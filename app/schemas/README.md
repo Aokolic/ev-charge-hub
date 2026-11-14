@@ -24,12 +24,26 @@
 
 ---
 
-## 二、 5 条业务线 Schema 划分与命名建议
+## 二、 公共模块与 5 条业务线 Schema 划分
 
-| 文件 | 业务线 | 核心请求 / 响应模型示例 | 重点校验 / 脱敏规则 |
+| 文件 | 模块 / 业务线 | 核心请求 / 响应模型 | 重点校验 / 脱敏规则 |
 | :--- | :--- | :--- | :--- |
+| [`common.py`](common.py) | **全组公共底座（已实现）** | `PageParams`、`PageResult[T]`、`ActionResult`、`LoginIn`、`RegisterIn`、`DevTokenIn`、`RoleInfoOut`、`UserProfileOut`、`TokenOut` | `PageParams` 约束 `page >= 1`、`1 <= page_size <= 100`；`RegisterIn` 校验 `fleet` 必传 `fleet_id` 且非车队角色自动置空；`UserProfileOut` 仅输出 `phone_masked` |
 | `station.py` | 业务线 1 | `StationCreate`、`PileCreate`、`GunCreate`、`GunOut`、`DeviceStatusLogOut` | 校验 `gun.max_power <= pile.rated_power`；营业时间格式规范 |
 | `order.py` | 业务线 2 | `PricingRuleCreate`、`OrderStartIn`、`OrderFinishOut`、`FeeDetailOut`、`PaymentCreate` | 启停 SOC 范围校验；分时明细列表与总金额保留 `Decimal` |
 | `monitor.py` | 业务线 3 | `TelemetryIn`、`AlarmOut`、`RepairDispatchIn`、`RepairCompleteIn` | 电压/电流/温度合理区间；派单/到场/修复时间节点递增校验 |
 | `user.py` | 业务线 4 | `UserRegisterIn`、`UserMaskedOut`、`VehicleBindIn`、`FleetCardIn`、`CouponRedeemIn` | 输出只包含脱敏手机号与车牌；快充支持与最大功率校验 |
 | `settle.py` | 业务线 5 | `SettlementGenerateIn`、`SettlementOut`、`ReconcileDiffIn`、`InvoiceCreateIn`、`InvoiceRedOffsetIn` | 账期格式 `YYYY-MM`；开票金额 `> 0` 且不得超过应结金额 |
+
+### 公共分页与回执复用示例
+
+各业务线列表接口统一通过 [`common.py`](common.py) 接收分页参数并返回泛型分页结果：
+
+```python
+from fastapi import Depends
+from app.schemas.common import ActionResult, PageParams, PageResult
+
+@router.get("/items", response_model=PageResult[ItemOut], summary="分页查询列表")
+def list_items(page: PageParams = Depends(), db: Session = Depends(get_db)) -> PageResult[ItemOut]:
+    return PageResult[ItemOut](**dao.list_items_page(db, page))
+```

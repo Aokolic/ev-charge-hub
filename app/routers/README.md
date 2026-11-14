@@ -12,8 +12,11 @@
    - 禁止在路由里直接写 SQL 语句或吞掉数据库约束异常。
 2. **挂载到主应用**：
    模块接口写完后，在 `app/main.py` 第 5 节的预留区添加 `app.include_router(...)`，即可在 `/docs` 中自动调试。
+   注意：各路由文件已在 `APIRouter(prefix=...)` 中声明完整前缀（例如 `auth.py` 已内置 `prefix="/api/auth"`），挂载时直接写 `app.include_router(auth.router)`，**切勿在 `include_router` 中重复传 `prefix`**。
 3. **接口文档规范**：
    每个 `@router.get/post/put/patch` 必须写明 `summary` 与 `response_model`，避免返回裸字典导致前端字段不统一。
+4. **联调鉴权快捷方式**：
+   在 `sql/01_ddl.sql` 尚未建表或造数前，组员可通过 `POST /api/auth/dev-token` 一键签发任意 5 类角色的测试 Bearer Token，在 Swagger `/docs` 点击右上角 **Authorize** 填入后即可调试各自接口的 `require_roles(...)` 权限隔离。
 
 ---
 
@@ -31,10 +34,11 @@
 
 ---
 
-## 三、 5 条业务线路由模块与前缀约定
+## 三、 公共路由与 5 条业务线路由模块约定
 
-| 文件 | 路由前缀 | 负责业务线与主要接口分组 |
+| 文件 | 路由前缀 | 负责模块与主要接口分组 |
 | :--- | :--- | :--- |
+| [`auth.py`](auth.py) | `/api/auth` | **公共认证鉴权（已实现）**：`POST /login`（含失败次数锁定）、`POST /register`（仅车主/车队自助注册）、`GET /me`（当前用户上下文）、`GET /roles`（5 类角色字典）、`POST /dev-token`（联调测试签发 JWT） |
 | [`station.py`](<station.py>) | `/api/stations` | **业务线 1（组长）**：运营商、场站、充电桩、充电枪档案管理，实时状态与状态变更日志视图 |
 | `order.py` | `/api/orders` | **业务线 2（成员 2）**：分时计费规则管理、扫码启动/结束核价、费用明细、支付与退款记录 |
 | `monitor.py` | `/api/monitor` | **业务线 3（成员 4）**：分钟级运行数据上报、告警列表与 SLA 升级、维修工单派发与闭环 |
