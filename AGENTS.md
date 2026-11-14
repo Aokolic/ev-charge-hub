@@ -7,12 +7,12 @@
 
 ## 2. 目录结构与分层规范
 - **数据库真源 `sql/`**（按顺序执行）：`01_ddl.sql`（建表/索引/生成列/分区）→ `02_views.sql`（每线 ≥3 个 RBAC 隔离视图）→ `03_procs_triggers.sql`（每线 ≥1 存储过程 + ≥1 触发器）→ `04_seed.sql`（每表 ≥20 条测试数据）→ `05_queries_compare.sql`（每线 ≥3 组双实现与 `EXPLAIN` 对比）。
-- **公共底座**：[app/config.py](app/config.py)（只读配置单例）、[app/db.py](app/db.py)（连接池与 `get_db()`）、[app/auth.py](app/auth.py)（鉴权与 RBAC 守卫）、[app/main.py](app/main.py)（FastAPI 入口、全局 MySQL 异常翻译、`/health/db` 与 `static/` 挂载）。
+- **公共底座**：[app/config.py](app/config.py)（只读配置单例）、[app/db.py](app/db.py)（连接池与 `get_db()`）、[app/auth.py](app/auth.py)（鉴权与 RBAC 守卫）、[app/main.py](app/main.py)（FastAPI 入口、全局 MySQL 异常翻译、`/health/db` 与 `static/` 挂载）、[app/schemas/common.py](app/schemas/common.py)（统一分页 `PageParams` / `PageResult[T]`、`ActionResult` 与认证契约）、[app/dao/common.py](app/dao/common.py)（视图参数化分页 `fetch_view_page`、敏感字段 Fernet 加解密 / HMAC 盲索引 / 脱敏及认证账号 DAO）、[app/routers/auth.py](app/routers/auth.py)（`/api/auth` 登录防暴破锁定、注册、角色字典与 `/dev-token` 联调签发）。
 - **分层规范文档**（修改对应目录代码前先对齐）：
   - `models`：[README.md](app/models/README.md)（SQLAlchemy 2.0 表映射，仅映射已有表）
-  - `schemas`：[README.md](app/schemas/README.md)（Pydantic v2 入参校验、脱敏输出与 `Decimal` 精度）
-  - `dao`：[README.md](app/dao/README.md)（ORM CRUD + `text()` 调视图/存储过程，显式事务边界）
-  - `routers`：[README.md](app/routers/README.md)（`APIRouter` 路由定义与 5 类角色 RBAC 矩阵）
+  - `schemas`：[README.md](app/schemas/README.md)（Pydantic v2 入参校验、脱敏输出、`Decimal` 精度与 `common.py` 分页/认证契约）
+  - `dao`：[README.md](app/dao/README.md)（ORM CRUD + `text()` 调视图/存储过程、显式事务边界与 `common.py` 分页/加解密工具）
+  - `routers`：[README.md](app/routers/README.md)（`APIRouter` 路由定义、5 类角色 RBAC 矩阵与 `auth.py` 鉴权入口）
 
 ## 3. 5 条业务线模块命名与分工边界
 各层均使用同名模块文件（`<module>.py`），按成员分工修改对应模块：
@@ -28,3 +28,4 @@
 3. **精度保留**：金额、电价、电量、功率在数据库用 `DECIMAL`，Python 侧全程保持 `Decimal`，禁止转成 `float`。
 4. **事务与异常**：跨表写操作须在同一 `Session` 内一次 `db.commit()`；底层 `IntegrityError`（`1062` 冲突、`1451/1452` 外键、`3819` CHECK）与 `OperationalError`（`1644` 触发器 `SIGNAL`）放行交由 `app/main.py` 统一转 HTTP 409/400。
 5. **安全与本地环境**：严禁将 `.env` 提交至 Git（新增配置同步更新 `.env.example`）；本地执行脚本或启动服务使用 `.venv\Scripts\python.exe` / `.venv\Scripts\uvicorn.exe`。
+6. **公共底座复用与路由挂载**：各业务线列表分页、敏感字段脱敏/加解密及 RBAC 联调 Token 统一复用 [app/schemas/common.py](app/schemas/common.py)、[app/dao/common.py](app/dao/common.py) 与 [app/routers/auth.py](app/routers/auth.py)（`POST /api/auth/dev-token`），禁止重复造轮子；各模块已在 `APIRouter(prefix=...)` 声明前缀，挂载到 [app/main.py](app/main.py) 时直接 `app.include_router(<module>.router)`，切勿重复传 `prefix`。
