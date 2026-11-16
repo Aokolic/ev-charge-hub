@@ -46,20 +46,22 @@ LEFT JOIN (
         COUNT(*) AS active_pile_count
     FROM charging_pile AS p
     WHERE p.acceptance_status = 'PASSED'
+      AND p.current_status IN ('IDLE', 'OCCUPIED')
     GROUP BY p.station_id
 ) AS pa
     ON pa.station_id = s.station_id
 LEFT JOIN (
     SELECT
         p.station_id,
-        COUNT(g.gun_id)                                                            AS total_gun_count,
-        SUM(CASE WHEN g.current_status = 'IDLE' THEN 1 ELSE 0 END)                 AS idle_gun_count,
-        SUM(CASE WHEN g.current_status = 'IDLE' AND g.gun_type = 'DC_FAST' THEN 1 ELSE 0 END) AS idle_fast_gun_count,
-        SUM(CASE WHEN g.current_status = 'IDLE' AND g.gun_type = 'AC_SLOW' THEN 1 ELSE 0 END) AS idle_slow_gun_count
+        COUNT(g.gun_id)                                                                         AS total_gun_count,
+        SUM(CASE WHEN g.current_status = 'IDLE' THEN 1 ELSE 0 END)                              AS idle_gun_count,
+        SUM(CASE WHEN g.current_status = 'IDLE' AND g.gun_type = 'DC_FAST' THEN 1 ELSE 0 END)   AS idle_fast_gun_count,
+        SUM(CASE WHEN g.current_status = 'IDLE' AND g.gun_type = 'AC_SLOW' THEN 1 ELSE 0 END)   AS idle_slow_gun_count
     FROM charging_pile AS p
     INNER JOIN charging_gun AS g
         ON g.pile_id = p.pile_id
     WHERE p.acceptance_status = 'PASSED'
+      AND p.current_status IN ('IDLE', 'OCCUPIED')
     GROUP BY p.station_id
 ) AS ga
     ON ga.station_id = s.station_id
@@ -99,7 +101,8 @@ INNER JOIN operator AS o
     ON o.operator_id = s.operator_id
 WHERE s.station_status = 'OPEN'
   AND o.status = 'ACTIVE'
-  AND p.acceptance_status = 'PASSED';
+  AND p.acceptance_status = 'PASSED'
+  AND p.current_status IN ('IDLE', 'OCCUPIED');
 
 
 -- ----------------------------------------------------------------------------
@@ -144,15 +147,18 @@ INNER JOIN operator AS o
     ON o.operator_id = s.operator_id
 LEFT JOIN charging_gun AS g
     ON g.pile_id = p.pile_id
-WHERE p.current_status IN ('FAULT', 'OFFLINE')
-   OR g.current_status IN ('FAULT', 'OFFLINE');
+WHERE p.acceptance_status = 'PASSED'
+  AND (
+      g.current_status IN ('FAULT', 'OFFLINE')
+      OR (p.current_status IN ('FAULT', 'OFFLINE') AND g.gun_id IS NULL)
+  );
 
 
 -- ----------------------------------------------------------------------------
 -- 视图 1.4：v_device_status_history（面向 ops / admin）
 -- 隔离边界：
 --   - 仅限运维与管理员审计设备状态变更轨迹及处理离线待办（todo_status = 'PENDING'）；
---   - 按 pile_id / gun_id 双分支 LEFT JOIN 无损还原所属桩、枪及场站信息。
+--   - 采用 UNION ALL 分别关联桩/枪外键分支，避免 COALESCE 连接导致索引失效。
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE VIEW v_device_status_history AS
 SELECT
@@ -161,8 +167,35 @@ SELECT
     s.station_code,
     s.station_name,
     l.device_type,
-    COALESCE(p_direct.pile_id, p_gun.pile_id)     AS pile_id,
-    COALESCE(p_direct.pile_code, p_gun.pile_code) AS pile_code,
+    p.pile_id,
+    p.pile_code,
+    l.gun_id,
+    NULL                        AS gun_code,
+    NULL                        AS gun_seq,
+    l.prev_status,
+    l.new_status,
+    l.change_source,
+    l.todo_status,
+    l.remark,
+    l.changed_at
+FROM device_status_log AS l
+INNER JOIN charging_pile AS p
+    ON p.pile_id = l.pile_id
+INNER JOIN station AS s
+    ON s.station_id = p.station_id
+WHERE l.device_type = 'PILE'
+  AND l.pile_id IS NOT NULL
+
+UNION ALL
+
+SELECT
+    l.log_id,
+    s.station_id,
+    s.station_code,
+    s.station_name,
+    l.device_type,
+    p.pile_id,
+    p.pile_code,
     l.gun_id,
     g.gun_code,
     g.gun_seq,
@@ -173,16 +206,14 @@ SELECT
     l.remark,
     l.changed_at
 FROM device_status_log AS l
-LEFT JOIN charging_pile AS p_direct
-    ON l.device_type = 'PILE'
-   AND l.pile_id = p_direct.pile_id
-LEFT JOIN charging_gun AS g
-    ON l.device_type = 'GUN'
-   AND l.gun_id = g.gun_id
-LEFT JOIN charging_pile AS p_gun
-    ON g.pile_id = p_gun.pile_id
+INNER JOIN charging_gun AS g
+    ON g.gun_id = l.gun_id
+INNER JOIN charging_pile AS p
+    ON p.pile_id = g.pile_id
 INNER JOIN station AS s
-    ON s.station_id = COALESCE(p_direct.station_id, p_gun.station_id);
+    ON s.station_id = p.station_id
+WHERE l.device_type = 'GUN'
+  AND l.gun_id IS NOT NULL;
 
 
 -- ----------------------------------------------------------------------------
