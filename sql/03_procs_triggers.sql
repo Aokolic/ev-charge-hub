@@ -34,11 +34,13 @@ CREATE TRIGGER trg_gun_before_insert_validate
 BEFORE INSERT ON charging_gun
 FOR EACH ROW
 BEGIN
-    DECLARE v_rated_power DECIMAL(8, 2);
-    DECLARE v_gun_count TINYINT UNSIGNED;
+    DECLARE v_rated_power       DECIMAL(8, 2);
+    DECLARE v_gun_count         TINYINT UNSIGNED;
+    DECLARE v_acceptance_status ENUM('PENDING', 'PASSED', 'REJECTED');
+    DECLARE v_pile_status       ENUM('IDLE', 'OCCUPIED', 'FAULT', 'OFFLINE');
 
-    SELECT rated_power, gun_count
-      INTO v_rated_power, v_gun_count
+    SELECT rated_power, gun_count, acceptance_status, current_status
+      INTO v_rated_power, v_gun_count, v_acceptance_status, v_pile_status
       FROM charging_pile
      WHERE pile_id = NEW.pile_id;
 
@@ -57,23 +59,35 @@ BEGIN
             SET MESSAGE_TEXT = '充电枪序号超出所属充电桩的设计枪数上限';
     END IF;
 
+    IF NEW.current_status IN ('IDLE', 'OCCUPIED') AND v_acceptance_status <> 'PASSED' THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = '所属充电桩未通过协议联调与验收，充电枪禁止置为空闲或占用状态';
+    END IF;
+
+    IF NEW.current_status IN ('IDLE', 'OCCUPIED') AND v_pile_status IN ('FAULT', 'OFFLINE') THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = '所属充电桩当前处于故障或离线状态，充电枪禁止置为空闲或占用状态';
+    END IF;
+
     IF NEW.status_updated_at IS NULL THEN
         SET NEW.status_updated_at = NOW();
     END IF;
 END //
 
 -- ----------------------------------------------------------------------------
--- 触发器 1.2：充电枪更新前校验（同步约束功率/枪序号并自动刷新状态更新时间）
+-- 触发器 1.2：充电枪更新前校验（同步约束功率/枪序号/父桩状态，保留调用方显式时间戳）
 -- ----------------------------------------------------------------------------
 CREATE TRIGGER trg_gun_before_update_validate
 BEFORE UPDATE ON charging_gun
 FOR EACH ROW
 BEGIN
-    DECLARE v_rated_power DECIMAL(8, 2);
-    DECLARE v_gun_count TINYINT UNSIGNED;
+    DECLARE v_rated_power       DECIMAL(8, 2);
+    DECLARE v_gun_count         TINYINT UNSIGNED;
+    DECLARE v_acceptance_status ENUM('PENDING', 'PASSED', 'REJECTED');
+    DECLARE v_pile_status       ENUM('IDLE', 'OCCUPIED', 'FAULT', 'OFFLINE');
 
-    SELECT rated_power, gun_count
-      INTO v_rated_power, v_gun_count
+    SELECT rated_power, gun_count, acceptance_status, current_status
+      INTO v_rated_power, v_gun_count, v_acceptance_status, v_pile_status
       FROM charging_pile
      WHERE pile_id = NEW.pile_id;
 
@@ -92,7 +106,18 @@ BEGIN
             SET MESSAGE_TEXT = '充电枪序号超出所属充电桩的设计枪数上限';
     END IF;
 
-    IF NOT (OLD.current_status <=> NEW.current_status) THEN
+    IF NEW.current_status IN ('IDLE', 'OCCUPIED') AND v_acceptance_status <> 'PASSED' THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = '所属充电桩未通过协议联调与验收，充电枪禁止置为空闲或占用状态';
+    END IF;
+
+    IF NEW.current_status IN ('IDLE', 'OCCUPIED') AND v_pile_status IN ('FAULT', 'OFFLINE') THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = '所属充电桩当前处于故障或离线状态，充电枪禁止置为空闲或占用状态';
+    END IF;
+
+    IF NOT (OLD.current_status <=> NEW.current_status)
+       AND (NEW.status_updated_at <=> OLD.status_updated_at OR NEW.status_updated_at IS NULL) THEN
         SET NEW.status_updated_at = NOW();
     END IF;
 END //
@@ -129,7 +154,8 @@ BEGIN
             SET MESSAGE_TEXT = '存在序号超出新枪数上限的充电枪，禁止缩减桩设计枪数';
     END IF;
 
-    IF NOT (OLD.current_status <=> NEW.current_status) THEN
+    IF NOT (OLD.current_status <=> NEW.current_status)
+       AND (NEW.status_updated_at <=> OLD.status_updated_at OR NEW.status_updated_at IS NULL) THEN
         SET NEW.status_updated_at = NOW();
     END IF;
 END //
@@ -172,6 +198,9 @@ BEGIN
             COALESCE(@status_change_remark, '充电桩状态变更自动留痕'),
             NEW.status_updated_at
         );
+        SET @status_change_source = NULL,
+            @status_todo_status   = NULL,
+            @status_change_remark = NULL;
     END IF;
 END //
 
@@ -210,6 +239,9 @@ BEGIN
             COALESCE(@status_change_remark, '充电枪状态变更自动留痕'),
             NEW.status_updated_at
         );
+        SET @status_change_source = NULL,
+            @status_todo_status   = NULL,
+            @status_change_remark = NULL;
     END IF;
 END //
 
@@ -226,14 +258,17 @@ BEGIN
     DECLARE v_now DATETIME;
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
-        SET @skip_auto_status_log = NULL;
+        SET @skip_auto_status_log = NULL,
+            @status_change_source = NULL,
+            @status_todo_status   = NULL,
+            @status_change_remark = NULL;
         DROP TEMPORARY TABLE IF EXISTS tmp_offline_piles;
         RESIGNAL;
     END;
 
     SET v_now = COALESCE(p_check_time, NOW());
 
-    -- 使用临时表锁定本次判定的离线超阈值桩，避免先更新桩后再更新枪时条件漂移
+    -- 使用临时表加 FOR UPDATE 锁定本次判定的离线超阈值桩，避免并发心跳导致状态竞态与重复待办
     DROP TEMPORARY TABLE IF EXISTS tmp_offline_piles;
     CREATE TEMPORARY TABLE tmp_offline_piles (
         pile_id               BIGINT UNSIGNED PRIMARY KEY,
@@ -248,7 +283,8 @@ BEGIN
        AND (
            p.last_heartbeat_at IS NULL
            OR TIMESTAMPDIFF(SECOND, p.last_heartbeat_at, v_now) > p.offline_threshold_sec
-       );
+       )
+       FOR UPDATE;
 
     SELECT COUNT(*) INTO p_affected_piles FROM tmp_offline_piles;
 
@@ -309,7 +345,10 @@ BEGIN
              WHERE g.current_status IN ('IDLE', 'OCCUPIED');
         END IF;
 
-        SET @skip_auto_status_log = NULL;
+        SET @skip_auto_status_log = NULL,
+            @status_change_source = NULL,
+            @status_todo_status   = NULL,
+            @status_change_remark = NULL;
     ELSE
         SET p_affected_guns = 0;
     END IF;
@@ -330,19 +369,23 @@ BEGIN
     DECLARE v_now               DATETIME;
     DECLARE v_comm_date         DATE;
     DECLARE v_warranty_end      DATE;
+    DECLARE v_acceptance_status ENUM('PENDING', 'PASSED', 'REJECTED');
     DECLARE v_prev_status       ENUM('IDLE', 'OCCUPIED', 'FAULT', 'OFFLINE');
     DECLARE v_configured_guns   INT DEFAULT 0;
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
-        SET @skip_auto_status_log = NULL;
+        SET @skip_auto_status_log = NULL,
+            @status_change_source = NULL,
+            @status_todo_status   = NULL,
+            @status_change_remark = NULL;
         RESIGNAL;
     END;
 
     SET v_now = NOW();
     SET v_comm_date = COALESCE(p_commissioned_date, CURDATE());
 
-    SELECT warranty_end_date, current_status
-      INTO v_warranty_end, v_prev_status
+    SELECT warranty_end_date, acceptance_status, current_status
+      INTO v_warranty_end, v_acceptance_status, v_prev_status
       FROM charging_pile
      WHERE pile_id = p_pile_id
        FOR UPDATE;
@@ -350,6 +393,16 @@ BEGIN
     IF v_warranty_end IS NULL THEN
         SIGNAL SQLSTATE '45000'
             SET MESSAGE_TEXT = '指定充电桩不存在';
+    END IF;
+
+    IF v_acceptance_status = 'PASSED' THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = '该充电桩已完成验收投运，无需重复验收';
+    END IF;
+
+    IF v_prev_status IN ('FAULT', 'OCCUPIED') THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = '充电桩处于故障或占用状态，禁止直接执行验收投运';
     END IF;
 
     IF v_warranty_end < v_comm_date THEN
@@ -372,7 +425,7 @@ BEGIN
     UPDATE charging_pile
        SET acceptance_status = 'PASSED',
            commissioned_date = v_comm_date,
-           current_status    = IF(current_status = 'FAULT', 'FAULT', 'IDLE'),
+           current_status    = 'IDLE',
            last_heartbeat_at = v_now,
            status_updated_at = v_now
      WHERE pile_id = p_pile_id;
@@ -385,7 +438,7 @@ BEGIN
         p_pile_id,
         NULL,
         v_prev_status,
-        IF(v_prev_status = 'FAULT', 'FAULT', 'IDLE'),
+        'IDLE',
         'ACCEPTANCE',
         'NONE',
         COALESCE(NULLIF(TRIM(p_remark), ''), '协议联调与现场验收通过，允许正式投运'),
@@ -417,7 +470,10 @@ BEGIN
      WHERE pile_id = p_pile_id
        AND current_status = 'OFFLINE';
 
-    SET @skip_auto_status_log = NULL;
+    SET @skip_auto_status_log = NULL,
+        @status_change_source = NULL,
+        @status_todo_status   = NULL,
+        @status_change_remark = NULL;
 END //
 
 DELIMITER ;

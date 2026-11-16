@@ -15,7 +15,7 @@ SET NAMES utf8mb4;
 -- ----------------------------------------------------------------------------
 -- 第 1 组（4 表关联：operator + station + charging_pile + charging_gun）
 -- 业务场景：查询正常合作运营商(ACTIVE)旗下营业中场站(OPEN)已验收(PASSED)桩的
---           装机额定总功率、直流快充总枪数、空闲快充枪数与快充枪空闲率(%)
+--           装机额定总功率、直流快充总枪数与空闲快充枪数
 -- ----------------------------------------------------------------------------
 
 -- [实现 A - 低效]：使用函数破坏枚举/索引条件 + SELECT 标量相关子查询导致反复回表扫描
@@ -124,18 +124,19 @@ INNER JOIN operator AS o
     ON o.operator_id = s.operator_id
 WHERE DATE(l.changed_at) >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
   AND l.new_status IN ('FAULT', 'OFFLINE')
+  AND s.station_status = 'OPEN'
 GROUP BY s.station_id, s.station_code, s.station_name, o.operator_name
 ORDER BY abnormal_event_count DESC, s.station_id ASC;
 
 -- [实现 B - 优化]：将时间筛选转为 SARGable 常量下界 + 用 UNION ALL 拆开桩/枪外键分支，
---                 使两条分支分别利用 idx_status_log_pile_time 与 idx_status_log_gun_time（或主键/外键索引）
+--                 两条分支均命中时间前导联合索引 idx_status_log_type_time_status (device_type, changed_at, new_status, todo_status)
 SELECT
     s.station_id,
     s.station_code,
     s.station_name,
     o.operator_name,
-    SUM(agg.event_cnt)   AS abnormal_event_count,
-    SUM(agg.pending_cnt) AS pending_todo_count
+    CAST(SUM(agg.event_cnt) AS SIGNED) AS abnormal_event_count,
+    SUM(agg.pending_cnt)               AS pending_todo_count
 FROM (
     SELECT
         p.station_id,
@@ -145,9 +146,9 @@ FROM (
     INNER JOIN charging_pile AS p
         ON p.pile_id = l.pile_id
     WHERE l.device_type = 'PILE'
-      AND l.pile_id IS NOT NULL
       AND l.changed_at >= CAST(DATE_SUB(CURDATE(), INTERVAL 30 DAY) AS DATETIME)
       AND l.new_status IN ('FAULT', 'OFFLINE')
+      AND l.pile_id IS NOT NULL
     GROUP BY p.station_id
 
     UNION ALL
@@ -162,15 +163,16 @@ FROM (
     INNER JOIN charging_pile AS p
         ON p.pile_id = g.pile_id
     WHERE l.device_type = 'GUN'
-      AND l.gun_id IS NOT NULL
       AND l.changed_at >= CAST(DATE_SUB(CURDATE(), INTERVAL 30 DAY) AS DATETIME)
       AND l.new_status IN ('FAULT', 'OFFLINE')
+      AND l.gun_id IS NOT NULL
     GROUP BY p.station_id
 ) AS agg
 INNER JOIN station AS s
     ON s.station_id = agg.station_id
 INNER JOIN operator AS o
     ON o.operator_id = s.operator_id
+WHERE s.station_status = 'OPEN'
 GROUP BY s.station_id, s.station_code, s.station_name, o.operator_name
 ORDER BY abnormal_event_count DESC, s.station_id ASC;
 
