@@ -134,7 +134,7 @@ from app.routers import auth as auth_routes  # noqa: E402
 from app.routers import order as order_routes  # noqa: E402
 from app.routers import settle as settle_routes  # noqa: E402
 from app.routers import station as station_routes  # noqa: E402
-from app.routers import monitor as monitor_routes
+from app.routers import monitor as monitor_routes  # noqa: E402
 
 app.include_router(auth_routes.router)
 app.include_router(station_routes.router)

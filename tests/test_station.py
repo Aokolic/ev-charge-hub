@@ -1159,13 +1159,17 @@ class StationLine1VerificationTest(unittest.TestCase):
         """验证首页 GET / 与静态资源 /static/、styles.css、app.js 可正常访问。"""
         for static_path, marker in (
             ("/", "新能源汽车充电桩运营服务平台"),
-            ("/static/", "RBAC 角色切换与认证中心"),
-            ("/static/styles.css", ".station-grid"),
+            ("/static/", "充电桩运营服务平台"),
+            ("/static/styles.css", "@layer reset, base, components, utilities"),
             ("/static/app.js", "/api/stations/overview"),
         ):
             st, raw = asyncio.run(_call_asgi_raw("GET", static_path))
             self.assertEqual(st, 200, f"静态路径 {static_path} 返回状态码 {st}")
             self.assertIn(marker, raw.decode("utf-8"))
+
+        st_img, raw_img = asyncio.run(_call_asgi_raw("GET", "/static/res/brand-logo.jpg"))
+        self.assertEqual(st_img, 200)
+        self.assertGreater(len(raw_img), 0)
 
 
 if __name__ == "__main__":

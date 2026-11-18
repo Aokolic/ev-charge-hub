@@ -3,376 +3,1124 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="light dark">
     <title>EV Charge Hub · 新能源汽车充电桩运营服务平台</title>
+    <!-- 首帧前确定明暗主题，避免闪烁（读取本地偏好，缺省跟随系统） -->
+    <script>
+        (() => {
+            const saved = localStorage.getItem("ev_hub_theme");
+            const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+            document.documentElement.dataset.theme = saved || (prefersDark ? "dark" : "light");
+        })();
+    </script>
     <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-    <header class="topbar">
-        <div class="brand">
-            <div class="brand-badge">EV</div>
-            <div>
-                <h1>新能源汽车充电桩运营服务平台</h1>
-                <p>BFU 数据库系统课程设计 · RBAC 视图隔离与闭环演示工作台</p>
+    <a class="skip-link visually-hidden" href="#workspace-main">跳至主工作区</a>
+
+    <!-- 内联 SVG 图标库：导航与工具按钮统一引用 -->
+    <svg class="icon-sprite" aria-hidden="true" focusable="false">
+        <symbol id="i-home" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.6"/><rect x="14" y="3" width="7" height="7" rx="1.6"/><rect x="3" y="14" width="7" height="7" rx="1.6"/><rect x="14" y="14" width="7" height="7" rx="1.6"/></symbol>
+        <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2 4.5 13.5H11L10 22l8.5-11.5H12L13 2z"/></symbol>
+        <symbol id="i-receipt" viewBox="0 0 24 24"><path d="M6 2.5h12v19l-3-2-3 2-3-2-3 2v-19z"/><path d="M9 7.5h6M9 11.5h6M9 15.5h3.5"/></symbol>
+        <symbol id="i-wrench" viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.3 5.3L3.5 17.5l3 3 5.9-5.9a4 4 0 0 0 5.3-5.3l-2.6 2.6-2.3-.7-.7-2.3 2.6-2.6z"/></symbol>
+        <symbol id="i-building" viewBox="0 0 24 24"><path d="M4.5 21V5a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2v16"/><path d="M15.5 9h2a2 2 0 0 1 2 2v10"/><path d="M8 7.5h4M8 11.5h4M8 15.5h4M2.5 21h19"/></symbol>
+        <symbol id="i-wallet" viewBox="0 0 24 24"><path d="M19 7V5.5A1.5 1.5 0 0 0 17.5 4h-12A2.5 2.5 0 0 0 3 6.5v11A2.5 2.5 0 0 0 5.5 20h13a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2H5.5"/><circle cx="16.5" cy="13.5" r="1.2"/></symbol>
+        <symbol id="i-flask" viewBox="0 0 24 24"><path d="M9 3h6M10 3v6.2L4.6 18.3A1.8 1.8 0 0 0 6.1 21h11.8a1.8 1.8 0 0 0 1.5-2.7L14 9.2V3"/><path d="M7.2 15h9.6"/></symbol>
+        <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7.5a4 4 0 0 1 8 0V11"/></symbol>
+        <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M4.6 4.6 6 6M18 18l1.4 1.4M2.5 12h2M19.5 12h2M4.6 19.4 6 18M18 6l1.4-1.4"/></symbol>
+        <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20.5 13.2A8.5 8.5 0 1 1 10.8 3.5a6.6 6.6 0 0 0 9.7 9.7z"/></symbol>
+        <symbol id="i-book" viewBox="0 0 24 24"><path d="M4.5 19V5.5A2.5 2.5 0 0 1 7 3h12.5v14H7a2.5 2.5 0 0 0-2.5 2.5v0A2.5 2.5 0 0 0 7 22h12.5"/><path d="M8.5 7.5h7"/></symbol>
+        <symbol id="i-login" viewBox="0 0 24 24"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/><path d="M10 16.5 14.5 12 10 7.5M14.5 12H3.5"/></symbol>
+        <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+    </svg>
+
+    <div class="app-shell">
+        <!-- 1. 左侧导航：品牌、模块分组导航、数据库探活 -->
+        <aside class="sidebar" aria-label="平台导航">
+            <a class="brand" href="#/home">
+                <span class="brand-mark" aria-hidden="true"><svg class="icon"><use href="#i-bolt"/></svg></span>
+                <span class="brand-text">
+                    <span class="brand-name">EV Charge Hub</span>
+                    <span class="brand-sub">充电桩运营服务平台</span>
+                </span>
+            </a>
+
+            <nav id="mainNav" class="side-nav" aria-label="业务模块">
+                <a class="nav-link" href="#/home" data-panel="panel-home">
+                    <svg class="icon" aria-hidden="true"><use href="#i-home"/></svg><span class="nav-text">总览</span>
+                </a>
+
+                <p class="nav-group">车主服务</p>
+                <a class="nav-link" href="#/stations" data-panel="panel-driver">
+                    <svg class="icon" aria-hidden="true"><use href="#i-bolt"/></svg><span class="nav-text">找站与开单</span>
+                    <svg class="icon nav-lock" aria-label="当前身份无权限"><use href="#i-lock"/></svg>
+                </a>
+                <a class="nav-link" href="#/orders" data-panel="panel-orders">
+                    <svg class="icon" aria-hidden="true"><use href="#i-receipt"/></svg><span class="nav-text">订单与分时计费</span>
+                    <svg class="icon nav-lock" aria-label="当前身份无权限"><use href="#i-lock"/></svg>
+                </a>
+
+                <p class="nav-group">运营运维</p>
+                <a class="nav-link" href="#/ops" data-panel="panel-ops">
+                    <svg class="icon" aria-hidden="true"><use href="#i-wrench"/></svg><span class="nav-text">运维排障与巡检</span>
+                    <svg class="icon nav-lock" aria-label="当前身份无权限"><use href="#i-lock"/></svg>
+                </a>
+                <a class="nav-link" href="#/assets" data-panel="panel-admin">
+                    <svg class="icon" aria-hidden="true"><use href="#i-building"/></svg><span class="nav-text">资产看板与建档</span>
+                    <svg class="icon nav-lock" aria-label="当前身份无权限"><use href="#i-lock"/></svg>
+                </a>
+
+                <p class="nav-group">财务结算</p>
+                <a class="nav-link" href="#/settle" data-panel="panel-settle">
+                    <svg class="icon" aria-hidden="true"><use href="#i-wallet"/></svg><span class="nav-text">结算对账与开票</span>
+                    <svg class="icon nav-lock" aria-label="当前身份无权限"><use href="#i-lock"/></svg>
+                </a>
+
+                <p class="nav-group">开发调试</p>
+                <a class="nav-link" href="#/lab" data-panel="panel-cross">
+                    <svg class="icon" aria-hidden="true"><use href="#i-flask"/></svg><span class="nav-text">RBAC 与约束实验室</span>
+                </a>
+            </nav>
+
+            <div class="sidebar-foot">
+                <span id="dbHealthPill" class="health-pill" title="数据库连接探活">
+                    <span id="dbHealthDot" class="status-dot" aria-hidden="true"></span>
+                    <span id="dbHealthText">正在探测数据库</span>
+                </span>
+                <a class="side-link" href="/docs" target="_blank" rel="noopener">
+                    <svg class="icon" aria-hidden="true"><use href="#i-book"/></svg>API 文档
+                </a>
             </div>
+        </aside>
+
+        <div class="main-col">
+            <!-- 2. 顶栏：当前页面标题、5 角色切换、主题与身份 -->
+            <header class="topbar">
+                <div class="page-heading">
+                    <h1 id="pageTitle">总览</h1>
+                    <p id="pageDesc" class="page-desc">按角色查看充电网络的实时状态与业务入口</p>
+                </div>
+
+                <div class="topbar-actions">
+                    <div id="roleButtons" class="role-switch" role="group" aria-label="切换联调角色">
+                        <button class="role-pill" data-role="driver" type="button" aria-pressed="false">车主</button>
+                        <button class="role-pill" data-role="fleet" type="button" aria-pressed="false">车队</button>
+                        <button class="role-pill" data-role="ops" type="button" aria-pressed="false">运维</button>
+                        <button class="role-pill" data-role="settlement" type="button" aria-pressed="false">结算</button>
+                        <button class="role-pill" data-role="admin" type="button" aria-pressed="false">管理员</button>
+                    </div>
+
+                    <button id="themeToggle" class="icon-btn" type="button" aria-pressed="false" aria-label="切换深色模式" title="切换深色模式">
+                        <svg class="icon icon-moon" aria-hidden="true"><use href="#i-moon"/></svg>
+                        <svg class="icon icon-sun" aria-hidden="true"><use href="#i-sun"/></svg>
+                    </button>
+
+                    <button id="openAuthDialogBtn" class="icon-btn" type="button" aria-label="账号登录" title="账号登录">
+                        <svg class="icon" aria-hidden="true"><use href="#i-login"/></svg>
+                    </button>
+
+                    <button
+                        id="identityPopoverBtn"
+                        class="identity-chip"
+                        type="button"
+                        popovertarget="identityPopover"
+                        aria-haspopup="true"
+                    >
+                        <span id="identityAvatar" class="avatar" aria-hidden="true">?</span>
+                        <span id="identityChipText" class="identity-text">未认证</span>
+                    </button>
+                </div>
+            </header>
+
+            <!-- 联调参数与当前角色权限说明 Popover -->
+            <aside id="identityPopover" class="identity-popover" popover="auto" aria-label="联调身份参数与权限边界">
+                <div class="popover-head">
+                    <h2>当前身份与联调参数</h2>
+                    <button class="btn btn-ghost btn-xs" type="button" popovertarget="identityPopover" popovertargetaction="hide" aria-label="关闭联调参数面板">关闭</button>
+                </div>
+                <div class="context-summary">
+                    <div><strong id="currentUserLabel">未签发</strong></div>
+                    <p id="currentRoleDesc" class="role-desc">点击顶栏任意角色即可签发开发测试 Token。</p>
+                </div>
+                <form id="devContextForm" class="popover-form">
+                    <div class="field-row">
+                        <div class="field">
+                            <label for="devUserId">联调 user_id</label>
+                            <input id="devUserId" name="user_id" type="number" min="1" value="9001" inputmode="numeric" required>
+                        </div>
+                        <div class="field">
+                            <label for="devFleetId">fleet_id（仅车队）</label>
+                            <input id="devFleetId" name="fleet_id" type="number" min="1" value="1" inputmode="numeric" required>
+                        </div>
+                    </div>
+                    <div class="preset-row">
+                        <span class="hint">常用 UID</span>
+                        <button class="btn btn-outline btn-xs uid-preset-btn" data-uid="9001" type="button">9001 有充电中订单</button>
+                        <button class="btn btn-outline btn-xs uid-preset-btn" data-uid="9006" type="button">9006 有已支付订单</button>
+                        <button class="btn btn-outline btn-xs uid-preset-btn" data-uid="1" type="button">1</button>
+                    </div>
+                    <div class="popover-actions">
+                        <button id="reissueRoleBtn" class="btn btn-primary btn-sm" type="submit">按当前参数重签 Token</button>
+                    </div>
+                </form>
+            </aside>
+
+            <!-- 3. 主工作区：每个模块为一个独立页面（hash 路由切换） -->
+            <main id="workspace-main" class="workspace" tabindex="-1">
+                <!-- 当前角色无本页权限时的提示条 -->
+                <div id="roleNoticeBanner" class="role-notice" hidden>
+                    <svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>
+                    <div class="role-notice-text" id="roleNoticeText"></div>
+                    <div id="roleNoticeActions" class="role-notice-actions"></div>
+                </div>
+
+                <!-- Page 0: 总览 -->
+                <section id="panel-home" class="tabpanel" aria-label="总览">
+                    <div class="panel-stack">
+                        <div class="home-hero">
+                            <div class="hero-intro">
+                                <p id="homeGreeting" class="hero-greet">你好</p>
+                                <h2 class="hero-title">充电网络此刻的状态</h2>
+                                <p id="homeRoleDesc" class="hero-desc">正在识别当前身份…</p>
+                                <dl id="homeStats" class="hero-stats">
+                                    <div><dt>营业场站</dt><dd id="statStations">—</dd></div>
+                                    <div><dt>充电枪</dt><dd id="statGuns">—</dd></div>
+                                    <div><dt id="statOrdersLabel">订单</dt><dd id="statOrders">—</dd></div>
+                                </dl>
+                                <div id="homeQuickActions" class="hero-actions"></div>
+                            </div>
+
+                            <div class="matrix-panel">
+                                <div class="matrix-head">
+                                    <h3>充电枪实时阵列</h3>
+                                    <ul id="gunMatrixLegend" class="matrix-legend" aria-label="状态图例">
+                                        <li><span class="cell-dot s-idle"></span>空闲 <b data-legend="IDLE">0</b></li>
+                                        <li><span class="cell-dot s-occupied"></span>充电中 <b data-legend="OCCUPIED">0</b></li>
+                                        <li><span class="cell-dot s-fault"></span>故障 <b data-legend="FAULT">0</b></li>
+                                        <li><span class="cell-dot s-offline"></span>离线 <b data-legend="OFFLINE">0</b></li>
+                                    </ul>
+                                </div>
+                                <div id="gunMatrix" class="gun-matrix">
+                                    <div class="empty-hint">正在加载充电枪状态…</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="block-head">
+                            <h2>业务模块</h2>
+                            <p class="section-sub">锁形标记表示当前身份无权访问，可在顶栏切换角色</p>
+                        </div>
+                        <ul id="homeModules" class="module-cards"></ul>
+                    </div>
+                </section>
+
+                <!-- Page 1: 找站与开单 -->
+                <section id="panel-driver" class="tabpanel" aria-label="找站与开单" hidden="until-found">
+                    <div class="panel-stack">
+                        <article class="surface-card">
+                            <div class="section-head">
+                                <div>
+                                    <h2>营业场站</h2>
+                                    <p class="section-sub">数据源：视图 <code>v_driver_station_overview</code>，仅展示营业中场站与已验收桩的聚合指标，屏蔽敏感联络信息</p>
+                                </div>
+                            </div>
+
+                            <search>
+                                <form id="stationSearchForm" class="filter-bar">
+                                    <div class="field field-grow">
+                                        <label for="stationKeyword">场站名称或地址</label>
+                                        <input id="stationKeyword" name="keyword" type="search" placeholder="如：清华东路、五道口、机场">
+                                    </div>
+                                    <div class="field field-check">
+                                        <input id="onlyIdleFast" name="only_idle_fast" type="checkbox">
+                                        <label for="onlyIdleFast">只看有空闲快充枪的场站</label>
+                                    </div>
+                                    <div class="filter-actions">
+                                        <button class="btn btn-primary" type="submit">查询场站</button>
+                                        <button id="resetStationsBtn" class="btn btn-outline" type="button">重置</button>
+                                    </div>
+                                </form>
+                            </search>
+
+                            <div id="driverStationGrid" class="station-grid"></div>
+                            <div id="driverStationPager" class="pagination"></div>
+                        </article>
+
+                        <article id="driverGunsCard" class="surface-card">
+                            <div class="section-head">
+                                <div>
+                                    <h2>充电枪实时可用明细</h2>
+                                    <p class="section-sub">数据源：视图 <code>v_driver_gun_availability</code>，支持按站筛选与扫码开单（同枪并发由 <code>uk_gun_active</code> 拦截）</p>
+                                </div>
+                            </div>
+
+                            <search>
+                                <form id="gunSearchForm" class="filter-bar">
+                                    <div class="field">
+                                        <label for="gunStationFilter">场站 ID</label>
+                                        <input id="gunStationFilter" name="station_id" type="number" min="1" inputmode="numeric" placeholder="全部场站">
+                                    </div>
+                                    <div class="field">
+                                        <label for="gunTypeFilter">枪型</label>
+                                        <select id="gunTypeFilter" name="gun_type">
+                                            <option value="">全部枪型</option>
+                                            <option value="DC_FAST">直流快充 (DC_FAST)</option>
+                                            <option value="AC_SLOW">交流慢充 (AC_SLOW)</option>
+                                        </select>
+                                    </div>
+                                    <div class="field">
+                                        <label for="gunStatusFilter">枪状态</label>
+                                        <select id="gunStatusFilter" name="gun_status">
+                                            <option value="">全部状态</option>
+                                            <option value="IDLE">空闲 (IDLE)</option>
+                                            <option value="OCCUPIED">充电中 (OCCUPIED)</option>
+                                            <option value="FAULT">故障 (FAULT)</option>
+                                            <option value="OFFLINE">离线 (OFFLINE)</option>
+                                        </select>
+                                    </div>
+                                    <div class="filter-actions">
+                                        <button class="btn btn-primary" type="submit">查询充电枪</button>
+                                        <button id="resetGunsBtn" class="btn btn-outline" type="button">清空筛选</button>
+                                    </div>
+                                </form>
+                            </search>
+
+                            <div class="table-wrap" tabindex="0" role="region" aria-labelledby="driverGunsCaption">
+                                <table>
+                                    <caption id="driverGunsCaption" class="visually-hidden">营业场站充电枪实时可用明细表</caption>
+                                    <thead>
+                                        <tr>
+                                            <th scope="col">枪 ID</th>
+                                            <th scope="col">枪编号</th>
+                                            <th scope="col">所属场站</th>
+                                            <th scope="col">所属桩 / 额定功率</th>
+                                            <th scope="col">枪型</th>
+                                            <th scope="col">接口标准</th>
+                                            <th scope="col" class="num">最大功率 (kW)</th>
+                                            <th scope="col">当前状态</th>
+                                            <th scope="col">操作</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="driverGunsBody"></tbody>
+                                </table>
+                            </div>
+                            <div id="driverGunsPager" class="pagination"></div>
+                        </article>
+                    </div>
+                </section>
+
+                <!-- Page 2: 订单与分时计费 -->
+                <section id="panel-orders" class="tabpanel" aria-label="订单与分时计费" hidden="until-found">
+                    <div class="panel-stack">
+                        <article class="surface-card">
+                            <div class="section-head">
+                                <div>
+                                    <h2>充电订单</h2>
+                                    <p id="orderScopeDesc" class="section-sub">数据源：视图 <code>v_order_owner</code>（车主/车队仅看本人，运维/结算/管理员看全量）</p>
+                                </div>
+                                <div class="head-actions">
+                                    <button id="refreshOrdersBtn" class="btn btn-outline btn-sm" type="button">刷新</button>
+                                    <button id="openManualOrderBtn" class="btn btn-primary btn-sm" type="button">手动扫码开单</button>
+                                </div>
+                            </div>
+
+                            <div class="table-wrap" tabindex="0" role="region" aria-labelledby="ordersTableCaption">
+                                <table>
+                                    <caption id="ordersTableCaption" class="visually-hidden">充电订单与计费状态列表</caption>
+                                    <thead>
+                                        <tr>
+                                            <th scope="col">订单 ID</th>
+                                            <th scope="col">订单编号</th>
+                                            <th scope="col">车主 UID</th>
+                                            <th scope="col">场站 / 枪</th>
+                                            <th scope="col">起止时间</th>
+                                            <th scope="col" class="num">电量 (kWh)</th>
+                                            <th scope="col" class="num">应付 (¥)</th>
+                                            <th scope="col" class="num">已付 / 待付 (¥)</th>
+                                            <th scope="col">状态</th>
+                                            <th scope="col">操作</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="ordersBody"></tbody>
+                                </table>
+                            </div>
+                            <div id="ordersPager" class="pagination"></div>
+                        </article>
+
+                        <article class="surface-card">
+                            <div class="section-head">
+                                <div>
+                                    <h2>峰平谷分时电价与电量统计</h2>
+                                    <p class="section-sub">数据源：视图 <code>v_order_period_stat</code>（限 <code>ops</code> / <code>admin</code>），用于核验分时电价规则的拆分效果</p>
+                                </div>
+                                <ul class="period-legend" aria-label="时段配色">
+                                    <li><span class="badge badge-warn">PEAK 峰</span></li>
+                                    <li><span class="badge badge-info">FLAT 平</span></li>
+                                    <li><span class="badge badge-ok">VALLEY 谷</span></li>
+                                </ul>
+                            </div>
+
+                            <search>
+                                <form id="periodStatForm" class="filter-bar">
+                                    <div class="field">
+                                        <label for="statStartDate">起始日期</label>
+                                        <input id="statStartDate" name="start_date" type="date" value="2025-03-01" required>
+                                    </div>
+                                    <div class="field">
+                                        <label for="statEndDate">结束日期</label>
+                                        <input id="statEndDate" name="end_date" type="date" value="2025-03-31" required>
+                                    </div>
+                                    <div class="filter-actions">
+                                        <button class="btn btn-primary" type="submit">查询峰平谷统计</button>
+                                    </div>
+                                </form>
+                            </search>
+
+                            <div id="periodStatBox" class="table-wrap" tabindex="0" role="region" aria-label="峰平谷统计结果">
+                                <div class="empty-hint">切换到 <code>ops</code> 或 <code>admin</code> 角色后点击“查询峰平谷统计”。</div>
+                            </div>
+                        </article>
+                    </div>
+                </section>
+
+                <!-- Page 3: 运维排障与巡检 -->
+                <section id="panel-ops" class="tabpanel" aria-label="运维排障与巡检" hidden="until-found">
+                    <div class="panel-stack">
+                        <article class="surface-card command-card">
+                            <div class="command-block">
+                                <h2>全网心跳巡检</h2>
+                                <p class="section-sub">以数据库 UTC 时间为基准，把超过离线阈值未上报心跳的桩和枪标记为离线，并自动写入 <code>device_status_log</code></p>
+                                <button id="heartbeatCheckBtn" class="btn btn-warn" type="button">执行心跳离线巡检</button>
+                            </div>
+                            <div class="command-block">
+                                <h2>单桩指令</h2>
+                                <p class="section-sub">限 <code>ops</code> / <code>admin</code>，对指定充电桩执行验收投运、心跳上报或手工改状态</p>
+                                <div class="ops-pile-control">
+                                    <div class="field">
+                                        <label for="opsPileId">目标桩 ID</label>
+                                        <input id="opsPileId" type="number" min="1" value="21" inputmode="numeric">
+                                    </div>
+                                    <button id="commissionPileBtn" class="btn btn-primary" type="button">验收投运</button>
+                                    <button id="reportHeartbeatBtn" class="btn btn-outline" type="button">上报心跳</button>
+                                    <button id="openPileStatusBtn" class="btn btn-outline" type="button">手工改状态</button>
+                                </div>
+                            </div>
+                        </article>
+
+                        <article class="surface-card">
+                            <div class="section-head">
+                                <div>
+                                    <h2>故障枪与离线桩</h2>
+                                    <p class="section-sub">数据源：视图 <code>v_fault_gun_detail</code>（客服热线自动脱敏，含无枪离线桩）</p>
+                                </div>
+                            </div>
+
+                            <search>
+                                <form id="faultSearchForm" class="filter-bar">
+                                    <div class="field">
+                                        <label for="faultStationFilter">场站 ID</label>
+                                        <input id="faultStationFilter" name="station_id" type="number" min="1" inputmode="numeric" placeholder="全部场站">
+                                    </div>
+                                    <div class="field">
+                                        <label for="faultPileStatusFilter">桩异常状态</label>
+                                        <select id="faultPileStatusFilter" name="pile_status">
+                                            <option value="">全部异常状态</option>
+                                            <option value="FAULT">故障 (FAULT)</option>
+                                            <option value="OFFLINE">离线 (OFFLINE)</option>
+                                        </select>
+                                    </div>
+                                    <div class="filter-actions">
+                                        <button class="btn btn-primary" type="submit">刷新故障清单</button>
+                                    </div>
+                                </form>
+                            </search>
+
+                            <div class="table-wrap" tabindex="0" role="region" aria-labelledby="faultsTableCaption">
+                                <table>
+                                    <caption id="faultsTableCaption" class="visually-hidden">故障充电枪与离线充电桩排障明细表</caption>
+                                    <thead>
+                                        <tr>
+                                            <th scope="col">场站</th>
+                                            <th scope="col">桩编号 / 型号</th>
+                                            <th scope="col">桩状态</th>
+                                            <th scope="col">枪编号</th>
+                                            <th scope="col">枪状态</th>
+                                            <th scope="col" class="num">心跳滞后 (s)</th>
+                                            <th scope="col">脱敏热线</th>
+                                            <th scope="col">排障处置</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="faultsBody"></tbody>
+                                </table>
+                            </div>
+                            <div id="faultsPager" class="pagination"></div>
+                        </article>
+
+                        <article class="surface-card">
+                            <div class="section-head">
+                                <div>
+                                    <h2>设备状态变更历史与运维待办</h2>
+                                    <p class="section-sub">数据源：视图 <code>v_device_status_history</code>，可填写处置备注办结 <code>PENDING</code> 待办</p>
+                                </div>
+                            </div>
+
+                            <search>
+                                <form id="logSearchForm" class="filter-bar">
+                                    <div class="field">
+                                        <label for="logStationFilter">场站 ID</label>
+                                        <input id="logStationFilter" name="station_id" type="number" min="1" inputmode="numeric" placeholder="全部场站">
+                                    </div>
+                                    <div class="field">
+                                        <label for="logDeviceTypeFilter">设备类型</label>
+                                        <select id="logDeviceTypeFilter" name="device_type">
+                                            <option value="">全部设备</option>
+                                            <option value="PILE">充电桩 (PILE)</option>
+                                            <option value="GUN">充电枪 (GUN)</option>
+                                        </select>
+                                    </div>
+                                    <div class="field">
+                                        <label for="logTodoStatusFilter">待办状态</label>
+                                        <select id="logTodoStatusFilter" name="todo_status">
+                                            <option value="">全部待办</option>
+                                            <option value="PENDING">待处理 (PENDING)</option>
+                                            <option value="DONE">已办结 (DONE)</option>
+                                            <option value="NONE">无需处理 (NONE)</option>
+                                        </select>
+                                    </div>
+                                    <div class="filter-actions">
+                                        <button class="btn btn-primary" type="submit">刷新状态日志</button>
+                                    </div>
+                                </form>
+                            </search>
+
+                            <div class="table-wrap" tabindex="0" role="region" aria-labelledby="logsTableCaption">
+                                <table>
+                                    <caption id="logsTableCaption" class="visually-hidden">设备状态变更审计与运维待办表</caption>
+                                    <thead>
+                                        <tr>
+                                            <th scope="col">日志 ID</th>
+                                            <th scope="col">场站</th>
+                                            <th scope="col">设备</th>
+                                            <th scope="col">状态变迁</th>
+                                            <th scope="col">来源</th>
+                                            <th scope="col">待办</th>
+                                            <th scope="col">备注说明</th>
+                                            <th scope="col">变更时间</th>
+                                            <th scope="col">操作</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="statusLogsBody"></tbody>
+                                </table>
+                            </div>
+                            <div id="logsPager" class="pagination"></div>
+                        </article>
+                    </div>
+                </section>
+
+                <!-- Page 4: 资产看板与三级建档 -->
+                <section id="panel-admin" class="tabpanel" aria-label="资产看板与建档" hidden="until-found">
+                    <div class="panel-stack">
+                        <article class="surface-card">
+                            <div class="section-head">
+                                <div>
+                                    <h2>全平台场站实时资产</h2>
+                                    <p class="section-sub">数据源：视图 <code>v_station_realtime_status</code>（限 <code>admin</code> / <code>settlement</code>）</p>
+                                </div>
+                            </div>
+
+                            <div id="realtimeKpis" class="kpi-grid"></div>
+
+                            <search>
+                                <form id="realtimeSearchForm" class="filter-bar">
+                                    <div class="field">
+                                        <label for="realtimeOperatorFilter">运营商 ID</label>
+                                        <input id="realtimeOperatorFilter" name="operator_id" type="number" min="1" inputmode="numeric" placeholder="全部运营商">
+                                    </div>
+                                    <div class="field">
+                                        <label for="realtimeStatusFilter">场站营业状态</label>
+                                        <select id="realtimeStatusFilter" name="station_status">
+                                            <option value="">全部状态</option>
+                                            <option value="OPEN">营业中 (OPEN)</option>
+                                            <option value="MAINTENANCE">维护中 (MAINTENANCE)</option>
+                                            <option value="CLOSED">已关闭 (CLOSED)</option>
+                                        </select>
+                                    </div>
+                                    <div class="filter-actions">
+                                        <button class="btn btn-primary" type="submit">刷新看板</button>
+                                    </div>
+                                </form>
+                            </search>
+
+                            <div class="table-wrap" tabindex="0" role="region" aria-labelledby="realtimeTableCaption">
+                                <table>
+                                    <caption id="realtimeTableCaption" class="visually-hidden">全平台场站与桩枪实时资产汇总表</caption>
+                                    <thead>
+                                        <tr>
+                                            <th scope="col">场站 ID</th>
+                                            <th scope="col">场站名称</th>
+                                            <th scope="col">运营商</th>
+                                            <th scope="col">营业状态</th>
+                                            <th scope="col">充电桩分布（总 / 待验 / 闲 / 忙 / 异常）</th>
+                                            <th scope="col" class="num">装机功率 (kW)</th>
+                                            <th scope="col">充电枪分布（总 / 闲 / 忙 / 异常）</th>
+                                            <th scope="col">操作</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="realtimeBody"></tbody>
+                                </table>
+                            </div>
+                            <div id="realtimePager" class="pagination"></div>
+                        </article>
+
+                        <div class="split-2">
+                            <article class="surface-card">
+                                <div class="section-head">
+                                    <div>
+                                        <h2>运营商档案</h2>
+                                        <p class="section-sub">完整档案仅 <code>admin</code> 可见；脱敏摘要对 <code>admin</code> / <code>settlement</code> 开放</p>
+                                    </div>
+                                    <div class="head-actions">
+                                        <div class="segmented" role="group" aria-label="档案视图">
+                                            <button id="loadOperatorsFullBtn" class="btn btn-outline btn-xs" type="button">完整档案</button>
+                                            <button id="loadOperatorsSummaryBtn" class="btn btn-outline btn-xs" type="button">脱敏摘要</button>
+                                        </div>
+                                        <button id="openCreateOperatorBtn" class="btn btn-primary btn-xs" type="button">新增运营商</button>
+                                    </div>
+                                </div>
+
+                                <div class="table-wrap table-scroll-sm" tabindex="0" role="region" aria-labelledby="operatorsTableCaption">
+                                    <table>
+                                        <caption id="operatorsTableCaption" class="visually-hidden">合作运营商档案与脱敏摘要表</caption>
+                                        <thead>
+                                            <tr>
+                                                <th scope="col">ID</th>
+                                                <th scope="col">编码</th>
+                                                <th scope="col">名称</th>
+                                                <th scope="col">状态</th>
+                                                <th scope="col">客服热线</th>
+                                                <th scope="col">信用代码</th>
+                                                <th scope="col">操作</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="operatorsBody"></tbody>
+                                    </table>
+                                </div>
+                            </article>
+
+                            <article class="surface-card">
+                                <div class="section-head">
+                                    <div>
+                                        <h2>场站 → 桩 → 枪 钻取</h2>
+                                        <p class="section-sub">限 <code>ops</code> / <code>admin</code>，可直接查看下属设备、修改状态或验收投运</p>
+                                    </div>
+                                </div>
+
+                                <div class="filter-bar drill-bar">
+                                    <div class="field">
+                                        <label for="drillStationId">场站 ID</label>
+                                        <input id="drillStationId" type="number" min="1" value="1" inputmode="numeric">
+                                    </div>
+                                    <button id="drillPilesBtn" class="btn btn-outline btn-sm" type="button">查下属桩</button>
+                                    <div class="field">
+                                        <label for="drillPileId">桩 ID</label>
+                                        <input id="drillPileId" type="number" min="1" value="1" inputmode="numeric">
+                                    </div>
+                                    <button id="drillGunsBtn" class="btn btn-outline btn-sm" type="button">查下属枪</button>
+                                </div>
+                                <div id="drillResultBox" class="empty-hint">输入场站 ID 或桩 ID，逐级查看下属设备。</div>
+                            </article>
+                        </div>
+
+                        <details class="surface-card disclosure-card">
+                            <summary class="disclosure-summary">
+                                <span class="disclosure-title">
+                                    <svg class="icon disclosure-chevron" aria-hidden="true"><use href="#i-chevron"/></svg>
+                                    三级资产建档（新增场站 / 充电桩 / 充电枪，限 <code>admin</code>）
+                                </span>
+                                <span class="meta">可验证 1062 重复、3819 车位越界、1644 功率与枪序号守卫</span>
+                            </summary>
+                            <div class="disclosure-body">
+                                <div class="split-3">
+                                    <form id="createStationForm" class="sub-form" aria-labelledby="createStationTitle">
+                                        <h3 id="createStationTitle"><span class="step-no">1</span>新增充电场站 <code>POST /api/stations</code></h3>
+                                        <div class="form-grid">
+                                            <div class="field"><label for="cs-op-id">运营商 ID</label><input id="cs-op-id" name="operator_id" type="number" min="1" value="1" required></div>
+                                            <div class="field"><label for="cs-code">场站编码</label><input id="cs-code" name="station_code" type="text" value="ST-DEMO-101" autocorrect="off" autocapitalize="none" spellcheck="false" required></div>
+                                            <div class="field field-span2"><label for="cs-name">场站名称</label><input id="cs-name" name="station_name" type="text" value="演示超充示范站" required></div>
+                                            <div class="field field-span2"><label for="cs-addr">详细地址</label><input id="cs-addr" name="address" type="text" value="北京市海淀区学院路演示广场" required></div>
+                                            <div class="field"><label for="cs-lng">经度</label><input id="cs-lng" name="longitude" type="text" value="116.351200" inputmode="decimal" required></div>
+                                            <div class="field"><label for="cs-lat">纬度</label><input id="cs-lat" name="latitude" type="text" value="40.001200" inputmode="decimal" required></div>
+                                            <div class="field"><label for="cs-tot">总车位</label><input id="cs-tot" name="total_spaces" type="number" min="1" value="12" required></div>
+                                            <div class="field"><label for="cs-avail">空闲车位</label><input id="cs-avail" name="available_spaces" type="number" min="0" value="10" required></div>
+                                            <div class="field"><label for="cs-hours">营业时间</label><input id="cs-hours" name="business_hours" type="text" value="00:00-24:00" required></div>
+                                            <div class="field"><label for="cs-fee">停车费 (元/h)</label><input id="cs-fee" name="parking_fee_rate" type="text" value="4.00" inputmode="decimal" required></div>
+                                        </div>
+                                        <button class="btn btn-primary btn-sm" type="submit">创建场站</button>
+                                    </form>
+
+                                    <form id="createPileForm" class="sub-form" aria-labelledby="createPileTitle">
+                                        <h3 id="createPileTitle"><span class="step-no">2</span>新增待验收桩 <code>POST /api/stations/piles</code></h3>
+                                        <div class="form-grid">
+                                            <div class="field"><label for="cp-st-id">所属场站 ID</label><input id="cp-st-id" name="station_id" type="number" min="1" value="1" required></div>
+                                            <div class="field"><label for="cp-code">桩编码</label><input id="cp-code" name="pile_code" type="text" value="PL-DEMO-101" autocorrect="off" autocapitalize="none" spellcheck="false" required></div>
+                                            <div class="field"><label for="cp-model">设备型号</label><input id="cp-model" name="device_model" type="text" value="HW-Fusion180" required></div>
+                                            <div class="field"><label for="cp-power">额定功率 (kW)</label><input id="cp-power" name="rated_power" type="text" value="180.00" inputmode="decimal" required></div>
+                                            <div class="field"><label for="cp-guns">设计枪数 (1~8)</label><input id="cp-guns" name="gun_count" type="number" min="1" max="8" value="2" required></div>
+                                            <div class="field"><label for="cp-proto">通信协议</label><input id="cp-proto" name="protocol_type" type="text" value="OCPP1.6" required></div>
+                                            <div class="field"><label for="cp-warr">质保截止日</label><input id="cp-warr" name="warranty_end_date" type="date" value="2031-12-31" required></div>
+                                            <div class="field"><label for="cp-hb">离线阈值 (s)</label><input id="cp-hb" name="offline_threshold_sec" type="number" min="30" value="180" required></div>
+                                        </div>
+                                        <button class="btn btn-primary btn-sm" type="submit">新增待验收桩</button>
+                                    </form>
+
+                                    <form id="createGunForm" class="sub-form" aria-labelledby="createGunTitle">
+                                        <h3 id="createGunTitle"><span class="step-no">3</span>新增充电枪 <code>POST /api/stations/guns</code></h3>
+                                        <div class="form-grid">
+                                            <div class="field"><label for="cg-pile-id">所属桩 ID</label><input id="cg-pile-id" name="pile_id" type="number" min="1" value="1" required></div>
+                                            <div class="field"><label for="cg-code">枪编码</label><input id="cg-code" name="gun_code" type="text" value="GN-DEMO-101-A" autocorrect="off" autocapitalize="none" spellcheck="false" required></div>
+                                            <div class="field"><label for="cg-seq">枪序号</label><input id="cg-seq" name="gun_seq" type="number" min="1" value="2" required></div>
+                                            <div class="field"><label for="cg-type">枪型</label>
+                                                <select id="cg-type" name="gun_type">
+                                                    <option value="DC_FAST">DC_FAST</option>
+                                                    <option value="AC_SLOW">AC_SLOW</option>
+                                                </select>
+                                            </div>
+                                            <div class="field"><label for="cg-std">接口标准</label><input id="cg-std" name="connector_standard" type="text" value="GB/T 20234.3" required></div>
+                                            <div class="field"><label for="cg-power">最大功率 (kW)</label><input id="cg-power" name="max_power" type="text" value="180.00" inputmode="decimal" required></div>
+                                        </div>
+                                        <button class="btn btn-primary btn-sm" type="submit">新增充电枪</button>
+                                    </form>
+                                </div>
+                            </div>
+                        </details>
+                    </div>
+                </section>
+
+                <!-- Page 5: 结算对账与开票 -->
+                <section id="panel-settle" class="tabpanel" aria-label="结算对账与开票" hidden="until-found">
+                    <div class="panel-stack">
+                        <article class="surface-card">
+                            <div class="section-head">
+                                <div>
+                                    <h2>月度结算单</h2>
+                                    <p class="section-sub">数据源：存储过程 <code>sp_settle_generate</code> + 视图 <code>v_settle_bill_detail</code>（限 <code>settlement</code> / <code>admin</code>）</p>
+                                </div>
+                            </div>
+
+                            <div class="settle-tools">
+                                <form id="generateBillForm" class="filter-bar">
+                                    <div class="field">
+                                        <label for="genOperatorId">运营商 ID</label>
+                                        <input id="genOperatorId" name="operator_id" type="number" min="1" value="1" inputmode="numeric" required>
+                                    </div>
+                                    <div class="field">
+                                        <label for="genBillMonth">结算月份</label>
+                                        <input id="genBillMonth" name="bill_month" type="text" value="2025-03" pattern="\d{4}-\d{2}" placeholder="YYYY-MM" required>
+                                    </div>
+                                    <div class="field">
+                                        <label for="genPlatformRate">平台抽成比例</label>
+                                        <input id="genPlatformRate" name="platform_rate" type="text" value="0.0500" inputmode="decimal" required>
+                                    </div>
+                                    <div class="filter-actions">
+                                        <button class="btn btn-primary" type="submit">生成 / 刷新月结单</button>
+                                    </div>
+                                </form>
+
+                                <search>
+                                    <form id="billSearchForm" class="filter-bar">
+                                        <div class="field">
+                                            <label for="billOperatorFilter">按运营商筛选</label>
+                                            <input id="billOperatorFilter" name="operator_id" type="number" min="1" inputmode="numeric" placeholder="全部运营商">
+                                        </div>
+                                        <div class="filter-actions">
+                                            <button class="btn btn-outline" type="submit">查询账单</button>
+                                        </div>
+                                    </form>
+                                </search>
+                            </div>
+
+                            <div class="table-wrap" tabindex="0" role="region" aria-labelledby="billsTableCaption">
+                                <table>
+                                    <caption id="billsTableCaption" class="visually-hidden">运营商月度结算账单总览表</caption>
+                                    <thead>
+                                        <tr>
+                                            <th scope="col">账单 ID</th>
+                                            <th scope="col">运营商 / 场站</th>
+                                            <th scope="col">账期</th>
+                                            <th scope="col" class="num">订单数</th>
+                                            <th scope="col" class="num">总电量 (kWh)</th>
+                                            <th scope="col" class="num">订单总额 (¥)</th>
+                                            <th scope="col" class="num">平台抽成 (¥)</th>
+                                            <th scope="col" class="num">应付运营商 (¥)</th>
+                                            <th scope="col">开票进度</th>
+                                            <th scope="col" class="num">未处理差异</th>
+                                            <th scope="col">状态</th>
+                                            <th scope="col">操作</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="billsBody"></tbody>
+                                </table>
+                            </div>
+                            <div id="billsPager" class="pagination"></div>
+                        </article>
+
+                        <div class="split-2">
+                            <article class="surface-card">
+                                <div class="section-head">
+                                    <div>
+                                        <h2>未处理对账差异</h2>
+                                        <p class="section-sub">数据源：视图 <code>v_settle_diff_open</code>，每条差异回指具体订单</p>
+                                    </div>
+                                    <button id="refreshDiffsBtn" class="btn btn-outline btn-xs" type="button">刷新</button>
+                                </div>
+
+                                <div class="table-wrap table-scroll-sm" tabindex="0" role="region" aria-labelledby="diffsTableCaption">
+                                    <table>
+                                        <caption id="diffsTableCaption" class="visually-hidden">待核销对账差异记录表</caption>
+                                        <thead>
+                                            <tr>
+                                                <th scope="col">差异 ID</th>
+                                                <th scope="col">账单 / 账期</th>
+                                                <th scope="col">关联订单</th>
+                                                <th scope="col">类型</th>
+                                                <th scope="col" class="num">差额 (¥)</th>
+                                                <th scope="col">说明</th>
+                                                <th scope="col">操作</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="diffsBody"></tbody>
+                                    </table>
+                                </div>
+                                <div id="diffsPager" class="pagination"></div>
+                            </article>
+
+                            <article class="surface-card">
+                                <div class="section-head">
+                                    <div>
+                                        <h2>发票红冲</h2>
+                                        <p class="section-sub">禁止删除原票，开具负数票回指原 <code>invoice_id</code>（重复红冲会被 <code>1644</code> 拦截）</p>
+                                    </div>
+                                </div>
+
+                                <form id="redFlushForm" class="sub-form">
+                                    <div class="form-grid">
+                                        <div class="field">
+                                            <label for="rfInvoiceId">原发票 ID</label>
+                                            <input id="rfInvoiceId" name="invoice_id" type="number" min="1" value="1" inputmode="numeric" required>
+                                        </div>
+                                        <div class="field">
+                                            <label for="rfInvoiceNo">新红冲发票号</label>
+                                            <input id="rfInvoiceNo" name="invoice_no" type="text" placeholder="如：INV-RED-001" autocorrect="off" autocapitalize="none" spellcheck="false" required>
+                                        </div>
+                                        <div class="field field-span2">
+                                            <label for="rfAmount">红冲金额（负数，留空则按原票全额红冲）</label>
+                                            <input id="rfAmount" name="amount" type="text" inputmode="text" placeholder="如：-99.75">
+                                        </div>
+                                    </div>
+                                    <div class="filter-actions">
+                                        <button class="btn btn-danger btn-sm" type="submit">执行红冲</button>
+                                    </div>
+                                </form>
+
+                                <div class="recent-invoices">
+                                    <div class="meta">本会话新开具的发票（点击填入红冲表单）</div>
+                                    <ul id="sessionInvoicesList" class="invoice-chips">
+                                        <li class="meta">暂无本会话开票记录（种子发票 ID 为 1 ~ 20）</li>
+                                    </ul>
+                                </div>
+                            </article>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Page 6: RBAC 与约束实验室 -->
+                <section id="panel-cross" class="tabpanel" aria-label="RBAC 与约束实验室" hidden="until-found">
+                    <div class="panel-stack">
+                        <article class="surface-card">
+                            <div class="section-head">
+                                <div>
+                                    <h2>越权与数据库约束实测</h2>
+                                    <p class="section-sub">使用顶栏当前角色的 Token 发起请求，观察 403 越权拦截与 MySQL 1062 / 1644 错误翻译</p>
+                                </div>
+                                <button id="clearConsoleBtn" class="btn btn-outline btn-xs" type="button">清空输出</button>
+                            </div>
+
+                            <div class="lab-layout">
+                                <div class="probe-groups">
+                                    <div class="probe-group">
+                                        <span class="probe-label">RBAC 权限探针</span>
+                                        <button id="probeFaultsBtn" class="btn btn-outline btn-sm probe-btn" type="button"><span class="method">GET</span>/api/stations/faults</button>
+                                        <button id="probeRealtimeBtn" class="btn btn-outline btn-sm probe-btn" type="button"><span class="method">GET</span>/api/stations/realtime-status</button>
+                                        <button id="probeOperatorsBtn" class="btn btn-outline btn-sm probe-btn" type="button"><span class="method">GET</span>/api/stations/operators</button>
+                                        <button id="probeOrdersBtn" class="btn btn-outline btn-sm probe-btn" type="button"><span class="method">GET</span>/api/orders</button>
+                                        <button id="probeBillsBtn" class="btn btn-outline btn-sm probe-btn" type="button"><span class="method">GET</span>/api/settlements</button>
+                                    </div>
+                                    <div class="probe-group">
+                                        <span class="probe-label">约束与触发器守卫</span>
+                                        <button id="probeCommission1Btn" class="btn btn-danger btn-sm" type="button">重复投运 1 号桩（1644）</button>
+                                        <button id="probeOverpayBtn" class="btn btn-danger btn-sm" type="button">超付 6 号已付订单（1644）</button>
+                                        <button id="probeOverInvoiceBtn" class="btn btn-danger btn-sm" type="button">超额开票 1 号账单（1644）</button>
+                                    </div>
+                                </div>
+
+                                <figure class="console-figure">
+                                    <figcaption id="consoleCaption" class="console-caption">
+                                        <span class="console-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+                                        请求与响应输出
+                                    </figcaption>
+                                    <pre id="apiConsole" class="console-box" role="region" aria-labelledby="consoleCaption" tabindex="0"><code>等待发起探测请求...</code></pre>
+                                </figure>
+                            </div>
+                        </article>
+
+                        <article class="surface-card">
+                            <div class="section-head">
+                                <div>
+                                    <h2>5 条业务线接入状态</h2>
+                                    <p class="section-sub">与 <code>app/main.py</code> 当前装配的路由保持一致</p>
+                                </div>
+                            </div>
+                            <ul class="module-grid">
+                                <li class="module-item module-ready">
+                                    <div class="module-head"><strong>业务线 1 · station</strong><span class="badge badge-ok">已挂载</span></div>
+                                    <p class="meta">运营商、场站、充电桩、充电枪三级资产 + 5 个 RBAC 视图 + 2 个存储过程</p>
+                                </li>
+                                <li class="module-item module-ready">
+                                    <div class="module-head"><strong>业务线 2 · order</strong><span class="badge badge-ok">已挂载</span></div>
+                                    <p class="meta">分时规则、生成列同枪防并发（<code>1062</code>）、<code>sp_order_calc</code> 计费、支付/退款守卫</p>
+                                </li>
+                                <li class="module-item module-ready">
+                                    <div class="module-head"><strong>业务线 5 · settle</strong><span class="badge badge-ok">已挂载</span></div>
+                                    <p class="meta"><code>sp_settle_generate</code> 按月唯一结算单、对账差异核销、开票超限守卫与红冲</p>
+                                </li>
+                                <li class="module-item module-pending">
+                                    <div class="module-head"><strong>业务线 3 · monitor</strong><span class="badge badge-muted">待合入 main</span></div>
+                                    <p class="meta">分钟级遥测分区表、告警分级升级与 1:N 维修工单闭环（路由文件已占位）</p>
+                                </li>
+                                <li class="module-item module-pending">
+                                    <div class="module-head"><strong>业务线 4 · user</strong><span class="badge badge-muted">待合入 main</span></div>
+                                    <p class="meta">车主/车辆（HMAC+Fernet）、车队与优惠券（<code>user_account</code> 建表后启用账号登录）</p>
+                                </li>
+                            </ul>
+                        </article>
+                    </div>
+                </section>
+            </main>
         </div>
-        <div class="topbar-right">
-            <span id="dbHealthPill" class="status-pill">
-                <span id="dbHealthDot" class="status-dot"></span>
-                <span id="dbHealthText">正在探测数据库连接...</span>
-            </span>
-            <a class="btn btn-outline btn-sm" href="/docs" target="_blank" rel="noopener">Swagger 接口文档</a>
+    </div>
+
+    <!-- 4. 原生 Modal 对话框集合 -->
+
+    <!-- 4.1 账号登录与自助注册 -->
+    <dialog id="authDialog" class="modal-dialog" aria-labelledby="authDialogTitle">
+        <div class="dialog-head">
+            <h2 id="authDialogTitle">登录平台账号</h2>
+            <button class="btn btn-ghost btn-xs dialog-close-x" type="button" data-close-dialog aria-label="关闭登录弹窗">关闭</button>
         </div>
-    </header>
+        <div class="dialog-body">
+            <div class="dialog-mode-switch segmented" role="group" aria-label="认证模式切换">
+                <button id="modeLoginBtn" class="btn btn-primary btn-xs" type="button" aria-pressed="true">账号登录</button>
+                <button id="modeRegisterBtn" class="btn btn-outline btn-xs" type="button" aria-pressed="false">车主 / 车队注册</button>
+            </div>
+            <p id="authDialogError" class="inline-alert" role="alert" hidden></p>
 
-    <main class="container">
-        <!-- 认证与 5 类角色切换中心 -->
-        <section class="card">
-            <div class="auth-bar">
-                <div>
-                    <div class="section-header" style="margin-bottom: 4px;">
-                        <h2>RBAC 角色切换与认证中心</h2>
-                        <span class="meta">开发联调一键签发 HS256 JWT（<code>POST /api/auth/dev-token</code>）</span>
-                    </div>
-                    <div class="toolbar" style="margin-bottom: 6px;">
-                        <label class="meta">联调 user_id：</label>
-                        <input id="devUserId" type="number" min="1" value="9001" style="width: 90px;" title="设为 9001 可直接查看线2种子订单">
-                        <label class="meta">fleet_id（仅车队）：</label>
-                        <input id="devFleetId" type="number" min="1" value="1" style="width: 80px;">
-                        <button id="toggleLoginBtn" class="btn btn-outline btn-sm" type="button">账号密码登录</button>
-                    </div>
-                    <div id="roleButtons" class="role-buttons">
-                        <button class="role-btn" data-role="driver" type="button">普通车主 (driver)</button>
-                        <button class="role-btn" data-role="fleet" type="button">企业车队 (fleet)</button>
-                        <button class="role-btn" data-role="ops" type="button">场站运维 (ops)</button>
-                        <button class="role-btn" data-role="settlement" type="button">结算专员 (settlement)</button>
-                        <button class="role-btn" data-role="admin" type="button">平台管理员 (admin)</button>
+            <form id="loginForm" class="dialog-form">
+                <div class="field">
+                    <label for="loginUsername">用户名</label>
+                    <input id="loginUsername" name="username" type="text" autocomplete="username" autocorrect="off" autocapitalize="none" spellcheck="false" minlength="2" maxlength="50" required autofocus>
+                </div>
+                <div class="field">
+                    <label for="loginPassword">密码</label>
+                    <div class="password-wrap">
+                        <input id="loginPassword" name="password" type="password" autocomplete="current-password" minlength="6" maxlength="128" required>
+                        <button id="toggleLoginPwdBtn" class="btn btn-outline btn-xs" type="button" aria-pressed="false" aria-label="显示登录密码">显示</button>
                     </div>
                 </div>
-                <div id="userContextCard" class="user-context">
-                    <div><strong>当前身份：</strong><span id="currentUserLabel">未签发</span></div>
-                    <div id="currentRoleDesc" class="role-desc">请点击左侧任意角色按钮签发测试 Token 后开始操作。</div>
+                <p class="hint">需业务线 4（<code>user_account</code>）合入建表后使用；联调阶段可直接在顶栏切换 5 类角色。</p>
+                <div class="dialog-actions">
+                    <button class="btn btn-outline" type="button" data-close-dialog>取消</button>
+                    <button id="loginSubmitBtn" class="btn btn-primary" type="submit">登录</button>
                 </div>
-            </div>
+            </form>
 
-            <!-- 可折叠真实账号登录表单（待业务线4创建 user_account 表后可用） -->
-            <div id="loginPanel" style="display: none; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);">
-                <div class="toolbar" style="margin-bottom: 0;">
-                    <input id="loginUsername" type="text" placeholder="用户名">
-                    <input id="loginPassword" type="password" placeholder="密码">
-                    <button id="realLoginSubmitBtn" class="btn btn-primary btn-sm" type="button">登录（POST /api/auth/login）</button>
-                    <span class="meta">提示：需业务线 4（user_account）建表后使用，当前联调请优先用上方快捷签发角色 Token。</span>
+            <form id="registerForm" class="dialog-form" hidden>
+                <div class="field">
+                    <label for="regUsername">用户名（2~50 位字母、数字、下划线或中文）</label>
+                    <input id="regUsername" name="username" type="text" autocomplete="username" autocorrect="off" autocapitalize="none" spellcheck="false" minlength="2" maxlength="50" required>
                 </div>
-            </div>
-        </section>
-
-        <!-- 功能工作台选项卡 -->
-        <nav class="tabs" id="mainTabs">
-            <button class="tab-btn active" data-tab="tab-driver" type="button">找站与可用枪（车主/车队）</button>
-            <button class="tab-btn" data-tab="tab-ops" type="button">运维排障与巡检（运维/管理员）</button>
-            <button class="tab-btn" data-tab="tab-admin" type="button">全局看板与三级建档（管理员/结算）</button>
-            <button class="tab-btn" data-tab="tab-cross" type="button">跨线联调与越权检验</button>
-        </nav>
-
-        <!-- Tab 1: 车主 / 车队找站查枪 -->
-        <section id="tab-driver" class="tab-panel active">
-            <div class="card">
-                <div class="section-header">
-                    <h3>营业场站概览（视图 <code>v_driver_station_overview</code>）</h3>
-                    <span class="meta">仅显示营业中场站与已验收正常桩聚合数据，屏蔽敏感联系字段</span>
+                <div class="field">
+                    <label for="regPhone">11 位手机号</label>
+                    <input id="regPhone" name="phone" type="tel" autocomplete="tel" inputmode="numeric" pattern="1[3-9]\d{9}" placeholder="如：13800138000" required>
                 </div>
-                <div class="toolbar">
-                    <input id="stationKeyword" type="text" placeholder="搜索场站名称或地址（如 清华东路）" style="min-width: 240px;">
-                    <label style="display: inline-flex; align-items: center; gap: 6px; font-size: 13px;">
-                        <input id="onlyIdleFast" type="checkbox"> 仅看含空闲快充枪场站
-                    </label>
-                    <button id="searchStationsBtn" class="btn btn-primary" type="button">查询场站</button>
+                <div class="field">
+                    <label for="regPassword">设置密码（6~128 位）</label>
+                    <div class="password-wrap">
+                        <input id="regPassword" name="password" type="password" autocomplete="new-password" minlength="6" maxlength="128" required>
+                        <button id="toggleRegPwdBtn" class="btn btn-outline btn-xs" type="button" aria-pressed="false" aria-label="显示注册密码">显示</button>
+                    </div>
                 </div>
-                <div id="driverStationGrid" class="station-grid"></div>
-                <div id="driverStationPager" class="pagination"></div>
-            </div>
-
-            <div class="card">
-                <div class="section-header">
-                    <h3>充电枪实时可用明细（视图 <code>v_driver_gun_availability</code>）</h3>
-                    <div class="toolbar" style="margin-bottom: 0;">
-                        <input id="gunStationFilter" type="number" min="1" placeholder="场站ID（可选）" style="width: 130px;">
-                        <select id="gunTypeFilter">
-                            <option value="">全部枪型</option>
-                            <option value="DC_FAST">直流快充 (DC_FAST)</option>
-                            <option value="AC_SLOW">交流慢充 (AC_SLOW)</option>
+                <div class="field-row">
+                    <div class="field">
+                        <label for="regRole">注册角色</label>
+                        <select id="regRole" name="role">
+                            <option value="driver">普通车主 (driver)</option>
+                            <option value="fleet">企业车队 (fleet)</option>
                         </select>
-                        <select id="gunStatusFilter">
-                            <option value="">全部状态</option>
-                            <option value="IDLE">空闲 (IDLE)</option>
-                            <option value="OCCUPIED">占用 (OCCUPIED)</option>
-                        </select>
-                        <button id="searchGunsBtn" class="btn btn-outline" type="button">查询充电枪</button>
+                    </div>
+                    <div class="field" id="regFleetWrap" hidden>
+                        <label for="regFleetId">所属车队 ID</label>
+                        <input id="regFleetId" name="fleet_id" type="number" min="1" inputmode="numeric" placeholder="车队角色必填">
                     </div>
                 </div>
-                <div class="table-wrap">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>枪ID</th>
-                                <th>枪编号</th>
-                                <th>所属场站</th>
-                                <th>所属桩</th>
-                                <th>枪型</th>
-                                <th>接口标准</th>
-                                <th>最大功率(kW)</th>
-                                <th>枪状态</th>
-                            </tr>
-                        </thead>
-                        <tbody id="driverGunsBody"></tbody>
-                    </table>
+                <div class="dialog-actions">
+                    <button class="btn btn-outline" type="button" data-close-dialog>取消</button>
+                    <button id="registerSubmitBtn" class="btn btn-primary" type="submit">注册账号</button>
+                </div>
+            </form>
+        </div>
+    </dialog>
+
+    <!-- 4.2 扫码开单 -->
+    <dialog id="startOrderDialog" class="modal-dialog" aria-labelledby="startOrderTitle">
+        <div class="dialog-head">
+            <h2 id="startOrderTitle">扫码开单</h2>
+            <button class="btn btn-ghost btn-xs dialog-close-x" type="button" data-close-dialog aria-label="关闭开单弹窗">关闭</button>
+        </div>
+        <form id="startOrderForm" class="dialog-body dialog-form">
+            <p id="startOrderTargetInfo" class="context-summary"></p>
+            <p id="startOrderError" class="inline-alert" role="alert" hidden></p>
+            <div class="field-row">
+                <div class="field">
+                    <label for="soStationId">场站 ID</label>
+                    <input id="soStationId" name="station_id" type="number" min="1" required>
+                </div>
+                <div class="field">
+                    <label for="soGunId">充电枪 ID</label>
+                    <input id="soGunId" name="gun_id" type="number" min="1" required>
                 </div>
             </div>
-        </section>
-
-        <!-- Tab 2: 运维排障、状态日志与存储过程巡检 -->
-        <section id="tab-ops" class="tab-panel">
-            <div class="card">
-                <div class="section-header">
-                    <h3>运维存储过程快捷动作（<code>ops</code> / <code>admin</code>）</h3>
-                    <span class="meta">触发器自动审计留痕，数据库 UTC 基准时间戳防漂移</span>
+            <div class="field-row">
+                <div class="field">
+                    <label for="soVehicleId">车辆 ID（可选）</label>
+                    <input id="soVehicleId" name="vehicle_id" type="number" min="1" placeholder="扫码充可留空">
                 </div>
-                <div class="toolbar" style="margin-bottom: 0;">
-                    <button id="heartbeatCheckBtn" class="btn btn-warn" type="button">执行全网心跳离线巡检（proc_check_pile_heartbeat_offline）</button>
-                    <input id="opsPileId" type="number" min="1" value="21" style="width: 90px;" title="充电桩 ID">
-                    <button id="commissionPileBtn" class="btn btn-primary" type="button">验收投运该桩（proc_commission_charging_pile）</button>
-                    <button id="reportHeartbeatBtn" class="btn btn-outline" type="button">上报该桩心跳（NOW）</button>
+                <div class="field">
+                    <label for="soStartSoc">起始 SOC (%)（可选）</label>
+                    <input id="soStartSoc" name="start_soc" type="text" value="25" inputmode="decimal">
                 </div>
             </div>
+            <div class="dialog-actions">
+                <button class="btn btn-outline" type="button" data-close-dialog>取消</button>
+                <button id="startOrderSubmitBtn" class="btn btn-primary" type="submit" autofocus>确认开单</button>
+            </div>
+        </form>
+    </dialog>
 
-            <div class="card">
-                <div class="section-header">
-                    <h3>故障枪与离线桩清单（视图 <code>v_fault_gun_detail</code>）</h3>
-                    <div class="toolbar" style="margin-bottom: 0;">
-                        <select id="faultPileStatusFilter">
-                            <option value="">全部异常状态</option>
-                            <option value="FAULT">FAULT</option>
-                            <option value="OFFLINE">OFFLINE</option>
-                        </select>
-                        <button id="loadFaultsBtn" class="btn btn-outline btn-sm" type="button">刷新故障清单</button>
-                    </div>
+    <!-- 4.3 结束充电并计费 -->
+    <dialog id="finishOrderDialog" class="modal-dialog" aria-labelledby="finishOrderTitle">
+        <div class="dialog-head">
+            <h2 id="finishOrderTitle">结束充电并分时计费</h2>
+            <button class="btn btn-ghost btn-xs dialog-close-x" type="button" data-close-dialog aria-label="关闭结束计费弹窗">关闭</button>
+        </div>
+        <form id="finishOrderForm" class="dialog-body dialog-form">
+            <input id="foOrderId" name="order_id" type="hidden">
+            <p id="finishOrderInfo" class="context-summary"></p>
+            <p id="finishOrderError" class="inline-alert" role="alert" hidden></p>
+            <div class="field-row">
+                <div class="field">
+                    <label for="foKwh">本次充电度数 (kWh，0 &lt; kwh ≤ 200)</label>
+                    <input id="foKwh" name="kwh" type="text" value="32.500" inputmode="decimal" required autofocus>
                 </div>
-                <div class="table-wrap">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>场站</th>
-                                <th>桩编号</th>
-                                <th>桩状态</th>
-                                <th>枪编号</th>
-                                <th>枪状态</th>
-                                <th>心跳滞后(s)</th>
-                                <th>客服热线(脱敏)</th>
-                                <th>快速处置</th>
-                            </tr>
-                        </thead>
-                        <tbody id="faultsBody"></tbody>
-                    </table>
+                <div class="field">
+                    <label for="foEndSoc">结束 SOC (%)（可选）</label>
+                    <input id="foEndSoc" name="end_soc" type="text" value="85" inputmode="decimal">
                 </div>
             </div>
+            <div class="dialog-actions">
+                <button class="btn btn-outline" type="button" data-close-dialog>取消</button>
+                <button id="finishOrderSubmitBtn" class="btn btn-primary" type="submit">结束充电并结算</button>
+            </div>
+        </form>
+    </dialog>
 
-            <div class="card">
-                <div class="section-header">
-                    <h3>设备状态变更历史与运维待办（视图 <code>v_device_status_history</code>）</h3>
-                    <div class="toolbar" style="margin-bottom: 0;">
-                        <select id="logDeviceTypeFilter">
-                            <option value="">全部设备</option>
-                            <option value="PILE">充电桩 (PILE)</option>
-                            <option value="GUN">充电枪 (GUN)</option>
-                        </select>
-                        <select id="logTodoStatusFilter">
-                            <option value="">全部待办</option>
-                            <option value="PENDING">待处理 (PENDING)</option>
-                            <option value="DONE">已办结 (DONE)</option>
-                            <option value="NONE">无需处理 (NONE)</option>
-                        </select>
-                        <button id="loadLogsBtn" class="btn btn-outline btn-sm" type="button">刷新状态日志</button>
-                    </div>
+    <!-- 4.4 订单支付 / 退款 -->
+    <dialog id="payOrderDialog" class="modal-dialog" aria-labelledby="payOrderTitle">
+        <div class="dialog-head">
+            <h2 id="payOrderTitle">订单支付 / 退款</h2>
+            <button class="btn btn-ghost btn-xs dialog-close-x" type="button" data-close-dialog aria-label="关闭支付弹窗">关闭</button>
+        </div>
+        <form id="payOrderForm" class="dialog-body dialog-form">
+            <input id="poOrderId" name="order_id" type="hidden">
+            <p id="payOrderInfo" class="context-summary"></p>
+            <p id="payOrderError" class="inline-alert" role="alert" hidden></p>
+            <div class="field-row">
+                <div class="field">
+                    <label for="poAmount">交易金额（正数支付，负数退款）</label>
+                    <input id="poAmount" name="amount" type="text" inputmode="text" required autofocus>
                 </div>
-                <div class="table-wrap">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>日志ID</th>
-                                <th>场站</th>
-                                <th>设备</th>
-                                <th>变更轨迹</th>
-                                <th>来源</th>
-                                <th>待办</th>
-                                <th>备注</th>
-                                <th>时间(UTC)</th>
-                                <th>操作</th>
-                            </tr>
-                        </thead>
-                        <tbody id="statusLogsBody"></tbody>
-                    </table>
+                <div class="field">
+                    <label for="poMethod">支付渠道</label>
+                    <select id="poMethod" name="method">
+                        <option value="WECHAT">微信支付 (WECHAT)</option>
+                        <option value="ALIPAY">支付宝 (ALIPAY)</option>
+                        <option value="BALANCE">账户余额 (BALANCE)</option>
+                        <option value="CASH">线下现金 (CASH)</option>
+                    </select>
                 </div>
             </div>
-        </section>
-
-        <!-- Tab 3: 管理员实时看板与三级资产建档 -->
-        <section id="tab-admin" class="tab-panel">
-            <div class="card">
-                <div class="section-header">
-                    <h3>全平台场站实时资产看板（视图 <code>v_station_realtime_status</code>，仅 <code>admin</code> / <code>settlement</code>）</h3>
-                    <button id="loadRealtimeBtn" class="btn btn-primary btn-sm" type="button">刷新全局看板</button>
-                </div>
-                <div id="realtimeKpis" class="kpi-grid"></div>
-                <div class="table-wrap">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>场站ID</th>
-                                <th>场站名称</th>
-                                <th>运营商</th>
-                                <th>营业状态</th>
-                                <th>总桩/待验/闲/忙/故障/离</th>
-                                <th>额定总功率(kW)</th>
-                                <th>总枪/闲/忙/故障/离</th>
-                                <th>操作</th>
-                            </tr>
-                        </thead>
-                        <tbody id="realtimeBody"></tbody>
-                    </table>
+            <div class="field">
+                <label for="poTxnNo">渠道流水号（幂等防重）</label>
+                <div class="password-wrap">
+                    <input id="poTxnNo" name="txn_no" type="text" minlength="6" maxlength="64" autocorrect="off" autocapitalize="none" spellcheck="false" required>
+                    <button id="genTxnBtn" class="btn btn-outline btn-xs" type="button">换单号</button>
                 </div>
             </div>
-
-            <div class="grid-2">
-                <div class="card">
-                    <div class="section-header">
-                        <h3>运营商档案 / 脱敏摘要</h3>
-                        <div class="toolbar" style="margin-bottom: 0;">
-                            <button id="loadOperatorsFullBtn" class="btn btn-outline btn-sm" type="button">完整档案（admin）</button>
-                            <button id="loadOperatorsSummaryBtn" class="btn btn-outline btn-sm" type="button">脱敏摘要（admin/settlement）</button>
-                        </div>
-                    </div>
-                    <div class="table-wrap" style="max-height: 270px; overflow-y: auto;">
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>ID</th>
-                                    <th>编码</th>
-                                    <th>名称</th>
-                                    <th>状态</th>
-                                    <th>热线 / 脱敏热线</th>
-                                    <th>信用代码</th>
-                                </tr>
-                            </thead>
-                            <tbody id="operatorsBody"></tbody>
-                        </table>
-                    </div>
-                </div>
-
-                <div class="card">
-                    <div class="section-header">
-                        <h3>场站下属桩 / 枪钻取查询（<code>ops</code> / <code>admin</code>）</h3>
-                    </div>
-                    <div class="toolbar">
-                        <input id="drillStationId" type="number" min="1" value="1" style="width: 100px;" placeholder="场站ID">
-                        <button id="drillPilesBtn" class="btn btn-outline btn-sm" type="button">查场站下属桩</button>
-                        <input id="drillPileId" type="number" min="1" value="1" style="width: 100px;" placeholder="桩ID">
-                        <button id="drillGunsBtn" class="btn btn-outline btn-sm" type="button">查桩下属枪</button>
-                    </div>
-                    <div id="drillResultBox" class="empty-hint">选择场站 ID 或桩 ID 进行资产明细钻取。</div>
-                </div>
+            <div class="preset-row">
+                <span class="hint">演示填值</span>
+                <button id="presetRefundBtn" class="btn btn-outline btn-xs" type="button">-1.00 退款</button>
+                <button id="presetOverpayBtn" class="btn btn-danger btn-xs" type="button">9999 测超付拦截</button>
             </div>
-
-            <div class="grid-2">
-                <div class="card">
-                    <div class="section-header">
-                        <h3>新增充电场站（<code>POST /api/stations</code>，仅 <code>admin</code>）</h3>
-                        <span class="meta">支持实测 <code>1062</code> 重复 / <code>3819</code> 车位越界拦截</span>
-                    </div>
-                    <form id="createStationForm" class="form-grid">
-                        <div class="field"><label>运营商ID</label><input name="operator_id" type="number" min="1" value="1" required></div>
-                        <div class="field"><label>场站编码</label><input name="station_code" type="text" value="ST-DEMO-101" required></div>
-                        <div class="field"><label>场站名称</label><input name="station_name" type="text" value="演示超充示范站" required></div>
-                        <div class="field"><label>详细地址</label><input name="address" type="text" value="北京市海淀区学院路演示广场" required></div>
-                        <div class="field"><label>经度</label><input name="longitude" type="text" value="116.351200" required></div>
-                        <div class="field"><label>纬度</label><input name="latitude" type="text" value="40.001200" required></div>
-                        <div class="field"><label>总车位</label><input name="total_spaces" type="number" min="1" value="12" required></div>
-                        <div class="field"><label>空闲车位</label><input name="available_spaces" type="number" min="0" value="10" required></div>
-                        <div class="field"><label>停车费(元/h)</label><input name="parking_fee_rate" type="text" value="4.00" required></div>
-                        <div class="field" style="justify-content: flex-end;">
-                            <button class="btn btn-primary" type="submit">创建场站</button>
-                        </div>
-                    </form>
-                </div>
-
-                <div class="card">
-                    <div class="section-header">
-                        <h3>新增充电桩 / 充电枪（仅 <code>admin</code>）</h3>
-                        <span class="meta">自动留痕 INIT 日志并受 <code>1644</code> 功率/枪序号保护</span>
-                    </div>
-                    <form id="createPileForm" class="form-grid" style="margin-bottom: 14px;">
-                        <div class="field"><label>场站ID</label><input name="station_id" type="number" min="1" value="1" required></div>
-                        <div class="field"><label>桩编码</label><input name="pile_code" type="text" value="PL-DEMO-101" required></div>
-                        <div class="field"><label>设备型号</label><input name="device_model" type="text" value="HW-Fusion180" required></div>
-                        <div class="field"><label>额定功率(kW)</label><input name="rated_power" type="text" value="180.00" required></div>
-                        <div class="field"><label>设计枪数</label><input name="gun_count" type="number" min="1" max="8" value="2" required></div>
-                        <div class="field"><label>质保截止</label><input name="warranty_end_date" type="date" value="2031-12-31" required></div>
-                        <div class="field" style="justify-content: flex-end;">
-                            <button class="btn btn-outline" type="submit">新增待验收桩</button>
-                        </div>
-                    </form>
-                    <form id="createGunForm" class="form-grid">
-                        <div class="field"><label>所属桩ID</label><input name="pile_id" type="number" min="1" value="1" required></div>
-                        <div class="field"><label>枪编码</label><input name="gun_code" type="text" value="GN-DEMO-101-A" required></div>
-                        <div class="field"><label>枪序号</label><input name="gun_seq" type="number" min="1" value="2" required></div>
-                        <div class="field"><label>枪型</label>
-                            <select name="gun_type">
-                                <option value="DC_FAST">DC_FAST</option>
-                                <option value="AC_SLOW">AC_SLOW</option>
-                            </select>
-                        </div>
-                        <div class="field"><label>接口标准</label><input name="connector_standard" type="text" value="GB/T 20234.3" required></div>
-                        <div class="field"><label>最大功率(kW)</label><input name="max_power" type="text" value="180.00" required></div>
-                        <div class="field" style="justify-content: flex-end;">
-                            <button class="btn btn-outline" type="submit">新增充电枪</button>
-                        </div>
-                    </form>
-                </div>
+            <div class="dialog-actions">
+                <button class="btn btn-outline" type="button" data-close-dialog>取消</button>
+                <button id="payOrderSubmitBtn" class="btn btn-primary" type="submit">提交流水</button>
             </div>
-        </section>
+        </form>
+    </dialog>
 
-        <!-- Tab 4: 跨线联调与 RBAC/约束实测控制台 -->
-        <section id="tab-cross" class="tab-panel">
-            <div class="grid-2">
-                <div class="card">
-                    <div class="section-header">
-                        <h3>已挂载业务线联调（线 2 订单 + 线 5 结算）</h3>
-                        <span class="meta">线 3（monitor）与线 4（user）待组员合入 <code>main</code> 后接入</span>
-                    </div>
-                    <div class="toolbar">
-                        <button id="loadOrdersBtn" class="btn btn-outline btn-sm" type="button">查询订单（GET /api/orders）</button>
-                        <button id="loadBillsBtn" class="btn btn-outline btn-sm" type="button">查询结算单（GET /api/settlements）</button>
-                        <button id="loadDiffsBtn" class="btn btn-outline btn-sm" type="button">查询待处理差异（/diffs）</button>
-                    </div>
-                    <div id="crossPreviewBox" class="empty-hint">点击上方按钮，使用当前角色 Token 验证跨线接口返回或 403 越权拦截。</div>
-                </div>
+    <!-- 4.5 通用详情只读预览（订单分时明细 / 账单详情） -->
+    <dialog id="detailDialog" class="modal-dialog modal-wide" closedby="any" aria-labelledby="detailDialogTitle">
+        <div class="dialog-head">
+            <h2 id="detailDialogTitle">详情</h2>
+            <button class="btn btn-ghost btn-xs dialog-close-x" type="button" data-close-dialog aria-label="关闭详情弹窗">关闭</button>
+        </div>
+        <div id="detailDialogBody" class="dialog-body"></div>
+        <div class="dialog-actions dialog-footer-pad">
+            <button class="btn btn-primary btn-sm" type="button" data-close-dialog autofocus>关闭</button>
+        </div>
+    </dialog>
 
-                <div class="card">
-                    <div class="section-header">
-                        <h3>RBAC 越权与数据库约束一键自测</h3>
-                        <button id="clearConsoleBtn" class="btn btn-outline btn-sm" type="button">清空输出</button>
-                    </div>
-                    <div class="toolbar">
-                        <button id="probeFaultsBtn" class="btn btn-outline btn-sm" type="button">试探 /faults</button>
-                        <button id="probeRealtimeBtn" class="btn btn-outline btn-sm" type="button">试探 /realtime-status</button>
-                        <button id="probeOperatorsBtn" class="btn btn-outline btn-sm" type="button">试探 /operators</button>
-                        <button id="probeCommission1Btn" class="btn btn-danger btn-sm" type="button">重复验收 1号桩（触发 1644）</button>
-                    </div>
-                    <pre id="apiConsole" class="console-box">等待请求...</pre>
-                </div>
+    <!-- 4.6 通用操作确认/填参（验收投运、改状态、办结待办、编辑场站、新增/编辑运营商、开票、核销差异） -->
+    <dialog id="actionDialog" class="modal-dialog" aria-labelledby="actionDialogTitle">
+        <div class="dialog-head">
+            <h2 id="actionDialogTitle">执行操作</h2>
+            <button class="btn btn-ghost btn-xs dialog-close-x" type="button" data-close-dialog aria-label="关闭操作弹窗">关闭</button>
+        </div>
+        <form id="actionDialogForm" class="dialog-body dialog-form">
+            <p id="actionDialogDesc" class="context-summary" hidden></p>
+            <p id="actionDialogError" class="inline-alert" role="alert" hidden></p>
+            <div id="actionDialogFields" class="dialog-fields"></div>
+            <div class="dialog-actions">
+                <button class="btn btn-outline" type="button" data-close-dialog>取消</button>
+                <button id="actionDialogSubmitBtn" class="btn btn-primary" type="submit">确认提交</button>
             </div>
-        </section>
-    </main>
+        </form>
+    </dialog>
 
-    <div id="toast" class="toast"></div>
+    <!-- 5. 无障碍播报与可堆叠 Toast 容器 -->
+    <div id="liveAnnouncer" class="visually-hidden" aria-live="polite" aria-atomic="true"></div>
+    <div id="toastStack" class="toast-stack" role="region" aria-label="系统操作通知"></div>
+
     <script src="/static/app.js"></script>
 </body>
 </html>
