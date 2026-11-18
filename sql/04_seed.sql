@@ -372,5 +372,137 @@ UNION ALL SELECT 'invoice_record', COUNT(*) FROM invoice_record;
 
 
 -- ============================================================================
--- 【业务线 3 ~ 业务线 4】测试数据占位区（各负责成员追加，保证每表 >= 20 条）
+-- 【业务线 3】设备监控与工单测试数据（负责人：成员 3 / 代润森）
+-- 数据规模：pile_telemetry(24) / alarm_record(22) / repair_order(24)
+-- 说明：遥测采用固定时间戳便于重复执行；告警与工单保留 1:N 演示样本
+--       （alarm_id=21/22 各挂 2 张工单：1 张已闭环 + 1 张处理中）。
+-- ============================================================================
+
+-- 1. 分钟级遥测（24 条，按桩每分钟一条，故障/离线桩携带对应 fault_code）
+INSERT INTO pile_telemetry (
+    telemetry_id, pile_id, collected_at, output_voltage, output_current, power,
+    module_temp, offline_duration_sec, fault_code
+) VALUES
+(1,  1,  TIMESTAMPADD(MINUTE, 1,  '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 28.5, 0,    NULL),
+(2,  2,  TIMESTAMPADD(MINUTE, 2,  '2026-11-15 08:00:00'), 420.0, 52.00, 21.840, 39.2, 0, NULL),
+(3,  3,  TIMESTAMPADD(MINUTE, 3,  '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 30.1, 0,    NULL),
+(4,  4,  TIMESTAMPADD(MINUTE, 4,  '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 26.3, 0,    NULL),
+(5,  5,  TIMESTAMPADD(MINUTE, 5,  '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 31.2, 0,    NULL),
+(6,  6,  TIMESTAMPADD(MINUTE, 6,  '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 55.8, 0,    'E-CONTACTOR_STUCK'),
+(7,  7,  TIMESTAMPADD(MINUTE, 7,  '2026-11-15 08:00:00'), 480.0, 60.00, 28.800, 45.1, 0, NULL),
+(8,  8,  TIMESTAMPADD(MINUTE, 8,  '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 27.4, 0,    NULL),
+(9,  9,  TIMESTAMPADD(MINUTE, 9,  '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 29.0, 0,    NULL),
+(10, 10, TIMESTAMPADD(MINUTE, 10, '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 33.6, 0,    NULL),
+(11, 11, TIMESTAMPADD(MINUTE, 11, '2026-11-15 08:00:00'), 500.0, 55.00, 27.500, 47.3, 0, NULL),
+(12, 12, TIMESTAMPADD(MINUTE, 12, '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 28.8, 0,    NULL),
+(13, 13, TIMESTAMPADD(MINUTE, 13, '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 0.0,  45,   'E_COMM_TIMEOUT'),
+(14, 14, TIMESTAMPADD(MINUTE, 14, '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 35.2, 0,    NULL),
+(15, 15, TIMESTAMPADD(MINUTE, 15, '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 30.7, 0,    NULL),
+(16, 16, TIMESTAMPADD(MINUTE, 16, '2026-11-15 08:00:00'), 450.0, 48.00, 21.600, 42.9, 0, NULL),
+(17, 17, TIMESTAMPADD(MINUTE, 17, '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 27.1, 0,    NULL),
+(18, 18, TIMESTAMPADD(MINUTE, 18, '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 61.3, 0,    'E-ESTOP_TRIGGERED'),
+(19, 19, TIMESTAMPADD(MINUTE, 19, '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 26.9, 0,    NULL),
+(20, 20, TIMESTAMPADD(MINUTE, 20, '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 31.8, 0,    NULL),
+(21, 21, TIMESTAMPADD(MINUTE, 21, '2026-11-15 08:00:00'), NULL,  NULL, 0.000, 0.0,  120,  'E_OFFLINE'),
+(22, 22, TIMESTAMPADD(MINUTE, 22, '2026-11-15 08:00:00'), NULL,  NULL, 0.000, 0.0,  300,  'E_OFFLINE'),
+(23, 23, TIMESTAMPADD(MINUTE, 23, '2026-11-15 08:00:00'), NULL,  NULL, 0.000, 0.0,  1200, 'E_OFFLINE'),
+(24, 24, TIMESTAMPADD(MINUTE, 24, '2026-11-15 08:00:00'), NULL,  NULL, 0.000, 0.0,  300,  'E_OFFLINE')
+AS nv
+ON DUPLICATE KEY UPDATE
+    pile_id              = nv.pile_id,
+    output_voltage       = nv.output_voltage,
+    output_current       = nv.output_current,
+    power                = nv.power,
+    module_temp          = nv.module_temp,
+    offline_duration_sec = nv.offline_duration_sec,
+    fault_code           = nv.fault_code;
+
+
+-- 2. 设备告警（22 条：覆盖 ACTIVE / PROCESSING / RECOVERED / CLOSED 与四级等级）
+INSERT INTO alarm_record (
+    alarm_id, pile_id, gun_id, alarm_code, alarm_level, original_level,
+    response_limit_min, occurred_at, recovered_at, status, escalated_count, escalated_at
+) VALUES
+(1,  6,  11, 'E-CONTACTOR_STUCK',   'L1', 'L1', 15,  '2026-11-16 09:30:00', NULL,                 'ACTIVE',     0, NULL),
+(2,  13, NULL, 'E_COMM_TIMEOUT',     'L2', 'L2', 30,  '2026-11-16 08:00:00', NULL,                 'ACTIVE',     0, NULL),
+(3,  18, 34,  'E-ESTOP_TRIGGERED',   'L3', 'L3', 120, '2026-11-15 10:00:00', NULL,                 'ACTIVE',     0, NULL),
+(4,  2,  3,   'E_MODULE_OVERHEAT',   'L1', 'L1', 15,  '2026-11-16 10:20:00', NULL,                 'PROCESSING', 0, NULL),
+(5,  6,  11,  'E_CONTACTOR_STUCK',   'L2', 'L2', 30,  '2026-11-14 06:00:00', '2026-11-14 10:00:00', 'RECOVERED',  0, NULL),
+(6,  6,  11,  'E_INSULATION_LOW',    'L1', 'L1', 15,  '2026-11-13 06:00:00', '2026-11-13 09:00:00', 'CLOSED',     0, NULL),
+(7,  13, NULL, 'E_COMM_TIMEOUT',     'L3', 'L3', 120, '2026-11-12 07:30:00', '2026-11-12 12:00:00', 'RECOVERED',  0, NULL),
+(8,  18, 34,  'E_ESTOP_TRIGGERED',   'L2', 'L2', 30,  '2026-11-11 07:30:00', '2026-11-11 10:00:00', 'CLOSED',     0, NULL),
+(9,  1,  NULL, 'E_POWER_SUPPLY_ABN', 'L4', 'L4', 480, '2026-11-16 11:00:00', NULL,                 'PROCESSING', 0, NULL),
+(10, 13, 25,  'E_GUN_LOCK_FAIL',     'L3', 'L2', 120, '2026-11-16 06:00:00', NULL,                 'PROCESSING', 1, '2026-11-16 08:01:00'),
+(11, 11, 21,  'E_OVER_CURRENT',      'L2', 'L2', 30,  '2026-11-16 09:45:00', NULL,                 'PROCESSING', 0, NULL),
+(12, 11, 21,  'E_OVER_CURRENT',      'L1', 'L1', 15,  '2026-11-15 08:00:00', '2026-11-15 08:20:00', 'RECOVERED',  0, NULL),
+(13, 16, 31,  'E_COOLING_FAIL',      'L2', 'L2', 30,  '2026-11-14 07:00:00', '2026-11-14 09:00:00', 'CLOSED',     0, NULL),
+(14, 7,  13,  'E_OVER_VOLTAGE',      'L3', 'L3', 120, '2026-11-16 08:30:00', NULL,                 'PROCESSING', 0, NULL),
+(15, 10, NULL, 'E_TEMP_SENSOR_FAIL', 'L4', 'L4', 480, '2026-11-15 05:00:00', NULL,                 'PROCESSING', 0, NULL),
+(16, 2,  3,   'E_MODULE_OVERHEAT',   'L2', 'L2', 30,  '2026-11-13 06:00:00', '2026-11-13 07:30:00', 'RECOVERED',  0, NULL),
+(17, 12, NULL, 'E_FAN_SPEED_LOW',    'L3', 'L3', 120, '2026-11-12 04:00:00', '2026-11-12 09:00:00', 'CLOSED',     0, NULL),
+(18, 5,  17,  'E_OVER_CURRENT',      'L1', 'L1', 15,  '2026-11-16 10:50:00', NULL,                 'PROCESSING', 0, NULL),
+(19, 8,  NULL, 'E_COMM_RETRY_LIMIT', 'L2', 'L1', 30,  '2026-11-16 07:10:00', NULL,                 'PROCESSING', 1, '2026-11-16 07:41:00'),
+(20, 14, NULL, 'E_COOLANT_LEAK',     'L4', 'L4', 480, '2026-11-11 03:00:00', '2026-11-11 12:00:00', 'RECOVERED',  0, NULL),
+(21, 15, 29,  'E_OVER_CURRENT',      'L2', 'L2', 30,  '2026-11-16 08:15:00', NULL,                 'PROCESSING', 0, NULL),
+(22, 20, 36,  'E_OVER_TEMPERATURE',  'L3', 'L3', 120, '2026-11-15 11:00:00', NULL,                 'PROCESSING', 0, NULL)
+AS nv
+ON DUPLICATE KEY UPDATE
+    pile_id             = nv.pile_id,
+    gun_id              = nv.gun_id,
+    alarm_code          = nv.alarm_code,
+    alarm_level         = nv.alarm_level,
+    original_level      = nv.original_level,
+    response_limit_min  = nv.response_limit_min,
+    occurred_at         = nv.occurred_at,
+    recovered_at        = nv.recovered_at,
+    status              = nv.status,
+    escalated_count     = nv.escalated_count,
+    escalated_at        = nv.escalated_at;
+
+
+-- 3. 维修工单（24 条：alarm_id=21/22 各 2 张工单演示 1:N；时间节点严格递增）
+INSERT INTO repair_order (
+    work_order_id, alarm_id, maintainer_id, status, dispatched_at, accepted_at,
+    arrived_at, repaired_at, verified_at, closed_at, replaced_parts, result
+) VALUES
+(1,  5,  2, 'CLOSED',     '2026-11-14 06:05:00', '2026-11-14 06:10:00', '2026-11-14 06:20:00', '2026-11-14 07:30:00', '2026-11-14 07:50:00', '2026-11-14 08:00:00', '主接触器', '首次维修更换后复发'),
+(2,  6,  3, 'CLOSED',     '2026-11-13 06:05:00', '2026-11-13 06:10:00', '2026-11-13 06:20:00', '2026-11-13 07:10:00', '2026-11-13 07:20:00', '2026-11-13 07:30:00', NULL, '首次绝缘复测通过后复发'),
+(3,  7,  4, 'CLOSED',     '2026-11-12 07:35:00', '2026-11-12 07:45:00', '2026-11-12 08:00:00', '2026-11-12 08:50:00', '2026-11-12 09:00:00', '2026-11-12 09:10:00', '通信模块', '首次模块复位后复发'),
+(4,  4,  2, 'ACCEPTED',   '2026-11-16 10:22:00', '2026-11-16 10:30:00', NULL,                 NULL,                 NULL,                 NULL,                 NULL, NULL),
+(5,  5,  3, 'CLOSED',     '2026-11-14 08:02:00', '2026-11-14 08:05:00', '2026-11-14 08:20:00', '2026-11-14 09:30:00', '2026-11-14 09:50:00', '2026-11-14 10:00:00', '主接触器', '更换主接触器并测试通过'),
+(6,  6,  4, 'CLOSED',     '2026-11-13 08:02:00', '2026-11-13 08:06:00', '2026-11-13 08:15:00', '2026-11-13 08:40:00', '2026-11-13 08:55:00', '2026-11-13 09:00:00', NULL, '绝缘检测复测正常'),
+(7,  7,  2, 'CLOSED',     '2026-11-12 09:20:00', '2026-11-12 09:30:00', '2026-11-12 09:50:00', '2026-11-12 11:20:00', '2026-11-12 11:45:00', '2026-11-12 12:00:00', '通信模块', '更换4G通信模块恢复心跳'),
+(8,  8,  3, 'CLOSED',     '2026-11-11 07:35:00', '2026-11-11 07:40:00', '2026-11-11 08:00:00', '2026-11-11 09:30:00', '2026-11-11 09:50:00', '2026-11-11 10:00:00', NULL, '复位急停按钮并测试'),
+(9,  9,  5, 'DISPATCHED', '2026-11-16 11:02:00', NULL,                 NULL,                 NULL,                 NULL,                 NULL,                 NULL, NULL),
+(10, 10, 2, 'ACCEPTED',   '2026-11-16 06:02:00', '2026-11-16 06:10:00', NULL,                 NULL,                 NULL,                 NULL,                 NULL, NULL),
+(11, 11, 3, 'DISPATCHED', '2026-11-16 09:47:00', NULL,                 NULL,                 NULL,                 NULL,                 NULL,                 NULL, NULL),
+(12, 12, 4, 'CLOSED',     '2026-11-15 08:02:00', '2026-11-15 08:04:00', '2026-11-15 08:08:00', '2026-11-15 08:15:00', '2026-11-15 08:18:00', '2026-11-15 08:20:00', NULL, '重新标定电流采样'),
+(13, 13, 5, 'CLOSED',     '2026-11-14 07:02:00', '2026-11-14 07:10:00', '2026-11-14 07:30:00', '2026-11-14 08:40:00', '2026-11-14 08:55:00', '2026-11-14 09:00:00', '散热风扇', '更换散热风扇并验证风量'),
+(14, 14, 2, 'DISPATCHED', '2026-11-16 08:32:00', NULL,                 NULL,                 NULL,                 NULL,                 NULL,                 NULL, NULL),
+(15, 15, 3, 'ACCEPTED',   '2026-11-15 05:02:00', '2026-11-15 05:20:00', NULL,                 NULL,                 NULL,                 NULL,                 NULL, NULL),
+(16, 16, 4, 'CLOSED',     '2026-11-13 06:02:00', '2026-11-13 06:08:00', '2026-11-13 06:20:00', '2026-11-13 07:10:00', '2026-11-13 07:25:00', '2026-11-13 07:30:00', NULL, '清理风道并复测温度'),
+(17, 17, 5, 'CLOSED',     '2026-11-12 04:05:00', '2026-11-12 04:15:00', '2026-11-12 04:40:00', '2026-11-12 08:30:00', '2026-11-12 08:50:00', '2026-11-12 09:00:00', '风扇驱动板', '更换风扇驱动板'),
+(18, 18, 2, 'DISPATCHED', '2026-11-16 10:52:00', NULL,                 NULL,                 NULL,                 NULL,                 NULL,                 NULL, NULL),
+(19, 19, 3, 'ARRIVED',    '2026-11-16 07:12:00', '2026-11-16 07:20:00', '2026-11-16 07:35:00', NULL,                 NULL,                 NULL,                 NULL, NULL),
+(20, 20, 4, 'CLOSED',     '2026-11-11 03:10:00', '2026-11-11 03:30:00', '2026-11-11 04:00:00', '2026-11-11 11:00:00', '2026-11-11 11:40:00', '2026-11-11 12:00:00', '液冷管接头', '更换接头并补充冷却液'),
+(21, 21, 5, 'CLOSED',     '2026-11-16 08:16:00', '2026-11-16 08:20:00', '2026-11-16 08:35:00', '2026-11-16 09:10:00', '2026-11-16 09:20:00', '2026-11-16 09:30:00', NULL, '首次维修未彻底消除，已闭环'),
+(22, 21, 5, 'DISPATCHED', '2026-11-16 10:40:00', NULL,                 NULL,                 NULL,                 NULL,                 NULL,                 NULL, NULL),
+(23, 22, 2, 'CLOSED',     '2026-11-15 11:05:00', '2026-11-15 11:15:00', '2026-11-15 11:35:00', '2026-11-15 14:00:00', '2026-11-15 14:20:00', '2026-11-15 14:30:00', NULL, '首次处置后复测通过'),
+(24, 22, 2, 'ACCEPTED',   '2026-11-15 15:10:00', '2026-11-15 15:20:00', NULL,                 NULL,                 NULL,                 NULL,                 NULL, NULL)
+AS nv
+ON DUPLICATE KEY UPDATE
+    alarm_id       = nv.alarm_id,
+    maintainer_id  = nv.maintainer_id,
+    status         = nv.status,
+    dispatched_at  = nv.dispatched_at,
+    accepted_at    = nv.accepted_at,
+    arrived_at     = nv.arrived_at,
+    repaired_at    = nv.repaired_at,
+    verified_at    = nv.verified_at,
+    closed_at      = nv.closed_at,
+    replaced_parts = nv.replaced_parts,
+    result         = nv.result;
+
+-- ============================================================================
+-- 【业务线 4】测试数据占位区（各负责成员追加，保证每表 >= 20 条）
 -- ============================================================================
