@@ -26,15 +26,18 @@ if str(_PROJECT_ROOT) not in sys.path:
 from fastapi import HTTPException
 from fastapi.routing import APIRoute
 from fastapi.security import HTTPAuthorizationCredentials
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 from starlette.requests import Request
 from starlette.routing import Match
+import pymysql
 
 from app.auth import CurrentUser, RoleEnum, create_access_token, get_current_user
+from app.config import settings
 from app.dao import station as station_dao
-from app.db import SessionLocal
+from app.db import get_db
 from app.main import app, integrity_error_handler, operational_error_handler
 from app.routers import station as station_router
 from app.schemas.common import PageParams
@@ -51,7 +54,76 @@ from app.schemas.station import (
     TodoResolveIn,
 )
 
-_SEED_SQL_PATH = _PROJECT_ROOT / "sql" / "04_seed.sql"
+_SQL_DIR = _PROJECT_ROOT / "sql"
+_TEST_DB_NAME = "ev_charge_hub_test_station"
+
+
+def _split_mysql_script(sql_text: str) -> list[str]:
+    """按 DELIMITER 语句拆分可在 PyMySQL 顺序执行的 SQL 语句列表。"""
+    delimiter = ";"
+    buffer: list[str] = []
+    statements: list[str] = []
+    for raw_line in sql_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("--"):
+            continue
+        if stripped.upper().startswith("DELIMITER "):
+            delimiter = stripped.split(None, 1)[1].strip()
+            continue
+        buffer.append(raw_line)
+        joined = "\n".join(buffer)
+        if joined.rstrip().endswith(delimiter):
+            stmt = joined.rstrip()[: -len(delimiter)].strip()
+            if stmt:
+                statements.append(stmt)
+            buffer = []
+    tail = "\n".join(buffer).strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
+def _connect_mysql_admin() -> pymysql.connections.Connection:
+    """使用配置连接串中的凭据建立管理连接，用于创建与销毁隔离测试库。"""
+    url = make_url(settings.DATABASE_URL)
+    return pymysql.connect(
+        host=url.host or "127.0.0.1",
+        port=int(url.port or 3306),
+        user=url.username,
+        password=url.password or "",
+        charset="utf8mb4",
+        autocommit=True,
+    )
+
+
+def _rebuild_isolated_test_db() -> None:
+    """在独立临时库 ev_charge_hub_test_station 中全量重建并灌入种子数据（不触碰共享库）。"""
+    conn = _connect_mysql_admin()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"DROP DATABASE IF EXISTS `{_TEST_DB_NAME}`")
+            cur.execute(
+                f"CREATE DATABASE `{_TEST_DB_NAME}` "
+                "DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+            )
+            for fname in ("01_ddl.sql", "02_views.sql", "03_procs_triggers.sql", "04_seed.sql"):
+                sql_text = (_SQL_DIR / fname).read_text(encoding="utf-8").replace(
+                    "ev_charge_hub", _TEST_DB_NAME
+                )
+                for stmt in _split_mysql_script(sql_text):
+                    cur.execute(stmt)
+    finally:
+        conn.close()
+
+
+def _drop_isolated_test_db() -> None:
+    """销毁独立临时测试库，确保测试无任何跨库或数据残留影响。"""
+    conn = _connect_mysql_admin()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"DROP DATABASE IF EXISTS `{_TEST_DB_NAME}`")
+    finally:
+        conn.close()
 
 
 def _make_user(role: RoleEnum, user_id: int = 100, fleet_id: int | None = None) -> CurrentUser:
@@ -127,70 +199,6 @@ async def _call_asgi(
     return int(start_msg["status"]), parsed
 
 
-def _load_line1_seed_statements() -> list[str]:
-    """从 sql/04_seed.sql 提取 `-- 【业务线 2` 之前的业务线 1 SQL 语句列表。"""
-    content = _SEED_SQL_PATH.read_text(encoding="utf-8")
-    marker = "-- 【业务线 2"
-    idx = content.find(marker)
-    if idx == -1:
-        raise RuntimeError("未在 sql/04_seed.sql 中找到 '-- 【业务线 2' 分界标记")
-    line1_block = content[:idx]
-
-    # 剥离单行 SQL 注释与 USE 切换语句，在当前连接库上按分号拆分为可执行单句
-    cleaned_lines = [
-        line for line in line1_block.splitlines() if not line.lstrip().startswith("--")
-    ]
-    statements: list[str] = []
-    for raw_stmt in "\n".join(cleaned_lines).split(";"):
-        stmt = raw_stmt.strip()
-        if not stmt:
-            continue
-        if stmt.upper().startswith("USE "):
-            continue
-        statements.append(stmt)
-    return statements
-
-
-def _restore_line1_seed_data() -> None:
-    """清理测试期间新增行、重置自增序列并执行业务线 1 种子脚本恢复基线数据。"""
-    seed_stmts = _load_line1_seed_statements()
-    db = SessionLocal()
-    try:
-        # 1. 按外键子表到父表顺序删除测试新增记录
-        db.execute(text("DELETE FROM device_status_log WHERE log_id > 30"))
-        db.execute(text("DELETE FROM charging_gun WHERE gun_id > 40"))
-        db.execute(text("DELETE FROM charging_pile WHERE pile_id > 24"))
-        db.execute(text("DELETE FROM station WHERE station_id > 20"))
-        db.execute(text("DELETE FROM operator WHERE operator_id > 20"))
-
-        # 2. 重置 5 张表 AUTO_INCREMENT，确保测试后自增起点干净
-        db.execute(text("ALTER TABLE device_status_log AUTO_INCREMENT = 31"))
-        db.execute(text("ALTER TABLE charging_gun AUTO_INCREMENT = 41"))
-        db.execute(text("ALTER TABLE charging_pile AUTO_INCREMENT = 25"))
-        db.execute(text("ALTER TABLE station AUTO_INCREMENT = 21"))
-        db.execute(text("ALTER TABLE operator AUTO_INCREMENT = 21"))
-
-        # 3. 同一连接内执行业务线 1 种子恢复脚本（含 @skip_auto_status_log = 1 及尾部重置 NULL）
-        for stmt in seed_stmts:
-            db.execute(text(stmt))
-
-        # 4. 兜底清理全部状态会话变量
-        db.execute(
-            text(
-                "SET @skip_auto_status_log = NULL, "
-                "@status_change_source = NULL, "
-                "@status_todo_status = NULL, "
-                "@status_change_remark = NULL"
-            )
-        )
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
-
-
 def _find_station_api_route(path: str, method: str) -> APIRoute:
     """从 FastAPI 应用路由树（含 _IncludedRouter）中定位指定路径与 HTTP 方法对应的 APIRoute。"""
     upper_method = method.upper()
@@ -215,50 +223,53 @@ def _extract_role_guard(route: APIRoute):
 
 
 class StationLine1VerificationTest(unittest.TestCase):
-    """业务线 1 Python 四层代码与真实 MySQL 数据库验收测试集。"""
+    """业务线 1 Python 四层代码与隔离 MySQL 测试库端到端验收测试集。"""
 
     db: Session
+    _test_engine: Any
+    _TestSessionLocal: sessionmaker[Session]
 
     @classmethod
     def setUpClass(cls) -> None:
-        # 启动前先复位业务线 1 种子数据，刷新相对 NOW() 的心跳时间戳与日志基线
-        _restore_line1_seed_data()
+        # 在独立临时库构建 schema + 视图 + 存储过程 + 种子，绝不修改共享开发库
+        _rebuild_isolated_test_db()
+        test_url = make_url(settings.DATABASE_URL).set(database=_TEST_DB_NAME)
+        cls._test_engine = create_engine(
+            test_url,
+            pool_pre_ping=True,
+            pool_size=5,
+            max_overflow=5,
+        )
+        cls._TestSessionLocal = sessionmaker(
+            autoflush=False,
+            autocommit=False,
+            bind=cls._test_engine,
+        )
+
+        def _override_get_db():
+            session = cls._TestSessionLocal()
+            try:
+                yield session
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+        cls._prev_get_db_override = app.dependency_overrides.get(get_db)
+        app.dependency_overrides[get_db] = _override_get_db
 
     @classmethod
     def tearDownClass(cls) -> None:
-        # 全量测试结束后必须还原数据库种子数据与 AUTO_INCREMENT
-        _restore_line1_seed_data()
-        verify_db = SessionLocal()
-        try:
-            counts = {
-                "operator": verify_db.execute(text("SELECT COUNT(*) FROM operator")).scalar_one(),
-                "station": verify_db.execute(text("SELECT COUNT(*) FROM station")).scalar_one(),
-                "charging_pile": verify_db.execute(
-                    text("SELECT COUNT(*) FROM charging_pile")
-                ).scalar_one(),
-                "charging_gun": verify_db.execute(
-                    text("SELECT COUNT(*) FROM charging_gun")
-                ).scalar_one(),
-                "device_status_log": verify_db.execute(
-                    text("SELECT COUNT(*) FROM device_status_log")
-                ).scalar_one(),
-                "extra_logs": verify_db.execute(
-                    text("SELECT COUNT(*) FROM device_status_log WHERE log_id > 30")
-                ).scalar_one(),
-            }
-            assert counts == {
-                "operator": 20,
-                "station": 20,
-                "charging_pile": 24,
-                "charging_gun": 40,
-                "device_status_log": 30,
-                "extra_logs": 0,
-            }, f"tearDownClass 种子数据校验失败: {counts}"
-        finally:
-            verify_db.close()
+        if cls._prev_get_db_override is None:
+            app.dependency_overrides.pop(get_db, None)
+        else:
+            app.dependency_overrides[get_db] = cls._prev_get_db_override
+        cls._test_engine.dispose()
+        _drop_isolated_test_db()
 
     def setUp(self) -> None:
-        self.db = SessionLocal()
+        self.db = self._TestSessionLocal()
 
     def tearDown(self) -> None:
         self.db.close()
@@ -292,6 +303,7 @@ class StationLine1VerificationTest(unittest.TestCase):
             "/api/stations/piles/{pile_id}/status": {"patch"},
             "/api/stations/guns/{gun_id}/status": {"patch"},
             "/api/stations/operators": {"get", "post"},
+            "/api/stations/operators/summary": {"get"},
             "/api/stations/operators/{operator_id}": {"patch"},
             "/api/stations": {"post"},
             "/api/stations/piles": {"post"},
@@ -311,6 +323,7 @@ class StationLine1VerificationTest(unittest.TestCase):
         route_match_cases = [
             ("GET", "/api/stations/ping", "ping_station"),
             ("GET", "/api/stations/operators", "list_operators"),
+            ("GET", "/api/stations/operators/summary", "list_operator_summaries"),
             ("POST", "/api/stations/operators", "create_operator"),
             ("PATCH", "/api/stations/operators/1", "update_operator"),
             ("POST", "/api/stations", "create_station"),
@@ -340,6 +353,9 @@ class StationLine1VerificationTest(unittest.TestCase):
                 expected_endpoint_name,
                 f"路由 {method} {raw_path} 被错误路由遮蔽，命中 {matched_endpoint.__name__}",
             )
+
+        ping_route = _find_station_api_route("/api/stations/ping", "GET")
+        self.assertIsNotNone(ping_route.response_model)
 
         # 同时通过完整 ASGI 调度验证静态前缀与路径参数路由均无遮蔽（404 来自具体业务逻辑而非错配）
         admin_token = create_access_token(_make_user(RoleEnum.ADMIN, user_id=299))
@@ -392,27 +408,44 @@ class StationLine1VerificationTest(unittest.TestCase):
             _find_station_api_route("/api/stations/realtime-status", "GET")
         )
         list_ops_guard = _extract_role_guard(_find_station_api_route("/api/stations/operators", "GET"))
+        ops_summary_guard = _extract_role_guard(
+            _find_station_api_route("/api/stations/operators/summary", "GET")
+        )
 
         # driver 调用高权限路由守卫均抛 403
-        for guard in (faults_guard, commission_guard, create_station_guard, realtime_guard, list_ops_guard):
+        for guard in (
+            faults_guard,
+            commission_guard,
+            create_station_guard,
+            realtime_guard,
+            list_ops_guard,
+            ops_summary_guard,
+        ):
             with self.assertRaises(HTTPException) as ctx_403:
                 guard(user=driver_user)
             self.assertEqual(ctx_403.exception.status_code, 403)
 
-        # ops 不能新建场站（仅 admin），但可访问故障与投运接口
-        with self.assertRaises(HTTPException) as ctx_ops_403:
-            create_station_guard(user=ops_user)
-        self.assertEqual(ctx_ops_403.exception.status_code, 403)
+        # ops 不能新建场站（仅 admin）且不能看全平台资产看板（仅 admin / settlement），但可访问故障与投运接口
+        for ops_forbidden in (create_station_guard, realtime_guard, list_ops_guard, ops_summary_guard):
+            with self.assertRaises(HTTPException) as ctx_ops_403:
+                ops_forbidden(user=ops_user)
+            self.assertEqual(ctx_ops_403.exception.status_code, 403)
+
+        # settlement 不能查运营商完整档案（含信用代码与明文电话），但可查脱敏摘要与全平台看板
+        with self.assertRaises(HTTPException) as ctx_settle_403:
+            list_ops_guard(user=settlement_user)
+        self.assertEqual(ctx_settle_403.exception.status_code, 403)
 
         self.assertEqual(faults_guard(user=ops_user), ops_user)
         self.assertEqual(faults_guard(user=admin_user), admin_user)
         self.assertEqual(commission_guard(user=ops_user), ops_user)
         self.assertEqual(commission_guard(user=admin_user), admin_user)
         self.assertEqual(create_station_guard(user=admin_user), admin_user)
+        self.assertEqual(list_ops_guard(user=admin_user), admin_user)
         self.assertEqual(overview_guard(user=driver_user), driver_user)
         self.assertEqual(overview_guard(user=fleet_user), fleet_user)
         self.assertEqual(realtime_guard(user=settlement_user), settlement_user)
-        self.assertEqual(list_ops_guard(user=settlement_user), settlement_user)
+        self.assertEqual(ops_summary_guard(user=settlement_user), settlement_user)
 
         # 2.3 通过完整 ASGI 链路验证 401 / 403 / 200
         status_unauth, _ = asyncio.run(_call_asgi("GET", "/api/stations/faults"))
@@ -511,6 +544,9 @@ class StationLine1VerificationTest(unittest.TestCase):
             user=ops_user,
         )
         self.assertEqual(faults_page.total, 7)
+        self.assertIsNotNone(faults_page.items[0].service_phone_masked)
+        self.assertIn("****", faults_page.items[0].service_phone_masked)
+        self.assertFalse(hasattr(faults_page.items[0], "service_phone"))
         fault_only = station_router.list_fault_guns(
             station_id=3,
             pile_status="FAULT",
@@ -762,8 +798,11 @@ class StationLine1VerificationTest(unittest.TestCase):
 
     def test_05_procedures_triggers_and_session_var_cleanup(self) -> None:
         """验证投运、心跳离线巡检、待办办结闭环及状态变更会话变量零泄漏。"""
-        # 确保从干净且心跳新鲜的基线出发（支持单独运行此用例）
-        _restore_line1_seed_data()
+        # 确保隔离测试库从干净且心跳新鲜的基线出发（支持单独运行此用例）
+        self.db.close()
+        self._test_engine.dispose()
+        _rebuild_isolated_test_db()
+        self.db = self._TestSessionLocal()
         ops_user = _make_user(RoleEnum.OPS)
 
         # 5.1 对 pile_id=21（PENDING / OFFLINE）执行验收投运
@@ -829,6 +868,25 @@ class StationLine1VerificationTest(unittest.TestCase):
         ).mappings().one()
         self.assertEqual(resolved_row["todo_status"], "DONE")
         self.assertEqual(resolved_row["remark"], "运维现场排查供电并完成待办")
+
+        # 负向校验：已 DONE 的待办或 todo_status='NONE' 的日志禁止再次办结（DAO 抛 ValueError -> 路由转 400）
+        with self.assertRaises(HTTPException) as ctx_done:
+            station_router.resolve_status_todo(
+                log_id=target_log_id,
+                payload=TodoResolveIn(remark="重复办结测试"),
+                db=self.db,
+                user=ops_user,
+            )
+        self.assertEqual(ctx_done.exception.status_code, 400)
+
+        with self.assertRaises(HTTPException) as ctx_none:
+            station_router.resolve_status_todo(
+                log_id=1,
+                payload=TodoResolveIn(remark="NONE日志办结测试"),
+                db=self.db,
+                user=ops_user,
+            )
+        self.assertEqual(ctx_none.exception.status_code, 400)
 
         # 5.3 验证 update_pile_status / update_gun_status 在变态、同态、异常后会话变量均为 NULL
         def _assert_session_vars_cleared() -> None:
@@ -941,11 +999,17 @@ class StationLine1VerificationTest(unittest.TestCase):
         ops_user = _make_user(RoleEnum.OPS)
         settlement_user = _make_user(RoleEnum.SETTLEMENT)
 
-        # ping 探活
-        self.assertEqual(station_router.ping_station()["status"], "ready")
+        # ping 探活（带显式 response_model=StationPingOut）
+        self.assertEqual(station_router.ping_station().status, "ready")
 
-        # 运营商 CRUD
-        operators = station_router.list_operators(db=self.db, user=settlement_user)
+        # 运营商脱敏摘要（结算专员）与完整档案（管理员）+ CRUD
+        op_summaries = station_router.list_operator_summaries(db=self.db, user=settlement_user)
+        self.assertGreaterEqual(len(op_summaries), 20)
+        self.assertIn("****", op_summaries[0].service_phone_masked or "")
+        self.assertFalse(hasattr(op_summaries[0], "credit_code"))
+        self.assertFalse(hasattr(op_summaries[0], "service_phone"))
+
+        operators = station_router.list_operators(db=self.db, user=admin_user)
         self.assertGreaterEqual(len(operators), 20)
 
         new_op = station_router.create_operator(

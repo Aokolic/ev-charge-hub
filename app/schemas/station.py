@@ -160,8 +160,16 @@ class TodoResolveIn(BaseModel):
 # ============================================================================
 
 
+class StationPingOut(BaseModel):
+    """业务线 1 探活响应模型。"""
+
+    module: str
+    owner: str
+    status: str
+
+
 class OperatorOut(BaseModel):
-    """运营商档案响应模型。"""
+    """运营商档案完整响应模型（仅管理员使用）。"""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -174,6 +182,18 @@ class OperatorOut(BaseModel):
     status: str
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class OperatorSummaryOut(BaseModel):
+    """运营商脱敏摘要响应模型（面向结算专员与管理员，隐藏社会信用代码及明文电话）。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    operator_id: int
+    operator_code: str
+    operator_name: str
+    status: str
+    service_phone_masked: str | None = None
 
 
 class StationOut(BaseModel):
@@ -316,13 +336,13 @@ class DriverGunAvailabilityOut(BaseModel):
 
 
 class FaultGunDetailOut(BaseModel):
-    """视图 1.3 v_fault_gun_detail（面向 ops / admin）响应模型。"""
+    """视图 1.3 v_fault_gun_detail（面向 ops / admin）响应模型（客服电话已脱敏）。"""
 
     model_config = ConfigDict(from_attributes=True)
 
     operator_id: int
     operator_name: str
-    service_phone: str
+    service_phone_masked: str | None = None
     station_id: int
     station_code: str
     station_name: str
@@ -413,7 +433,9 @@ __all__ = [
     "PileCommissionIn",
     "HeartbeatCheckIn",
     "TodoResolveIn",
+    "StationPingOut",
     "OperatorOut",
+    "OperatorSummaryOut",
     "StationOut",
     "PileOut",
     "GunOut",

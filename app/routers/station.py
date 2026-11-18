@@ -31,12 +31,14 @@ from app.schemas.station import (
     HeartbeatCheckOut,
     OperatorCreateIn,
     OperatorOut,
+    OperatorSummaryOut,
     OperatorUpdateIn,
     PileCommissionIn,
     PileCreateIn,
     PileOut,
     StationCreateIn,
     StationOut,
+    StationPingOut,
     StationRealtimeStatusOut,
     StationUpdateIn,
     TodoResolveIn,
@@ -59,10 +61,14 @@ def _require_found(obj: _ModelT | None, detail: str) -> _ModelT:
 # ============================================================================
 
 
-@router.get("/ping", summary="业务线1路由连通性探活")
-def ping_station() -> dict[str, str]:
+@router.get(
+    "/ping",
+    response_model=StationPingOut,
+    summary="业务线1路由连通性探活",
+)
+def ping_station() -> StationPingOut:
     """业务线 1 路由连通性探活接口。"""
-    return {"module": "station", "owner": "成员1（组长）", "status": "ready"}
+    return StationPingOut(module="station", owner="成员1（组长）", status="ready")
 
 
 # ============================================================================
@@ -176,9 +182,7 @@ def list_realtime_stations(
     station_status: Annotated[str | None, Query(description="按场站营业状态筛选")] = None,
     page: PageParams = Depends(),
     db: Session = Depends(get_db),
-    user: CurrentUser = Depends(
-        require_roles(RoleEnum.ADMIN, RoleEnum.SETTLEMENT, RoleEnum.OPS)
-    ),
+    user: CurrentUser = Depends(require_roles(RoleEnum.ADMIN, RoleEnum.SETTLEMENT)),
 ) -> PageResult[StationRealtimeStatusOut]:
     """查询全量场站、桩/枪实时统计与装机总功率（基于视图 v_station_realtime_status）。"""
     result = station_dao.list_realtime_stations(
@@ -208,10 +212,14 @@ def resolve_status_todo(
 ) -> ActionResult:
     """将指定状态变更日志的运维待办状态置为 DONE 并记录处置备注。"""
     resolved_payload = payload if payload is not None else TodoResolveIn()
-    _require_found(
-        station_dao.resolve_status_todo(db, log_id, resolved_payload),
-        "状态变更日志不存在",
-    )
+    try:
+        log = station_dao.resolve_status_todo(db, log_id, resolved_payload)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    _require_found(log, "状态变更日志不存在")
     return ActionResult(success=True, message="运维待办已办结", id=log_id)
 
 
@@ -317,15 +325,29 @@ def update_gun_status(
 @router.get(
     "/operators",
     response_model=list[OperatorOut],
-    summary="获取运营商列表",
+    summary="获取运营商完整档案列表（管理员专属）",
 )
 def list_operators(
     db: Session = Depends(get_db),
-    user: CurrentUser = Depends(require_roles(RoleEnum.ADMIN, RoleEnum.SETTLEMENT)),
+    user: CurrentUser = Depends(require_roles(RoleEnum.ADMIN)),
 ) -> list[OperatorOut]:
-    """查询平台全部合作运营商档案列表（按 operator_id 升序）。"""
+    """查询平台全部合作运营商完整档案列表（仅管理员可查）。"""
     operators = station_dao.list_operators(db)
     return [OperatorOut.model_validate(item) for item in operators]
+
+
+@router.get(
+    "/operators/summary",
+    response_model=list[OperatorSummaryOut],
+    summary="获取运营商脱敏摘要列表（管理员/结算）",
+)
+def list_operator_summaries(
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(require_roles(RoleEnum.ADMIN, RoleEnum.SETTLEMENT)),
+) -> list[OperatorSummaryOut]:
+    """返回隐藏信用代码与明文电话的运营商摘要列表（供结算对账核验归属）。"""
+    rows = station_dao.list_operator_summaries(db)
+    return [OperatorSummaryOut.model_validate(item) for item in rows]
 
 
 @router.post(

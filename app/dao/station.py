@@ -13,7 +13,7 @@ from typing import Any, TypeVar
 from sqlalchemy import TextClause, select, text
 from sqlalchemy.orm import Session
 
-from app.dao.common import fetch_view_page
+from app.dao.common import fetch_view_page, mask_phone
 from app.models.station import (
     ChargingGun,
     ChargingPile,
@@ -208,13 +208,18 @@ def list_fault_guns(
         sql_parts.append("AND pile_status = :pile_status")
         params["pile_status"] = pile_status.strip()
 
-    return fetch_view_page(
+    res = fetch_view_page(
         db,
         " ".join(sql_parts),
         params,
         page,
         order_by=_ORDER_FAULT_GUNS,
     )
+    # 故障列表响应脱敏运营商客服热线，避免向运维端直接暴露明文电话
+    for item in res["items"]:
+        raw_phone = item.pop("service_phone", None)
+        item["service_phone_masked"] = mask_phone(raw_phone)
+    return res
 
 
 def list_status_history(
@@ -358,9 +363,24 @@ def get_operator(db: Session, operator_id: int) -> Operator | None:
 
 
 def list_operators(db: Session) -> list[Operator]:
-    """按 operator_id 升序返回全部运营商档案列表。"""
+    """按 operator_id 升序返回全部运营商档案列表（管理员完整视图）。"""
     stmt = select(Operator).order_by(Operator.operator_id.asc())
     return list(db.execute(stmt).scalars().all())
+
+
+def list_operator_summaries(db: Session) -> list[dict[str, Any]]:
+    """返回面向结算专员与管理员的运营商脱敏摘要列表（隐藏社会信用代码与明文电话）。"""
+    operators = list_operators(db)
+    return [
+        {
+            "operator_id": op.operator_id,
+            "operator_code": op.operator_code,
+            "operator_name": op.operator_name,
+            "status": op.status,
+            "service_phone_masked": mask_phone(op.service_phone),
+        }
+        for op in operators
+    ]
 
 
 def create_operator(db: Session, payload: OperatorCreateIn) -> Operator:
@@ -545,10 +565,14 @@ def resolve_status_todo(
     log_id: int,
     payload: TodoResolveIn,
 ) -> DeviceStatusLog | None:
-    """办结设备状态日志中的运维待办（置 todo_status='DONE' 并可选更新处理备注）。"""
+    """办结设备状态日志中的运维待办（仅 PENDING 状态允许置为 DONE）。"""
     log = db.get(DeviceStatusLog, log_id)
     if log is None:
         return None
+    if log.todo_status != "PENDING":
+        raise ValueError(
+            f"当前状态日志 todo_status={log.todo_status}，仅 PENDING 待办允许执行办结操作"
+        )
     log.todo_status = "DONE"
     if payload.remark is not None and payload.remark.strip():
         log.remark = payload.remark.strip()
@@ -570,6 +594,7 @@ __all__ = [
     "list_driver_stations",
     "list_fault_guns",
     "list_guns_by_pile",
+    "list_operator_summaries",
     "list_operators",
     "list_piles_by_station",
     "list_realtime_stations",
