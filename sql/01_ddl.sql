@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS charging_pile (
     updated_at             DATETIME                                           NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
     PRIMARY KEY (pile_id),
     UNIQUE KEY uk_pile_code (pile_code),
-    KEY idx_pile_station_status (station_id, current_status),
+    KEY idx_pile_station_status (station_id, acceptance_status, current_status, rated_power),
     KEY idx_pile_heartbeat_status (current_status, last_heartbeat_at),
     CONSTRAINT fk_pile_station
         FOREIGN KEY (station_id) REFERENCES station (station_id)
@@ -92,7 +92,8 @@ CREATE TABLE IF NOT EXISTS charging_pile (
     CONSTRAINT chk_pile_rated_power CHECK (rated_power > 0.00),
     CONSTRAINT chk_pile_gun_count CHECK (gun_count BETWEEN 1 AND 8),
     CONSTRAINT chk_pile_offline_sec CHECK (offline_threshold_sec >= 30),
-    CONSTRAINT chk_pile_warranty_date CHECK (commissioned_date IS NULL OR warranty_end_date >= commissioned_date)
+    CONSTRAINT chk_pile_warranty_date CHECK (commissioned_date IS NULL OR warranty_end_date >= commissioned_date),
+    CONSTRAINT chk_pile_acceptance_online CHECK (acceptance_status = 'PASSED' OR current_status NOT IN ('IDLE', 'OCCUPIED'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='业务线1-充电桩表';
 
 -- 1.4 充电枪表（独立实体，订单与计费最小粒度；单枪功率<=所属桩额定功率由触发器校验）
@@ -132,6 +133,7 @@ CREATE TABLE IF NOT EXISTS device_status_log (
     remark         VARCHAR(255)                                                       NULL                    COMMENT '变更说明或现场铭牌核对备注',
     changed_at     DATETIME                                                           NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '状态变更发生时间',
     PRIMARY KEY (log_id),
+    KEY idx_status_log_type_time_status (device_type, changed_at, new_status, todo_status),
     KEY idx_status_log_pile_time (pile_id, changed_at),
     KEY idx_status_log_gun_time (gun_id, changed_at),
     KEY idx_status_log_todo_time (todo_status, changed_at),
@@ -150,17 +152,18 @@ CREATE TABLE IF NOT EXISTS device_status_log (
 
 
 -- ============================================================================
--- 【业务线 4】用户账号、车辆、车队与优惠券（负责人：成员 3，待补充）
+-- 【业务线 4】用户账号、车辆、车队与优惠券（负责人：成员 4 / 李海波，待补充）
 -- 说明：须优先于业务线2建表；user_account 字段须与 app/dao/common.py 契约对齐
 -- ============================================================================
 
 
--- ============================================================
--- 业务线 2：订单计费（孙墨涵 / 02-develop）
--- 四张表：电价规则、充电订单、分时费用明细、支付流水
--- 说明：station_id / gun_id / user_id / vehicle_id 先只留 BIGINT 列，
---       外键统一放在文件最后一段，等线 1、线 4 建完表再加，避免顺序耦合。
--- ============================================================
+-- ============================================================================
+-- 【业务线 2】分时计费规则、充电订单与支付退款（负责人：成员 2 / 孙墨涵）
+-- 说明：依赖 station(station_id)、charging_gun(gun_id)、user_account(user_id)
+--       四张表：电价规则、充电订单、分时费用明细、支付流水
+--       station_id / gun_id / user_id / vehicle_id 先只留 BIGINT UNSIGNED 列，
+--       跨线外键统一放在文件最后一段，等线 1、线 4 建完表再加，避免顺序耦合。
+-- ============================================================================
 
 -- 电价规则：一个站、一个时段（峰/平/谷）、一段有效期，对应一条单价
 DROP TABLE IF EXISTS order_fee_detail;
@@ -266,15 +269,16 @@ CREATE TABLE payment_record (
 
 
 -- ============================================================================
--- 【业务线 3】设备运行遥测（分区表）、告警与维修工单（负责人：成员 4，待补充）
+-- 【业务线 3】设备运行遥测（分区表）、告警与维修工单（负责人：成员 3 / 代润森，待补充）
 -- 说明：依赖 charging_pile(pile_id)、charging_gun(gun_id)、user_account(user_id)
 -- ============================================================================
 
 
--- ============================================================
--- 业务线 5：结算对账（孙墨涵 / 05-develop）
--- data flow：settle 只读线2 的订单，写自己的三张表
--- ============================================================
+-- ============================================================================
+-- 【业务线 5】运营商月结账单、对账差异与开票红冲（负责人：成员 2 / 孙墨涵）
+-- 说明：依赖 operator(operator_id)、station(station_id)、charge_order(order_id)
+--       data flow：settle 只读线2 的订单，写自己的三张表
+-- ============================================================================
 
 DROP TABLE IF EXISTS invoice_record;
 DROP TABLE IF EXISTS reconcile_diff;
@@ -335,7 +339,7 @@ CREATE TABLE invoice_record (
 
 -- ============================================================
 -- 跨线外键：等线1（station / charging_gun）、线4（user_account / vehicle）建完表再执行
--- 类型必须都是 BIGINT，名字不一致就改这里
+-- 类型必须都是 BIGINT UNSIGNED，名字不一致就改这里
 -- ============================================================
 -- ALTER TABLE charge_order
 --     ADD CONSTRAINT fk_order_station FOREIGN KEY (station_id) REFERENCES station (station_id),
