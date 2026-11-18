@@ -251,7 +251,7 @@ INSERT INTO pricing_rule
 (station_id, period, start_time, end_time, energy_price, service_price,
  free_minutes, min_charge, effective_from, effective_to, is_active)
 SELECT s.station_id, p.period, p.st, p.et, p.ep, p.sp, 0, 0.00, '2025-01-01', NULL, 1
-FROM (SELECT 1 AS station_id UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) s
+FROM station s
 CROSS JOIN (
     SELECT 'VALLEY' AS period, '22:00:00' AS st, '08:00:00' AS et, 0.3000 AS ep, 0.2000 AS sp
     UNION ALL SELECT 'FLAT', '08:00:00', '10:00:00', 0.6000, 0.3000
@@ -266,27 +266,37 @@ ON DUPLICATE KEY UPDATE energy_price = VALUES(energy_price);
 INSERT IGNORE INTO charge_order
 (order_no, user_id, vehicle_id, gun_id, station_id, start_time, end_time,
  start_soc, end_soc, kwh, discount_amount, status)
-WITH RECURSIVE seq AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM seq WHERE n < 20)
+WITH RECURSIVE seq AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM seq WHERE n < 20),
+gun AS (SELECT g.gun_id, p.station_id,
+               ROW_NUMBER() OVER (ORDER BY g.gun_id) AS rn
+        FROM charging_gun g JOIN charging_pile p ON p.pile_id = g.pile_id)
 SELECT CONCAT('SEED2025', LPAD(n, 6, '0')),
-       9000 + n, 5000 + n, 1000 + n, 1 + MOD(n, 4),
+       9000 + n, 5000 + n, g.gun_id, g.station_id,
        TIMESTAMP('2025-03-01 08:00:00') + INTERVAL n * 7 HOUR,
        CASE WHEN n <= 5 THEN NULL
             ELSE TIMESTAMP('2025-03-01 08:00:00') + INTERVAL n * 7 HOUR + INTERVAL 150 MINUTE END,
        20, 90, 20 + n,
        CASE WHEN MOD(n, 3) = 0 THEN 2.00 ELSE 0.00 END,
        CASE WHEN n <= 5 THEN 'CHARGING' ELSE 'PAID' END
-FROM seq;
+FROM seq
+JOIN gun g ON g.rn = n;
 
 -- 3) 用存储过程给已结束的订单算分时明细（顺便验证过程能批量跑）
 DROP PROCEDURE IF EXISTS seed_calc;
 DELIMITER $$
 CREATE PROCEDURE seed_calc()
 BEGIN
-    DECLARE i INT DEFAULT 6;
-    WHILE i <= 20 DO
-        CALL sp_order_calc(i);
-        SET i = i + 1;
-    END WHILE;
+    DECLARE v_done INT DEFAULT 0;
+    DECLARE v_oid BIGINT;
+    DECLARE cur CURSOR FOR SELECT order_id FROM charge_order WHERE end_time IS NOT NULL ORDER BY order_id;
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = 1;
+    OPEN cur;
+    calc_loop: LOOP
+        FETCH cur INTO v_oid;
+        IF v_done = 1 THEN LEAVE calc_loop; END IF;
+        CALL sp_order_calc(v_oid);
+    END LOOP;
+    CLOSE cur;
 END$$
 DELIMITER ;
 CALL seed_calc();
