@@ -149,8 +149,8 @@ LEFT JOIN charging_gun AS g
     ON g.pile_id = p.pile_id
 WHERE p.acceptance_status = 'PASSED'
   AND (
-      g.current_status IN ('FAULT', 'OFFLINE')
-      OR (p.current_status IN ('FAULT', 'OFFLINE') AND g.gun_id IS NULL)
+      p.current_status IN ('FAULT', 'OFFLINE')
+      OR g.current_status IN ('FAULT', 'OFFLINE')
   );
 
 

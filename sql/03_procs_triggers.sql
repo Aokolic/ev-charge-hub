@@ -344,14 +344,15 @@ BEGIN
                    g.status_updated_at = v_now
              WHERE g.current_status IN ('IDLE', 'OCCUPIED');
         END IF;
-
-        SET @skip_auto_status_log = NULL,
-            @status_change_source = NULL,
-            @status_todo_status   = NULL,
-            @status_change_remark = NULL;
     ELSE
         SET p_affected_guns = 0;
     END IF;
+
+    -- 无论是否命中超时桩，统一清理会话上下文变量，防止残留状态污染后续手工 DML
+    SET @skip_auto_status_log = NULL,
+        @status_change_source = NULL,
+        @status_todo_status   = NULL,
+        @status_change_remark = NULL;
 
     DROP TEMPORARY TABLE IF EXISTS tmp_offline_piles;
 END //
