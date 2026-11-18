@@ -23,9 +23,11 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 import pymysql
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import sessionmaker
 
+from app.config import settings
 from app.dao import order as order_dao
 from app.dao import settle as settle_dao
 from app.schemas.common import PageParams
@@ -34,8 +36,18 @@ from app.schemas.settle import BillGenerateIn, InvoiceIn
 
 _SQL_DIR = _PROJECT_ROOT / "sql"
 _TEST_DB = "ev_charge_hub_test_order"
-_MYSQL = dict(host="127.0.0.1", port=3307, user="root", password="123456", charset="utf8mb4")
-_URL = f"mysql+pymysql://root:123456@127.0.0.1:3307/{_TEST_DB}?charset=utf8mb4"
+
+# 连接信息统一从项目配置取（.env 或环境变量），只把库名换成隔离测试库，
+# 不在测试里硬编码端口和密码，否则换台机器就失效。
+_BASE_URL = make_url(settings.DATABASE_URL)
+_URL = _BASE_URL.set(database=_TEST_DB)
+_MYSQL = dict(
+    host=_BASE_URL.host or "127.0.0.1",
+    port=_BASE_URL.port or 3306,
+    user=_BASE_URL.username or "root",
+    password=_BASE_URL.password or "",
+    charset="utf8mb4",
+)
 
 
 def _split_statements(sql_text: str) -> list[str]:
@@ -49,9 +61,6 @@ def _split_statements(sql_text: str) -> list[str]:
             continue
         if line.upper().startswith("DELIMITER "):
             delimiter = line.split(None, 1)[1].strip()
-            continue
-        # 脚本头部可能有 USE xxx;，测试库靠连接串指定，必须剔除，否则会写进生产库
-        if line.upper().startswith("USE "):
             continue
         buffer.append(raw)
         joined = "\n".join(buffer)
@@ -84,6 +93,11 @@ def _rebuild_database() -> None:
             for name in ("01_ddl.sql", "03_procs_triggers.sql", "04_seed.sql", "02_views.sql"):
                 script = (_SQL_DIR / name).read_text(encoding="utf-8")
                 for stmt in _split_statements(script):
+                    head = stmt.lstrip().upper()
+                    # 库名由测试自己指定：跳过脚本里的 USE 与 CREATE DATABASE，
+                    # 否则会写进生产库、或在生产库名上建出空库。
+                    if head.startswith("USE ") or head.startswith("CREATE DATABASE"):
+                        continue
                     conn.execute(text(stmt))
     finally:
         engine.dispose()

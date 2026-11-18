@@ -8,7 +8,7 @@ from datetime import date, datetime, time
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Date, DateTime, Enum, Integer, Numeric, String, Time, text
+from sqlalchemy import FetchedValue, BigInteger, Date, DateTime, Enum, Integer, Numeric, String, Time
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -58,8 +58,8 @@ class ChargeOrder(Base):
     total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=Decimal("0.00"))
     paid_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=Decimal("0.00"))
     status: Mapped[str] = mapped_column(ORDER_STATUS_ENUM, default="CHARGING")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, server_default=text("CURRENT_TIMESTAMP"))
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now, server_default=text("CURRENT_TIMESTAMP"))
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=FetchedValue())
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=FetchedValue())
 
 
 class OrderFeeDetail(Base):
