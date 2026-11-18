@@ -93,8 +93,80 @@ WHERE o.status = 'ACTIVE'
   AND s.station_status = 'OPEN'
 ORDER BY s.station_id ASC;
 
--- EXPLAIN ANALYZE 对比命令（第 1 组）：
--- EXPLAIN ANALYZE SELECT ... （分别作用于实现 A 与实现 B）
+-- EXPLAIN ANALYZE 对比命令（第 1 组：实现 A vs 实现 B）：
+EXPLAIN ANALYZE
+SELECT
+    o.operator_name,
+    s.station_id,
+    s.station_code,
+    s.station_name,
+    COALESCE((
+        SELECT SUM(p.rated_power)
+          FROM charging_pile AS p
+         WHERE p.station_id = s.station_id
+           AND p.acceptance_status = 'PASSED'
+    ), 0.00) AS total_rated_power,
+    COALESCE((
+        SELECT COUNT(*)
+          FROM charging_gun AS g
+          INNER JOIN charging_pile AS p ON p.pile_id = g.pile_id
+         WHERE p.station_id = s.station_id
+           AND p.acceptance_status = 'PASSED'
+           AND g.gun_type = 'DC_FAST'
+    ), 0) AS dc_fast_total,
+    COALESCE((
+        SELECT COUNT(*)
+          FROM charging_gun AS g
+          INNER JOIN charging_pile AS p ON p.pile_id = g.pile_id
+         WHERE p.station_id = s.station_id
+           AND p.acceptance_status = 'PASSED'
+           AND g.gun_type = 'DC_FAST'
+           AND g.current_status = 'IDLE'
+    ), 0) AS dc_fast_idle
+FROM station AS s
+INNER JOIN operator AS o
+    ON o.operator_id = s.operator_id
+WHERE UPPER(o.status) = 'ACTIVE'
+  AND LOWER(s.station_status) = 'open'
+ORDER BY s.station_id ASC;
+
+EXPLAIN ANALYZE
+SELECT
+    o.operator_name,
+    s.station_id,
+    s.station_code,
+    s.station_name,
+    CAST(COALESCE(pa.total_rated_power, 0.00) AS DECIMAL(12, 2)) AS total_rated_power,
+    COALESCE(ga.dc_fast_total, 0)                                AS dc_fast_total,
+    COALESCE(ga.dc_fast_idle, 0)                                 AS dc_fast_idle
+FROM station AS s
+INNER JOIN operator AS o
+    ON o.operator_id = s.operator_id
+LEFT JOIN (
+    SELECT
+        p.station_id,
+        SUM(p.rated_power) AS total_rated_power
+    FROM charging_pile AS p
+    WHERE p.acceptance_status = 'PASSED'
+    GROUP BY p.station_id
+) AS pa
+    ON pa.station_id = s.station_id
+LEFT JOIN (
+    SELECT
+        p.station_id,
+        COUNT(*)                                                    AS dc_fast_total,
+        SUM(CASE WHEN g.current_status = 'IDLE' THEN 1 ELSE 0 END)  AS dc_fast_idle
+    FROM charging_pile AS p
+    INNER JOIN charging_gun AS g
+        ON g.pile_id = p.pile_id
+    WHERE p.acceptance_status = 'PASSED'
+      AND g.gun_type = 'DC_FAST'
+    GROUP BY p.station_id
+) AS ga
+    ON ga.station_id = s.station_id
+WHERE o.status = 'ACTIVE'
+  AND s.station_status = 'OPEN'
+ORDER BY s.station_id ASC;
 
 
 -- ----------------------------------------------------------------------------
@@ -130,6 +202,79 @@ ORDER BY abnormal_event_count DESC, s.station_id ASC;
 
 -- [实现 B - 优化]：将时间筛选转为 SARGable 常量下界 + 用 UNION ALL 拆开桩/枪外键分支，
 --                 两条分支均命中时间前导联合索引 idx_status_log_type_time_status (device_type, changed_at, new_status, todo_status)
+SELECT
+    s.station_id,
+    s.station_code,
+    s.station_name,
+    o.operator_name,
+    CAST(SUM(agg.event_cnt) AS SIGNED) AS abnormal_event_count,
+    SUM(agg.pending_cnt)               AS pending_todo_count
+FROM (
+    SELECT
+        p.station_id,
+        COUNT(*)                                                  AS event_cnt,
+        SUM(CASE WHEN l.todo_status = 'PENDING' THEN 1 ELSE 0 END) AS pending_cnt
+    FROM device_status_log AS l
+    INNER JOIN charging_pile AS p
+        ON p.pile_id = l.pile_id
+    WHERE l.device_type = 'PILE'
+      AND l.changed_at >= CAST(DATE_SUB(CURDATE(), INTERVAL 30 DAY) AS DATETIME)
+      AND l.new_status IN ('FAULT', 'OFFLINE')
+      AND l.pile_id IS NOT NULL
+    GROUP BY p.station_id
+
+    UNION ALL
+
+    SELECT
+        p.station_id,
+        COUNT(*)                                                  AS event_cnt,
+        SUM(CASE WHEN l.todo_status = 'PENDING' THEN 1 ELSE 0 END) AS pending_cnt
+    FROM device_status_log AS l
+    INNER JOIN charging_gun AS g
+        ON g.gun_id = l.gun_id
+    INNER JOIN charging_pile AS p
+        ON p.pile_id = g.pile_id
+    WHERE l.device_type = 'GUN'
+      AND l.changed_at >= CAST(DATE_SUB(CURDATE(), INTERVAL 30 DAY) AS DATETIME)
+      AND l.new_status IN ('FAULT', 'OFFLINE')
+      AND l.gun_id IS NOT NULL
+    GROUP BY p.station_id
+) AS agg
+INNER JOIN station AS s
+    ON s.station_id = agg.station_id
+INNER JOIN operator AS o
+    ON o.operator_id = s.operator_id
+WHERE s.station_status = 'OPEN'
+GROUP BY s.station_id, s.station_code, s.station_name, o.operator_name
+ORDER BY abnormal_event_count DESC, s.station_id ASC;
+
+-- EXPLAIN ANALYZE 对比命令（第 2 组：实现 A vs 实现 B）：
+EXPLAIN ANALYZE
+SELECT
+    s.station_id,
+    s.station_code,
+    s.station_name,
+    o.operator_name,
+    COUNT(l.log_id)                                                  AS abnormal_event_count,
+    SUM(CASE WHEN l.todo_status = 'PENDING' THEN 1 ELSE 0 END)       AS pending_todo_count
+FROM device_status_log AS l
+LEFT JOIN charging_pile AS p_direct
+    ON l.device_type = 'PILE' AND l.pile_id = p_direct.pile_id
+LEFT JOIN charging_gun AS g
+    ON l.device_type = 'GUN' AND l.gun_id = g.gun_id
+LEFT JOIN charging_pile AS p_gun
+    ON g.pile_id = p_gun.pile_id
+INNER JOIN station AS s
+    ON s.station_id = COALESCE(p_direct.station_id, p_gun.station_id)
+INNER JOIN operator AS o
+    ON o.operator_id = s.operator_id
+WHERE DATE(l.changed_at) >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+  AND l.new_status IN ('FAULT', 'OFFLINE')
+  AND s.station_status = 'OPEN'
+GROUP BY s.station_id, s.station_code, s.station_name, o.operator_name
+ORDER BY abnormal_event_count DESC, s.station_id ASC;
+
+EXPLAIN ANALYZE
 SELECT
     s.station_id,
     s.station_code,
@@ -220,6 +365,97 @@ ORDER BY p.pile_id ASC, g.gun_seq ASC;
 -- [实现 B - 优化]：结合 DDL 约束 offline_threshold_sec >= 30，先用常量区间
 --                 last_heartbeat_at < DATE_SUB(NOW(), INTERVAL 30 SECOND) 下推走 idx_pile_heartbeat_status
 --                 锁定候选桩，再精确复核每台桩的独立阈值并关联枪明细
+SELECT
+    o.operator_name,
+    s.station_code,
+    s.station_name,
+    cand.pile_id,
+    cand.pile_code,
+    cand.current_status AS pile_status,
+    cand.last_heartbeat_at,
+    cand.offline_threshold_sec,
+    g.gun_id,
+    g.gun_code,
+    g.current_status AS gun_status
+FROM (
+    SELECT
+        p.pile_id,
+        p.station_id,
+        p.pile_code,
+        p.current_status,
+        p.last_heartbeat_at,
+        p.offline_threshold_sec
+    FROM charging_pile AS p
+    WHERE p.current_status = 'OFFLINE'
+      AND p.acceptance_status = 'PASSED'
+
+    UNION ALL
+
+    SELECT
+        p.pile_id,
+        p.station_id,
+        p.pile_code,
+        p.current_status,
+        p.last_heartbeat_at,
+        p.offline_threshold_sec
+    FROM charging_pile AS p
+    WHERE p.current_status IN ('IDLE', 'OCCUPIED')
+      AND p.acceptance_status = 'PASSED'
+      AND (
+          p.last_heartbeat_at IS NULL
+          OR (
+              p.last_heartbeat_at < DATE_SUB(NOW(), INTERVAL 30 SECOND)
+              AND TIMESTAMPDIFF(SECOND, p.last_heartbeat_at, NOW()) > p.offline_threshold_sec
+          )
+      )
+) AS cand
+INNER JOIN station AS s
+    ON s.station_id = cand.station_id
+INNER JOIN operator AS o
+    ON o.operator_id = s.operator_id
+LEFT JOIN charging_gun AS g
+    ON g.pile_id = cand.pile_id
+WHERE o.status = 'ACTIVE'
+  AND s.station_status = 'OPEN'
+ORDER BY cand.pile_id ASC, g.gun_seq ASC;
+
+-- EXPLAIN ANALYZE 对比命令（第 3 组：实现 A vs 实现 B）：
+EXPLAIN ANALYZE
+SELECT
+    o.operator_name,
+    s.station_code,
+    s.station_name,
+    p.pile_id,
+    p.pile_code,
+    p.current_status AS pile_status,
+    p.last_heartbeat_at,
+    p.offline_threshold_sec,
+    g.gun_id,
+    g.gun_code,
+    g.current_status AS gun_status
+FROM charging_pile AS p
+INNER JOIN station AS s
+    ON s.station_id = p.station_id
+INNER JOIN operator AS o
+    ON o.operator_id = s.operator_id
+LEFT JOIN charging_gun AS g
+    ON g.pile_id = p.pile_id
+WHERE o.status = 'ACTIVE'
+  AND s.station_status = 'OPEN'
+  AND p.acceptance_status = 'PASSED'
+  AND (
+      p.current_status = 'OFFLINE'
+      OR (
+          p.current_status IN ('IDLE', 'OCCUPIED')
+          AND (
+              p.last_heartbeat_at IS NULL
+              OR TIMESTAMPDIFF(SECOND, p.last_heartbeat_at, NOW()) > p.offline_threshold_sec
+          )
+      )
+  )
+ORDER BY p.pile_id ASC, g.gun_seq ASC;
+
+EXPLAIN ANALYZE
 SELECT
     o.operator_name,
     s.station_code,
