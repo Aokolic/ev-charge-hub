@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EV Charge Hub · 新能源汽车充电桩运营服务平台</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand">
+            <div class="brand-badge">EV</div>
+            <div>
+                <h1>新能源汽车充电桩运营服务平台</h1>
+                <p>BFU 数据库系统课程设计 · RBAC 视图隔离与闭环演示工作台</p>
+            </div>
+        </div>
+        <div class="topbar-right">
+            <span id="dbHealthPill" class="status-pill">
+                <span id="dbHealthDot" class="status-dot"></span>
+                <span id="dbHealthText">正在探测数据库连接...</span>
+            </span>
+            <a class="btn btn-outline btn-sm" href="/docs" target="_blank" rel="noopener">Swagger 接口文档</a>
+        </div>
+    </header>
+
+    <main class="container">
+        <!-- 认证与 5 类角色切换中心 -->
+        <section class="card">
+            <div class="auth-bar">
+                <div>
+                    <div class="section-header" style="margin-bottom: 4px;">
+                        <h2>RBAC 角色切换与认证中心</h2>
+                        <span class="meta">开发联调一键签发 HS256 JWT（<code>POST /api/auth/dev-token</code>）</span>
+                    </div>
+                    <div class="toolbar" style="margin-bottom: 6px;">
+                        <label class="meta">联调 user_id：</label>
+                        <input id="devUserId" type="number" min="1" value="9001" style="width: 90px;" title="设为 9001 可直接查看线2种子订单">
+                        <label class="meta">fleet_id（仅车队）：</label>
+                        <input id="devFleetId" type="number" min="1" value="1" style="width: 80px;">
+                        <button id="toggleLoginBtn" class="btn btn-outline btn-sm" type="button">账号密码登录</button>
+                    </div>
+                    <div id="roleButtons" class="role-buttons">
+                        <button class="role-btn" data-role="driver" type="button">普通车主 (driver)</button>
+                        <button class="role-btn" data-role="fleet" type="button">企业车队 (fleet)</button>
+                        <button class="role-btn" data-role="ops" type="button">场站运维 (ops)</button>
+                        <button class="role-btn" data-role="settlement" type="button">结算专员 (settlement)</button>
+                        <button class="role-btn" data-role="admin" type="button">平台管理员 (admin)</button>
+                    </div>
+                </div>
+                <div id="userContextCard" class="user-context">
+                    <div><strong>当前身份：</strong><span id="currentUserLabel">未签发</span></div>
+                    <div id="currentRoleDesc" class="role-desc">请点击左侧任意角色按钮签发测试 Token 后开始操作。</div>
+                </div>
+            </div>
+
+            <!-- 可折叠真实账号登录表单（待业务线4创建 user_account 表后可用） -->
+            <div id="loginPanel" style="display: none; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);">
+                <div class="toolbar" style="margin-bottom: 0;">
+                    <input id="loginUsername" type="text" placeholder="用户名">
+                    <input id="loginPassword" type="password" placeholder="密码">
+                    <button id="realLoginSubmitBtn" class="btn btn-primary btn-sm" type="button">登录（POST /api/auth/login）</button>
+                    <span class="meta">提示：需业务线 4（user_account）建表后使用，当前联调请优先用上方快捷签发角色 Token。</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- 功能工作台选项卡 -->
+        <nav class="tabs" id="mainTabs">
+            <button class="tab-btn active" data-tab="tab-driver" type="button">找站与可用枪（车主/车队）</button>
+            <button class="tab-btn" data-tab="tab-ops" type="button">运维排障与巡检（运维/管理员）</button>
+            <button class="tab-btn" data-tab="tab-admin" type="button">全局看板与三级建档（管理员/结算）</button>
+            <button class="tab-btn" data-tab="tab-cross" type="button">跨线联调与越权检验</button>
+        </nav>
+
+        <!-- Tab 1: 车主 / 车队找站查枪 -->
+        <section id="tab-driver" class="tab-panel active">
+            <div class="card">
+                <div class="section-header">
+                    <h3>营业场站概览（视图 <code>v_driver_station_overview</code>）</h3>
+                    <span class="meta">仅显示营业中场站与已验收正常桩聚合数据，屏蔽敏感联系字段</span>
+                </div>
+                <div class="toolbar">
+                    <input id="stationKeyword" type="text" placeholder="搜索场站名称或地址（如 清华东路）" style="min-width: 240px;">
+                    <label style="display: inline-flex; align-items: center; gap: 6px; font-size: 13px;">
+                        <input id="onlyIdleFast" type="checkbox"> 仅看含空闲快充枪场站
+                    </label>
+                    <button id="searchStationsBtn" class="btn btn-primary" type="button">查询场站</button>
+                </div>
+                <div id="driverStationGrid" class="station-grid"></div>
+                <div id="driverStationPager" class="pagination"></div>
+            </div>
+
+            <div class="card">
+                <div class="section-header">
+                    <h3>充电枪实时可用明细（视图 <code>v_driver_gun_availability</code>）</h3>
+                    <div class="toolbar" style="margin-bottom: 0;">
+                        <input id="gunStationFilter" type="number" min="1" placeholder="场站ID（可选）" style="width: 130px;">
+                        <select id="gunTypeFilter">
+                            <option value="">全部枪型</option>
+                            <option value="DC_FAST">直流快充 (DC_FAST)</option>
+                            <option value="AC_SLOW">交流慢充 (AC_SLOW)</option>
+                        </select>
+                        <select id="gunStatusFilter">
+                            <option value="">全部状态</option>
+                            <option value="IDLE">空闲 (IDLE)</option>
+                            <option value="OCCUPIED">占用 (OCCUPIED)</option>
+                        </select>
+                        <button id="searchGunsBtn" class="btn btn-outline" type="button">查询充电枪</button>
+                    </div>
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>枪ID</th>
+                                <th>枪编号</th>
+                                <th>所属场站</th>
+                                <th>所属桩</th>
+                                <th>枪型</th>
+                                <th>接口标准</th>
+                                <th>最大功率(kW)</th>
+                                <th>枪状态</th>
+                            </tr>
+                        </thead>
+                        <tbody id="driverGunsBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- Tab 2: 运维排障、状态日志与存储过程巡检 -->
+        <section id="tab-ops" class="tab-panel">
+            <div class="card">
+                <div class="section-header">
+                    <h3>运维存储过程快捷动作（<code>ops</code> / <code>admin</code>）</h3>
+                    <span class="meta">触发器自动审计留痕，数据库 UTC 基准时间戳防漂移</span>
+                </div>
+                <div class="toolbar" style="margin-bottom: 0;">
+                    <button id="heartbeatCheckBtn" class="btn btn-warn" type="button">执行全网心跳离线巡检（proc_check_pile_heartbeat_offline）</button>
+                    <input id="opsPileId" type="number" min="1" value="21" style="width: 90px;" title="充电桩 ID">
+                    <button id="commissionPileBtn" class="btn btn-primary" type="button">验收投运该桩（proc_commission_charging_pile）</button>
+                    <button id="reportHeartbeatBtn" class="btn btn-outline" type="button">上报该桩心跳（NOW）</button>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="section-header">
+                    <h3>故障枪与离线桩清单（视图 <code>v_fault_gun_detail</code>）</h3>
+                    <div class="toolbar" style="margin-bottom: 0;">
+                        <select id="faultPileStatusFilter">
+                            <option value="">全部异常状态</option>
+                            <option value="FAULT">FAULT</option>
+                            <option value="OFFLINE">OFFLINE</option>
+                        </select>
+                        <button id="loadFaultsBtn" class="btn btn-outline btn-sm" type="button">刷新故障清单</button>
+                    </div>
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>场站</th>
+                                <th>桩编号</th>
+                                <th>桩状态</th>
+                                <th>枪编号</th>
+                                <th>枪状态</th>
+                                <th>心跳滞后(s)</th>
+                                <th>客服热线(脱敏)</th>
+                                <th>快速处置</th>
+                            </tr>
+                        </thead>
+                        <tbody id="faultsBody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="section-header">
+                    <h3>设备状态变更历史与运维待办（视图 <code>v_device_status_history</code>）</h3>
+                    <div class="toolbar" style="margin-bottom: 0;">
+                        <select id="logDeviceTypeFilter">
+                            <option value="">全部设备</option>
+                            <option value="PILE">充电桩 (PILE)</option>
+                            <option value="GUN">充电枪 (GUN)</option>
+                        </select>
+                        <select id="logTodoStatusFilter">
+                            <option value="">全部待办</option>
+                            <option value="PENDING">待处理 (PENDING)</option>
+                            <option value="DONE">已办结 (DONE)</option>
+                            <option value="NONE">无需处理 (NONE)</option>
+                        </select>
+                        <button id="loadLogsBtn" class="btn btn-outline btn-sm" type="button">刷新状态日志</button>
+                    </div>
+                </div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>日志ID</th>
+                                <th>场站</th>
+                                <th>设备</th>
+                                <th>变更轨迹</th>
+                                <th>来源</th>
+                                <th>待办</th>
+                                <th>备注</th>
+                                <th>时间(UTC)</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="statusLogsBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- Tab 3: 管理员实时看板与三级资产建档 -->
+        <section id="tab-admin" class="tab-panel">
+            <div class="card">
+                <div class="section-header">
+                    <h3>全平台场站实时资产看板（视图 <code>v_station_realtime_status</code>，仅 <code>admin</code> / <code>settlement</code>）</h3>
+                    <button id="loadRealtimeBtn" class="btn btn-primary btn-sm" type="button">刷新全局看板</button>
+                </div>
+                <div id="realtimeKpis" class="kpi-grid"></div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>场站ID</th>
+                                <th>场站名称</th>
+                                <th>运营商</th>
+                                <th>营业状态</th>
+                                <th>总桩/待验/闲/忙/故障/离</th>
+                                <th>额定总功率(kW)</th>
+                                <th>总枪/闲/忙/故障/离</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="realtimeBody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="grid-2">
+                <div class="card">
+                    <div class="section-header">
+                        <h3>运营商档案 / 脱敏摘要</h3>
+                        <div class="toolbar" style="margin-bottom: 0;">
+                            <button id="loadOperatorsFullBtn" class="btn btn-outline btn-sm" type="button">完整档案（admin）</button>
+                            <button id="loadOperatorsSummaryBtn" class="btn btn-outline btn-sm" type="button">脱敏摘要（admin/settlement）</button>
+                        </div>
+                    </div>
+                    <div class="table-wrap" style="max-height: 270px; overflow-y: auto;">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>ID</th>
+                                    <th>编码</th>
+                                    <th>名称</th>
+                                    <th>状态</th>
+                                    <th>热线 / 脱敏热线</th>
+                                    <th>信用代码</th>
+                                </tr>
+                            </thead>
+                            <tbody id="operatorsBody"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="section-header">
+                        <h3>场站下属桩 / 枪钻取查询（<code>ops</code> / <code>admin</code>）</h3>
+                    </div>
+                    <div class="toolbar">
+                        <input id="drillStationId" type="number" min="1" value="1" style="width: 100px;" placeholder="场站ID">
+                        <button id="drillPilesBtn" class="btn btn-outline btn-sm" type="button">查场站下属桩</button>
+                        <input id="drillPileId" type="number" min="1" value="1" style="width: 100px;" placeholder="桩ID">
+                        <button id="drillGunsBtn" class="btn btn-outline btn-sm" type="button">查桩下属枪</button>
+                    </div>
+                    <div id="drillResultBox" class="empty-hint">选择场站 ID 或桩 ID 进行资产明细钻取。</div>
+                </div>
+            </div>
+
+            <div class="grid-2">
+                <div class="card">
+                    <div class="section-header">
+                        <h3>新增充电场站（<code>POST /api/stations</code>，仅 <code>admin</code>）</h3>
+                        <span class="meta">支持实测 <code>1062</code> 重复 / <code>3819</code> 车位越界拦截</span>
+                    </div>
+                    <form id="createStationForm" class="form-grid">
+                        <div class="field"><label>运营商ID</label><input name="operator_id" type="number" min="1" value="1" required></div>
+                        <div class="field"><label>场站编码</label><input name="station_code" type="text" value="ST-DEMO-101" required></div>
+                        <div class="field"><label>场站名称</label><input name="station_name" type="text" value="演示超充示范站" required></div>
+                        <div class="field"><label>详细地址</label><input name="address" type="text" value="北京市海淀区学院路演示广场" required></div>
+                        <div class="field"><label>经度</label><input name="longitude" type="text" value="116.351200" required></div>
+                        <div class="field"><label>纬度</label><input name="latitude" type="text" value="40.001200" required></div>
+                        <div class="field"><label>总车位</label><input name="total_spaces" type="number" min="1" value="12" required></div>
+                        <div class="field"><label>空闲车位</label><input name="available_spaces" type="number" min="0" value="10" required></div>
+                        <div class="field"><label>停车费(元/h)</label><input name="parking_fee_rate" type="text" value="4.00" required></div>
+                        <div class="field" style="justify-content: flex-end;">
+                            <button class="btn btn-primary" type="submit">创建场站</button>
+                        </div>
+                    </form>
+                </div>
+
+                <div class="card">
+                    <div class="section-header">
+                        <h3>新增充电桩 / 充电枪（仅 <code>admin</code>）</h3>
+                        <span class="meta">自动留痕 INIT 日志并受 <code>1644</code> 功率/枪序号保护</span>
+                    </div>
+                    <form id="createPileForm" class="form-grid" style="margin-bottom: 14px;">
+                        <div class="field"><label>场站ID</label><input name="station_id" type="number" min="1" value="1" required></div>
+                        <div class="field"><label>桩编码</label><input name="pile_code" type="text" value="PL-DEMO-101" required></div>
+                        <div class="field"><label>设备型号</label><input name="device_model" type="text" value="HW-Fusion180" required></div>
+                        <div class="field"><label>额定功率(kW)</label><input name="rated_power" type="text" value="180.00" required></div>
+                        <div class="field"><label>设计枪数</label><input name="gun_count" type="number" min="1" max="8" value="2" required></div>
+                        <div class="field"><label>质保截止</label><input name="warranty_end_date" type="date" value="2031-12-31" required></div>
+                        <div class="field" style="justify-content: flex-end;">
+                            <button class="btn btn-outline" type="submit">新增待验收桩</button>
+                        </div>
+                    </form>
+                    <form id="createGunForm" class="form-grid">
+                        <div class="field"><label>所属桩ID</label><input name="pile_id" type="number" min="1" value="1" required></div>
+                        <div class="field"><label>枪编码</label><input name="gun_code" type="text" value="GN-DEMO-101-A" required></div>
+                        <div class="field"><label>枪序号</label><input name="gun_seq" type="number" min="1" value="2" required></div>
+                        <div class="field"><label>枪型</label>
+                            <select name="gun_type">
+                                <option value="DC_FAST">DC_FAST</option>
+                                <option value="AC_SLOW">AC_SLOW</option>
+                            </select>
+                        </div>
+                        <div class="field"><label>接口标准</label><input name="connector_standard" type="text" value="GB/T 20234.3" required></div>
+                        <div class="field"><label>最大功率(kW)</label><input name="max_power" type="text" value="180.00" required></div>
+                        <div class="field" style="justify-content: flex-end;">
+                            <button class="btn btn-outline" type="submit">新增充电枪</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </section>
+
+        <!-- Tab 4: 跨线联调与 RBAC/约束实测控制台 -->
+        <section id="tab-cross" class="tab-panel">
+            <div class="grid-2">
+                <div class="card">
+                    <div class="section-header">
+                        <h3>已挂载业务线联调（线 2 订单 + 线 5 结算）</h3>
+                        <span class="meta">线 3（monitor）与线 4（user）待组员合入 <code>main</code> 后接入</span>
+                    </div>
+                    <div class="toolbar">
+                        <button id="loadOrdersBtn" class="btn btn-outline btn-sm" type="button">查询订单（GET /api/orders）</button>
+                        <button id="loadBillsBtn" class="btn btn-outline btn-sm" type="button">查询结算单（GET /api/settlements）</button>
+                        <button id="loadDiffsBtn" class="btn btn-outline btn-sm" type="button">查询待处理差异（/diffs）</button>
+                    </div>
+                    <div id="crossPreviewBox" class="empty-hint">点击上方按钮，使用当前角色 Token 验证跨线接口返回或 403 越权拦截。</div>
+                </div>
+
+                <div class="card">
+                    <div class="section-header">
+                        <h3>RBAC 越权与数据库约束一键自测</h3>
+                        <button id="clearConsoleBtn" class="btn btn-outline btn-sm" type="button">清空输出</button>
+                    </div>
+                    <div class="toolbar">
+                        <button id="probeFaultsBtn" class="btn btn-outline btn-sm" type="button">试探 /faults</button>
+                        <button id="probeRealtimeBtn" class="btn btn-outline btn-sm" type="button">试探 /realtime-status</button>
+                        <button id="probeOperatorsBtn" class="btn btn-outline btn-sm" type="button">试探 /operators</button>
+                        <button id="probeCommission1Btn" class="btn btn-danger btn-sm" type="button">重复验收 1号桩（触发 1644）</button>
+                    </div>
+                    <pre id="apiConsole" class="console-box">等待请求...</pre>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <div id="toast" class="toast"></div>
+    <script src="/static/app.js"></script>
+</body>
+</html>

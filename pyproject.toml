@@ -1,7 +1,7 @@
 [project]
 name = "ev-charge-hub"
 version = "0.1.0"
-description = "Add your description here"
+description = "新能源汽车充电桩运营服务平台（BFU 数据库系统课程设计）"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [

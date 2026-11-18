@@ -13,3 +13,7 @@ wheels/
 .env
 .env.*
 !.env.example
+
+# IDE configs
+.idea/
+.vscode/
