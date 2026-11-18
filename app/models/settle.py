@@ -3,7 +3,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, DateTime, Enum, Integer, Numeric, String
+from sqlalchemy import BigInteger, DateTime, Enum, Integer, Numeric, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -31,8 +31,8 @@ class SettlementBill(Base):
     platform_fee: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("0.00"))
     payable_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("0.00"))
     status: Mapped[str] = mapped_column(BILL_STATUS_ENUM, default="DRAFT")
-    created_at: Mapped[datetime | None] = mapped_column(DateTime)
-    updated_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, server_default=text("CURRENT_TIMESTAMP"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now, server_default=text("CURRENT_TIMESTAMP"))
 
 
 class ReconcileDiff(Base):
@@ -47,7 +47,7 @@ class ReconcileDiff(Base):
     diff_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("0.00"))
     resolved: Mapped[int] = mapped_column(Integer, default=0)
     remark: Mapped[str | None] = mapped_column(String(200))
-    created_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, server_default=text("CURRENT_TIMESTAMP"))
 
 
 class InvoiceRecord(Base):
