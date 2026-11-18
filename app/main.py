@@ -11,7 +11,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -115,7 +115,13 @@ def health_check_db(db: Session = Depends(get_db)) -> dict[str, str | None]:
 # 4. 静态前端挂载（使用基于 __file__ 的绝对路径，避免工作目录切换导致找不到 static/）
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 _STATIC_DIR.mkdir(exist_ok=True)
-app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+app.mount("/static", StaticFiles(directory=str(_STATIC_DIR), html=True), name="static")
+
+
+@app.get("/", include_in_schema=False)
+def serve_frontend_index() -> FileResponse:
+    """平台静态单页应用首页入口。"""
+    return FileResponse(str(_STATIC_DIR / "index.html"))
 
 
 # 5. 各业务线路由挂载区（后续由组长在此统一引入 auth 及 5 条业务线路由）

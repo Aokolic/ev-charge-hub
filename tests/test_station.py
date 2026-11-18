@@ -148,14 +148,14 @@ def _make_dummy_request(method: str = "POST", path: str = "/api/stations") -> Re
     )
 
 
-async def _call_asgi(
+async def _call_asgi_raw(
     method: str,
     path: str,
     query_string: str = "",
     token: str | None = None,
     payload: dict[str, Any] | None = None,
-) -> tuple[int, dict[str, Any] | list[Any]]:
-    """无 httpx 依赖的原生 ASGI 请求调度器，完整经过路由、依赖注入、DB 与全局异常处理器。"""
+) -> tuple[int, bytes]:
+    """无 httpx 依赖的原生 ASGI 原始字节调度器，完整经过路由、中间件与静态文件挂载。"""
     body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else b""
     headers: list[tuple[bytes, bytes]] = [(b"host", b"testserver")]
     if token is not None:
@@ -179,24 +179,42 @@ async def _call_asgi(
     }
     sent_messages: list[dict[str, Any]] = []
     body_sent = False
+    response_done = asyncio.Event()
 
     async def receive() -> dict[str, Any]:
         nonlocal body_sent
         if not body_sent:
             body_sent = True
             return {"type": "http.request", "body": body_bytes, "more_body": False}
+        await response_done.wait()
         return {"type": "http.disconnect"}
 
     async def send(message: dict[str, Any]) -> None:
         sent_messages.append(message)
+        if message["type"] == "http.response.body" and not message.get("more_body", False):
+            response_done.set()
 
     await app(scope, receive, send)
     start_msg = next(msg for msg in sent_messages if msg["type"] == "http.response.start")
     resp_bytes = b"".join(
         msg.get("body", b"") for msg in sent_messages if msg["type"] == "http.response.body"
     )
+    return int(start_msg["status"]), resp_bytes
+
+
+async def _call_asgi(
+    method: str,
+    path: str,
+    query_string: str = "",
+    token: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> tuple[int, dict[str, Any] | list[Any]]:
+    """无 httpx 依赖的原生 ASGI JSON 请求调度器，完整经过路由、依赖注入、DB 与全局异常处理器。"""
+    status_code, resp_bytes = await _call_asgi_raw(
+        method, path, query_string=query_string, token=token, payload=payload
+    )
     parsed = json.loads(resp_bytes.decode("utf-8")) if resp_bytes else {}
-    return int(start_msg["status"]), parsed
+    return status_code, parsed
 
 
 def _find_station_api_route(path: str, method: str) -> APIRoute:
@@ -1136,6 +1154,18 @@ class StationLine1VerificationTest(unittest.TestCase):
         )
         self.assertEqual(resp_missing.status_code, 400)
         self.assertIn("不存在", json.loads(resp_missing.body.decode("utf-8"))["detail"])
+
+    def test_07_static_frontend_routes(self) -> None:
+        """验证首页 GET / 与静态资源 /static/、styles.css、app.js 可正常访问。"""
+        for static_path, marker in (
+            ("/", "新能源汽车充电桩运营服务平台"),
+            ("/static/", "RBAC 角色切换与认证中心"),
+            ("/static/styles.css", ".station-grid"),
+            ("/static/app.js", "/api/stations/overview"),
+        ):
+            st, raw = asyncio.run(_call_asgi_raw("GET", static_path))
+            self.assertEqual(st, 200, f"静态路径 {static_path} 返回状态码 {st}")
+            self.assertIn(marker, raw.decode("utf-8"))
 
 
 if __name__ == "__main__":
