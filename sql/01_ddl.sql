@@ -269,9 +269,102 @@ CREATE TABLE payment_record (
 
 
 -- ============================================================================
--- 【业务线 3】设备运行遥测（分区表）、告警与维修工单（负责人：成员 3 / 代润森，待补充）
--- 说明：依赖 charging_pile(pile_id)、charging_gun(gun_id)、user_account(user_id)
+-- 【业务线 3】设备运行遥测（分区表）、告警与维修工单（负责人：成员 3 / 代润森）
+-- 说明：依赖 charging_pile(pile_id)、charging_gun(gun_id)；repair_order.maintainer_id
+--       与业务线4 user_account(user_id) 语义对齐（逻辑外键，待 04-develop 建表后由组长
+--       统一补 FK，避免本分支先行建表时因 user_account 尚未创建而无法执行）。
 -- ============================================================================
+
+-- 3.1 分钟级设备运行遥测事实表（按采集时间 RANGE 分区；分区表禁止外键）
+CREATE TABLE IF NOT EXISTS pile_telemetry (
+    telemetry_id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '遥测记录主键ID',
+    pile_id              BIGINT UNSIGNED NOT NULL                COMMENT '关联充电桩ID（逻辑引用 charging_pile.pile_id）',
+    collected_at         DATETIME(3)     NOT NULL                COMMENT '采集时间（毫秒精度，分区键）',
+    output_voltage       DECIMAL(6, 1)   NULL                    COMMENT '输出电压（V）',
+    output_current       DECIMAL(6, 2)   NULL                    COMMENT '输出电流（A）',
+    power                DECIMAL(8, 3)   NOT NULL DEFAULT 0.000  COMMENT '当前输出功率（kW）',
+    module_temp          DECIMAL(5, 1)   NULL                    COMMENT '模块温度（℃）',
+    offline_duration_sec INT UNSIGNED    NOT NULL DEFAULT 0      COMMENT '累计离线时长（秒）',
+    fault_code           VARCHAR(32)     NULL                    COMMENT '故障码（无故障为 NULL）',
+    PRIMARY KEY (telemetry_id, collected_at),
+    UNIQUE KEY uk_pile_telemetry_time (pile_id, collected_at),
+    KEY idx_pile_telemetry_pile_time (pile_id, collected_at),
+    KEY idx_pile_telemetry_fault_time (fault_code, collected_at),
+    CONSTRAINT chk_telemetry_voltage CHECK (output_voltage IS NULL OR output_voltage BETWEEN 0 AND 1000),
+    CONSTRAINT chk_telemetry_current CHECK (output_current IS NULL OR output_current BETWEEN 0 AND 1000),
+    CONSTRAINT chk_telemetry_power CHECK (power >= 0),
+    CONSTRAINT chk_telemetry_temp CHECK (module_temp IS NULL OR module_temp BETWEEN -40 AND 150)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+COMMENT='业务线3-分钟级设备运行遥测分区表'
+PARTITION BY RANGE COLUMNS (collected_at) (
+    PARTITION p202610 VALUES LESS THAN ('2026-11-01'),
+    PARTITION p202611 VALUES LESS THAN ('2026-12-01'),
+    PARTITION p202612 VALUES LESS THAN ('2027-01-01'),
+    PARTITION p202701 VALUES LESS THAN ('2027-02-01'),
+    PARTITION p_future  VALUES LESS THAN (MAXVALUE)
+);
+
+-- 3.2 设备告警记录表（告警与维修工单为 1:N，同一告警可多次派单）
+CREATE TABLE IF NOT EXISTS alarm_record (
+    alarm_id            BIGINT UNSIGNED                         NOT NULL AUTO_INCREMENT COMMENT '告警主键ID',
+    pile_id             BIGINT UNSIGNED                         NOT NULL                COMMENT '关联充电桩ID',
+    gun_id              BIGINT UNSIGNED                         NULL                    COMMENT '关联充电枪ID（仅枪级告警非空）',
+    alarm_code          VARCHAR(32)                             NOT NULL                COMMENT '告警码（如 E-OVERVOLT / E-MODULE_OVERHEAT）',
+    alarm_level         ENUM('L1', 'L2', 'L3', 'L4')            NOT NULL                COMMENT '当前告警等级：L1-一级(最紧急) / L4-四级',
+    original_level      ENUM('L1', 'L2', 'L3', 'L4')            NOT NULL                COMMENT '初始告警等级（升级后不可回退）',
+    response_limit_min  SMALLINT UNSIGNED                       NOT NULL                COMMENT '该等级 SLA 响应时限（分钟）',
+    occurred_at         DATETIME(3)                             NOT NULL                COMMENT '告警发生时间',
+    recovered_at        DATETIME(3)                             NULL                    COMMENT '告警恢复时间（解除前为空）',
+    status              ENUM('ACTIVE', 'PROCESSING', 'RECOVERED', 'CLOSED') NOT NULL DEFAULT 'ACTIVE' COMMENT '告警状态',
+    escalated_count     TINYINT UNSIGNED                        NOT NULL DEFAULT 0      COMMENT '已自动升级次数',
+    escalated_at        DATETIME(3)                             NULL                    COMMENT '最近一次升级时间',
+    created_at          DATETIME                                NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+    updated_at          DATETIME                                NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
+    PRIMARY KEY (alarm_id),
+    KEY idx_alarm_status_time (status, occurred_at),
+    KEY idx_alarm_pile_time (pile_id, occurred_at),
+    KEY idx_alarm_code (alarm_code),
+    CONSTRAINT fk_alarm_pile
+        FOREIGN KEY (pile_id) REFERENCES charging_pile (pile_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT,
+    CONSTRAINT fk_alarm_gun
+        FOREIGN KEY (gun_id) REFERENCES charging_gun (gun_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT,
+    CONSTRAINT chk_alarm_response_limit CHECK (response_limit_min > 0),
+    CONSTRAINT chk_alarm_recovered_time CHECK (recovered_at IS NULL OR recovered_at >= occurred_at),
+    CONSTRAINT chk_alarm_escalated_count CHECK (escalated_count >= 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='业务线3-设备告警记录表';
+
+-- 3.3 维修工单表（同一告警可多次派单；同一时刻仅允许一张处理中工单，由触发器保障）
+CREATE TABLE IF NOT EXISTS repair_order (
+    work_order_id   BIGINT UNSIGNED   NOT NULL AUTO_INCREMENT COMMENT '维修工单主键ID',
+    alarm_id        BIGINT UNSIGNED   NOT NULL                COMMENT '关联告警ID',
+    maintainer_id   BIGINT UNSIGNED   NOT NULL                COMMENT '维修人员 user_id（逻辑引用业务线4 user_account.user_id）',
+    status          ENUM('DISPATCHED', 'ACCEPTED', 'ARRIVED', 'REPAIRED', 'VERIFIED', 'CLOSED') NOT NULL DEFAULT 'DISPATCHED' COMMENT '工单状态',
+    dispatched_at   DATETIME(3)       NOT NULL                COMMENT '派单时间',
+    accepted_at     DATETIME(3)       NULL                    COMMENT '接单时间',
+    arrived_at      DATETIME(3)       NULL                    COMMENT '到场时间',
+    repaired_at     DATETIME(3)       NULL                    COMMENT '修复时间',
+    verified_at     DATETIME(3)       NULL                    COMMENT '复核时间',
+    closed_at       DATETIME(3)       NULL                    COMMENT '关闭时间',
+    replaced_parts  VARCHAR(255)      NULL                    COMMENT '更换备件清单',
+    result          VARCHAR(255)      NULL                    COMMENT '处理结果说明',
+    created_at      DATETIME          NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+    updated_at      DATETIME          NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
+    PRIMARY KEY (work_order_id),
+    KEY idx_workorder_alarm_status (alarm_id, status),
+    KEY idx_workorder_maintainer_status (maintainer_id, status),
+    CONSTRAINT fk_workorder_alarm
+        FOREIGN KEY (alarm_id) REFERENCES alarm_record (alarm_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT,
+    CONSTRAINT chk_workorder_time_order CHECK (
+        (accepted_at IS NULL OR accepted_at >= dispatched_at)
+        AND (arrived_at IS NULL OR arrived_at >= accepted_at)
+        AND (repaired_at IS NULL OR repaired_at >= arrived_at)
+        AND (verified_at IS NULL OR verified_at >= repaired_at)
+        AND (closed_at IS NULL OR closed_at >= verified_at)
+    )
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='业务线3-维修工单表';
 
 
 -- ============================================================================

@@ -646,5 +646,180 @@ ORDER BY created_at DESC;
 
 
 -- ============================================================================
--- 【业务线 3 ~ 业务线 4】复杂 SQL 双实现与 EXPLAIN ANALYZE 对比占位区
+-- 【业务线 3】设备监控与工单复杂查询优化对比（负责人：成员 3 / 代润森，共 3 组）
+-- ============================================================================
+
+-- ----------------------------------------------------------------------------
+-- 第 1 组（4 表关联：operator + station + charging_pile + pile_telemetry）
+-- 业务场景：查询营业场站内每根已验收桩的最新一分钟遥测与故障码
+-- ----------------------------------------------------------------------------
+
+-- [实现 A - 低效]：SELECT 标量相关子查询每桩回表取最大时间，且在时间列上使用
+--                  DATE() 函数，导致 idx_pile_telemetry_pile_time 与分区裁剪失效
+SELECT
+    s.station_code,
+    s.station_name,
+    p.pile_id,
+    p.pile_code,
+    t.collected_at,
+    t.power,
+    t.module_temp,
+    t.fault_code
+FROM charging_pile AS p
+INNER JOIN station AS s
+    ON s.station_id = p.station_id
+INNER JOIN operator AS o
+    ON o.operator_id = s.operator_id
+LEFT JOIN pile_telemetry AS t
+    ON t.pile_id = p.pile_id
+   AND t.collected_at = (
+       SELECT MAX(t2.collected_at)
+         FROM pile_telemetry AS t2
+        WHERE t2.pile_id = p.pile_id
+          AND DATE(t2.collected_at) = DATE(NOW())
+   )
+WHERE s.station_status = 'OPEN'
+  AND o.status = 'ACTIVE'
+  AND p.acceptance_status = 'PASSED'
+ORDER BY p.pile_id ASC;
+
+-- [实现 B - 优化]：使用 ROW_NUMBER 窗口函数每桩取最新一行，避免相关子查询回表；
+--                 时间过滤使用常量区间，使索引与 RANGE 分区裁剪同时生效
+SELECT
+    s.station_code,
+    s.station_name,
+    p.pile_id,
+    p.pile_code,
+    t.collected_at,
+    t.power,
+    t.module_temp,
+    t.fault_code
+FROM charging_pile AS p
+INNER JOIN station AS s
+    ON s.station_id = p.station_id
+INNER JOIN operator AS o
+    ON o.operator_id = s.operator_id
+LEFT JOIN (
+    SELECT
+        pt.pile_id,
+        pt.collected_at,
+        pt.power,
+        pt.module_temp,
+        pt.fault_code,
+        ROW_NUMBER() OVER (PARTITION BY pt.pile_id ORDER BY pt.collected_at DESC) AS rn
+    FROM pile_telemetry AS pt
+    WHERE pt.collected_at >= CAST(CURDATE() AS DATETIME)
+) AS t
+    ON t.pile_id = p.pile_id AND t.rn = 1
+WHERE s.station_status = 'OPEN'
+  AND o.status = 'ACTIVE'
+  AND p.acceptance_status = 'PASSED'
+ORDER BY p.pile_id ASC;
+
+
+-- ----------------------------------------------------------------------------
+-- 第 2 组（5 表关联：operator + station + charging_pile + alarm_record + repair_order）
+-- 业务场景：统计近 30 分钟各营业场站超时未响应告警数量与最高告警等级
+-- ----------------------------------------------------------------------------
+
+-- [实现 A - 低效]：NOT EXISTS 子查询反复扫描 repair_order；WHERE 用
+--                  TIMESTAMPDIFF 包裹 occurred_at，无法命中 idx_alarm_status_time
+SELECT
+    s.station_id,
+    s.station_code,
+    s.station_name,
+    o.operator_name,
+    COUNT(*)                                  AS overdue_alarm_count,
+    MAX(a.alarm_level)                        AS max_alarm_level
+FROM alarm_record AS a
+INNER JOIN charging_pile AS p
+    ON p.pile_id = a.pile_id
+INNER JOIN station AS s
+    ON s.station_id = p.station_id
+INNER JOIN operator AS o
+    ON o.operator_id = s.operator_id
+WHERE a.status IN ('ACTIVE', 'PROCESSING')
+  AND TIMESTAMPDIFF(MINUTE, a.occurred_at, NOW()) > a.response_limit_min
+  AND NOT EXISTS (
+      SELECT 1
+        FROM repair_order AS r
+       WHERE r.alarm_id = a.alarm_id
+         AND r.status IN ('ACCEPTED', 'ARRIVED', 'REPAIRED', 'VERIFIED', 'CLOSED')
+  )
+GROUP BY s.station_id, s.station_code, s.station_name, o.operator_name
+ORDER BY overdue_alarm_count DESC;
+
+-- [实现 B - 优化]：由于 DDL 约束 response_limit_min >= 15，先用常量时间下界锁定候选
+--                 行命中 idx_alarm_status_time(status, occurred_at)，再逐行精确复核
+SELECT
+    s.station_id,
+    s.station_code,
+    s.station_name,
+    o.operator_name,
+    COUNT(*)                                  AS overdue_alarm_count,
+    MAX(a.alarm_level)                        AS max_alarm_level
+FROM alarm_record AS a
+INNER JOIN charging_pile AS p
+    ON p.pile_id = a.pile_id
+INNER JOIN station AS s
+    ON s.station_id = p.station_id
+INNER JOIN operator AS o
+    ON o.operator_id = s.operator_id
+WHERE a.status IN ('ACTIVE', 'PROCESSING')
+  AND a.occurred_at < DATE_SUB(NOW(), INTERVAL 15 MINUTE)
+  AND TIMESTAMPDIFF(MINUTE, a.occurred_at, NOW()) > a.response_limit_min
+  AND NOT EXISTS (
+      SELECT 1
+        FROM repair_order AS r
+       WHERE r.alarm_id = a.alarm_id
+         AND r.status IN ('ACCEPTED', 'ARRIVED', 'REPAIRED', 'VERIFIED', 'CLOSED')
+  )
+GROUP BY s.station_id, s.station_code, s.station_name, o.operator_name
+ORDER BY overdue_alarm_count DESC;
+
+
+-- ----------------------------------------------------------------------------
+-- 第 3 组（4 表关联：station + charging_pile + alarm_record + repair_order）
+-- 业务场景：统计近 7 天各场站维修工单量、平均响应时长与按时闭环率
+-- ----------------------------------------------------------------------------
+
+-- [实现 A - 低效]：DATE() 包裹 dispatched_at 使时间索引失效，且每行做 CASE 函数计算
+SELECT
+    s.station_id,
+    s.station_name,
+    COUNT(r.work_order_id)                                                          AS work_order_count,
+    ROUND(AVG(TIMESTAMPDIFF(MINUTE, a.occurred_at, r.accepted_at)), 1)             AS avg_response_min,
+    ROUND(100 * SUM(CASE WHEN r.closed_at IS NOT NULL THEN 1 ELSE 0 END) / COUNT(*), 1) AS closure_rate
+FROM repair_order AS r
+INNER JOIN alarm_record AS a
+    ON a.alarm_id = r.alarm_id
+INNER JOIN charging_pile AS p
+    ON p.pile_id = a.pile_id
+INNER JOIN station AS s
+    ON s.station_id = p.station_id
+WHERE DATE(r.dispatched_at) >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+GROUP BY s.station_id, s.station_name
+ORDER BY work_order_count DESC;
+
+-- [实现 B - 优化]：时间筛选改为常量下界直接命中 idx_workorder_maintainer_status 或
+--                 idx_workorder_alarm_status 的时间范围，聚合前先裁剪工单明细
+SELECT
+    s.station_id,
+    s.station_name,
+    COUNT(r.work_order_id)                                                          AS work_order_count,
+    ROUND(AVG(TIMESTAMPDIFF(MINUTE, a.occurred_at, r.accepted_at)), 1)             AS avg_response_min,
+    ROUND(100 * SUM(CASE WHEN r.closed_at IS NOT NULL THEN 1 ELSE 0 END) / COUNT(*), 1) AS closure_rate
+FROM repair_order AS r
+INNER JOIN alarm_record AS a
+    ON a.alarm_id = r.alarm_id
+INNER JOIN charging_pile AS p
+    ON p.pile_id = a.pile_id
+INNER JOIN station AS s
+    ON s.station_id = p.station_id
+WHERE r.dispatched_at >= CAST(DATE_SUB(CURDATE(), INTERVAL 7 DAY) AS DATETIME)
+GROUP BY s.station_id, s.station_name
+ORDER BY work_order_count DESC;
+
+-- ============================================================================
+-- 【业务线 4】复杂 SQL 双实现与 EXPLAIN ANALYZE 对比占位区
 -- ============================================================================

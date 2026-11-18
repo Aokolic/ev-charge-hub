@@ -340,6 +340,128 @@ SELECT d.period,
 FROM order_fee_detail d
 GROUP BY d.period, DATE(d.begin_time);
 
+-- ============================================================================
+-- 【业务线 3】设备监控与工单隔离视图（负责人：成员 3 / 代润森，共 3 个视图）
+-- 说明：三个视图均只供 ops / admin 使用；ops 的行级归属由 DAO 层叠加
+--       maintainer_id 条件实现，driver / fleet / settlement 禁查本业务线视图。
+-- ============================================================================
+
+-- ----------------------------------------------------------------------------
+-- 视图 3.1：v_monitor_realtime_status（面向 ops / admin）
+-- 隔离边界：仅暴露已验收桩的最新一条遥测，屏蔽遥测主键、未来分区细节等内部字段；
+--           使用 ROW_NUMBER 取每桩最新采集，避免 GROUP BY + 回表造成全分区扫描。
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_monitor_realtime_status AS
+SELECT
+    t.pile_id,
+    s.station_id,
+    s.station_code,
+    s.station_name,
+    p.pile_code,
+    p.current_status                              AS pile_status,
+    t.collected_at,
+    t.output_voltage,
+    t.output_current,
+    t.power,
+    t.module_temp,
+    t.offline_duration_sec,
+    t.fault_code,
+    CASE
+        WHEN p.last_heartbeat_at IS NULL THEN NULL
+        ELSE TIMESTAMPDIFF(SECOND, p.last_heartbeat_at, NOW())
+    END                                          AS heartbeat_lag_sec
+FROM (
+    SELECT
+        pt.pile_id,
+        pt.collected_at,
+        pt.output_voltage,
+        pt.output_current,
+        pt.power,
+        pt.module_temp,
+        pt.offline_duration_sec,
+        pt.fault_code,
+        ROW_NUMBER() OVER (PARTITION BY pt.pile_id ORDER BY pt.collected_at DESC) AS rn
+    FROM pile_telemetry AS pt
+) AS t
+INNER JOIN charging_pile AS p
+    ON p.pile_id = t.pile_id
+INNER JOIN station AS s
+    ON s.station_id = p.station_id
+WHERE t.rn = 1
+  AND p.acceptance_status = 'PASSED';
+
+
+-- ----------------------------------------------------------------------------
+-- 视图 3.2：v_monitor_alarm_overview（面向 ops / admin）
+-- 隔离边界：聚合最新派单维修人 latest_maintainer_id，供 ops 按本人隔离行级数据；
+--           overdue_flag 标记超时未响应告警，供 DAO 与看板直接过滤。
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_monitor_alarm_overview AS
+SELECT
+    a.alarm_id,
+    a.pile_id,
+    a.gun_id,
+    a.alarm_code,
+    a.alarm_level,
+    a.original_level,
+    a.response_limit_min,
+    a.occurred_at,
+    a.recovered_at,
+    a.status,
+    a.escalated_count,
+    a.escalated_at,
+    (
+        SELECT r.maintainer_id
+          FROM repair_order AS r
+         WHERE r.alarm_id = a.alarm_id
+         ORDER BY r.dispatched_at DESC, r.work_order_id DESC
+         LIMIT 1
+    )                                              AS latest_maintainer_id,
+    CASE
+        WHEN a.status IN ('ACTIVE', 'PROCESSING')
+         AND TIMESTAMPDIFF(MINUTE, a.occurred_at, NOW()) > a.response_limit_min
+         AND NOT EXISTS (
+             SELECT 1
+               FROM repair_order AS r
+              WHERE r.alarm_id = a.alarm_id
+                AND r.status IN ('ACCEPTED', 'ARRIVED', 'REPAIRED', 'VERIFIED', 'CLOSED')
+         )
+        THEN 1
+        ELSE 0
+    END                                            AS overdue_flag
+FROM alarm_record AS a;
+
+
+-- ----------------------------------------------------------------------------
+-- 视图 3.3：v_monitor_workorder_closure（面向 ops / admin）
+-- 隔离边界：以工单为单位输出全流程时间节点与响应时长，供 ops 按 maintainer_id
+--           过滤本人数据，供 admin 做闭环率与 SLA 达标率统计。
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_monitor_workorder_closure AS
+SELECT
+    r.work_order_id,
+    r.alarm_id,
+    r.maintainer_id,
+    r.status,
+    r.dispatched_at,
+    r.accepted_at,
+    r.arrived_at,
+    r.repaired_at,
+    r.verified_at,
+    r.closed_at,
+    r.replaced_parts,
+    r.result,
+    TIMESTAMPDIFF(MINUTE, a.occurred_at, COALESCE(r.accepted_at, NOW())) AS response_minutes,
+    CASE
+        WHEN r.status = 'DISPATCHED'
+         AND TIMESTAMPDIFF(MINUTE, a.occurred_at, NOW()) > a.response_limit_min
+        THEN 1
+        ELSE 0
+    END                                                                  AS overdue_flag
+FROM repair_order AS r
+INNER JOIN alarm_record AS a
+    ON a.alarm_id = r.alarm_id;
+
 -- ============================================================
 -- 业务线 5：结算对账（孙墨涵 / 05-develop）
 -- ============================================================
