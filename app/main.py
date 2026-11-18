@@ -87,6 +87,13 @@ async def operational_error_handler(request: Request, exc: OperationalError) -> 
             content={"detail": msg, "code": 1644},
         )
 
+    if errno == 3819:
+        # PyMySQL 下 MySQL 8/9 CHECK 约束违反（SQLSTATE HY000）以 OperationalError 抛出
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "提交数据不满足数据库校验约束", "code": 3819},
+        )
+
     return JSONResponse(
         status_code=500,
         content={"detail": "数据库服务异常，请稍后重试", "code": errno or 500},
@@ -117,8 +124,12 @@ app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 # app.include_router(auth.router, prefix="/api/auth", tags=["认证鉴权"])
 
 # 业务线 2 / 5（孙墨涵）：前缀已写在 router 内部，这里只做挂载
+from app.routers import auth as auth_routes  # noqa: E402
 from app.routers import order as order_routes  # noqa: E402
 from app.routers import settle as settle_routes  # noqa: E402
+from app.routers import station as station_routes  # noqa: E402
 
+app.include_router(auth_routes.router)
+app.include_router(station_routes.router)
 app.include_router(order_routes.router)
 app.include_router(settle_routes.router)
