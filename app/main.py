@@ -115,3 +115,10 @@ app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 # 示例：
 # from app.routers import auth, station, order, user, monitor, settle
 # app.include_router(auth.router, prefix="/api/auth", tags=["认证鉴权"])
+
+# 业务线 2 / 5（孙墨涵）：前缀已写在 router 内部，这里只做挂载
+from app.routers import order as order_routes  # noqa: E402
+from app.routers import settle as settle_routes  # noqa: E402
+
+app.include_router(order_routes.router)
+app.include_router(settle_routes.router)

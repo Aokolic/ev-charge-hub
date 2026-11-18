@@ -158,9 +158,114 @@ CREATE TABLE IF NOT EXISTS device_status_log (
 
 
 -- ============================================================================
--- 【业务线 2】分时计费规则、充电订单与支付退款（负责人：成员 2 / 孙墨涵，待补充）
+-- 【业务线 2】分时计费规则、充电订单与支付退款（负责人：成员 2 / 孙墨涵）
 -- 说明：依赖 station(station_id)、charging_gun(gun_id)、user_account(user_id)
+--       四张表：电价规则、充电订单、分时费用明细、支付流水
+--       station_id / gun_id / user_id / vehicle_id 先只留 BIGINT UNSIGNED 列，
+--       跨线外键统一放在文件最后一段，等线 1、线 4 建完表再加，避免顺序耦合。
 -- ============================================================================
+
+-- 电价规则：一个站、一个时段（峰/平/谷）、一段有效期，对应一条单价
+DROP TABLE IF EXISTS order_fee_detail;
+DROP TABLE IF EXISTS payment_record;
+DROP TABLE IF EXISTS charge_order;
+DROP TABLE IF EXISTS pricing_rule;
+
+CREATE TABLE pricing_rule (
+    rule_id        BIGINT       NOT NULL AUTO_INCREMENT COMMENT '规则ID',
+    station_id     BIGINT UNSIGNED       NOT NULL COMMENT '所属场站（线1）',
+    period         ENUM('PEAK','FLAT','VALLEY') NOT NULL COMMENT '峰/平/谷',
+    start_time     TIME         NOT NULL COMMENT '时段开始，允许跨零点',
+    end_time       TIME         NOT NULL COMMENT '时段结束',
+    energy_price   DECIMAL(8,4) NOT NULL COMMENT '电费单价 元/度',
+    service_price  DECIMAL(8,4) NOT NULL COMMENT '服务费单价 元/度',
+    free_minutes   INT          NOT NULL DEFAULT 0 COMMENT '免费分钟数，先充够这个再计费',
+    min_charge     DECIMAL(8,2) NOT NULL DEFAULT 0.00 COMMENT '起步价',
+    effective_from DATE         NOT NULL COMMENT '生效日期',
+    effective_to   DATE         NULL COMMENT '失效日期，空表示长期',
+    is_active      TINYINT(1)   NOT NULL DEFAULT 1,
+    created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (rule_id),
+    UNIQUE KEY uk_rule_slot (station_id, period, start_time, end_time, effective_from),
+    KEY idx_rule_station (station_id, is_active),
+    CONSTRAINT ck_rule_price CHECK (energy_price >= 0 AND service_price >= 0 AND min_charge >= 0),
+    CONSTRAINT ck_rule_time  CHECK (start_time <> end_time),
+    CONSTRAINT ck_rule_date  CHECK (effective_to IS NULL OR effective_to >= effective_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='分时电价规则（业务线2）';
+
+-- 充电订单：一次充电一行，钱先记 0，结束时由 sp_order_calc 算出来
+CREATE TABLE charge_order (
+    order_id        BIGINT       NOT NULL AUTO_INCREMENT,
+    order_no        VARCHAR(32)  NOT NULL COMMENT '对外单号',
+    user_id         BIGINT UNSIGNED       NOT NULL COMMENT '车主（线4）',
+    vehicle_id      BIGINT UNSIGNED       NULL COMMENT '车辆（线4），扫码充电可能不带车',
+    gun_id          BIGINT UNSIGNED       NOT NULL COMMENT '充电枪（线1）',
+    station_id      BIGINT UNSIGNED       NOT NULL COMMENT '场站（线1），冗余一份省得每次join',
+    start_time      DATETIME     NOT NULL,
+    end_time        DATETIME     NULL,
+    start_soc       DECIMAL(5,2) NULL COMMENT '开始电量百分比',
+    end_soc         DECIMAL(5,2) NULL,
+    kwh             DECIMAL(10,3) NOT NULL DEFAULT 0.000 COMMENT '充了多少度',
+    energy_fee      DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+    service_fee     DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+    discount_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+    total_amount    DECIMAL(10,2) NOT NULL DEFAULT 0.00 COMMENT '应付',
+    paid_amount     DECIMAL(10,2) NOT NULL DEFAULT 0.00 COMMENT '已付，退款会冲减',
+    status          ENUM('CHARGING','FINISHED','PAID','CANCELLED','REFUNDED') NOT NULL DEFAULT 'CHARGING',
+    -- 充电中的单子把 gun_id 暴露出来，配合唯一索引挡住“同一把枪两个进行中订单”
+    active_gun_id   BIGINT GENERATED ALWAYS AS (CASE WHEN status = 'CHARGING' THEN gun_id END) STORED,
+    created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (order_id),
+    UNIQUE KEY uk_order_no (order_no),
+    UNIQUE KEY uk_gun_active (active_gun_id),
+    KEY idx_order_user (user_id, start_time),
+    KEY idx_order_station (station_id, start_time),
+    CONSTRAINT ck_order_time CHECK (end_time IS NULL OR end_time > start_time),
+    CONSTRAINT ck_order_kwh  CHECK (kwh >= 0),
+    CONSTRAINT ck_order_soc  CHECK ((start_soc IS NULL OR start_soc BETWEEN 0 AND 100)
+                                AND (end_soc   IS NULL OR end_soc   BETWEEN 0 AND 100)),
+    CONSTRAINT ck_order_money CHECK (energy_fee >= 0 AND service_fee >= 0
+                                 AND discount_amount >= 0 AND total_amount >= 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='充电订单（业务线2）';
+
+-- 费用明细：一单跨峰平谷就拆成多行，单价存快照，以后调价不影响老单
+CREATE TABLE order_fee_detail (
+    detail_id     BIGINT       NOT NULL AUTO_INCREMENT,
+    order_id      BIGINT       NOT NULL,
+    period        ENUM('PEAK','FLAT','VALLEY') NOT NULL,
+    rule_id       BIGINT       NULL COMMENT '命中哪条电价规则，留个痕迹',
+    begin_time    DATETIME     NOT NULL,
+    end_time      DATETIME     NOT NULL,
+    kwh           DECIMAL(10,3) NOT NULL,
+    energy_price  DECIMAL(8,4) NOT NULL COMMENT '下单时的电价快照',
+    service_price DECIMAL(8,4) NOT NULL,
+    energy_fee    DECIMAL(10,2) NOT NULL,
+    service_fee   DECIMAL(10,2) NOT NULL,
+    PRIMARY KEY (detail_id),
+    UNIQUE KEY uk_detail_seg (order_id, begin_time),
+    KEY idx_detail_order (order_id),
+    CONSTRAINT fk_detail_order FOREIGN KEY (order_id) REFERENCES charge_order (order_id) ON DELETE CASCADE,
+    CONSTRAINT ck_detail_time CHECK (end_time > begin_time),
+    CONSTRAINT ck_detail_kwh  CHECK (kwh >= 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='分时费用明细（业务线2）';
+
+-- 支付流水：一单可以付多次，退款记负数，txn_no 唯一防回调重复入账
+CREATE TABLE payment_record (
+    payment_id BIGINT       NOT NULL AUTO_INCREMENT,
+    order_id   BIGINT       NOT NULL,
+    amount     DECIMAL(10,2) NOT NULL COMMENT '负数表示退款',
+    method     ENUM('WECHAT','ALIPAY','BALANCE','CASH') NOT NULL,
+    txn_no     VARCHAR(64)  NOT NULL COMMENT '第三方流水号，幂等用',
+    status     ENUM('SUCCESS','FAILED','REFUNDED') NOT NULL DEFAULT 'SUCCESS',
+    paid_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    remark     VARCHAR(200) NULL,
+    PRIMARY KEY (payment_id),
+    UNIQUE KEY uk_payment_txn (txn_no),
+    KEY idx_payment_order (order_id),
+    CONSTRAINT fk_payment_order FOREIGN KEY (order_id) REFERENCES charge_order (order_id) ON DELETE CASCADE,
+    CONSTRAINT ck_payment_amount CHECK (amount <> 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='支付流水（业务线2）';
 
 
 -- ============================================================================
@@ -170,6 +275,74 @@ CREATE TABLE IF NOT EXISTS device_status_log (
 
 
 -- ============================================================================
--- 【业务线 5】运营商月结账单、对账差异与开票红冲（负责人：成员 2 / 孙墨涵，待补充）
+-- 【业务线 5】运营商月结账单、对账差异与开票红冲（负责人：成员 2 / 孙墨涵）
 -- 说明：依赖 operator(operator_id)、station(station_id)、charge_order(order_id)
+--       data flow：settle 只读线2 的订单，写自己的三张表
 -- ============================================================================
+
+DROP TABLE IF EXISTS invoice_record;
+DROP TABLE IF EXISTS reconcile_diff;
+DROP TABLE IF EXISTS settlement_bill;
+
+-- 月度结算单：一个运营商（或一个站）一个月只能有一张
+CREATE TABLE settlement_bill (
+    bill_id        BIGINT       NOT NULL AUTO_INCREMENT,
+    operator_id    BIGINT UNSIGNED       NOT NULL COMMENT '运营商（线1 若有表则挂外键）',
+    station_id     BIGINT UNSIGNED       NULL COMMENT '按站结算时填，按运营商结算留空',
+    bill_month     CHAR(7)      NOT NULL COMMENT 'YYYY-MM',
+    order_count    INT          NOT NULL DEFAULT 0,
+    total_kwh      DECIMAL(12,3) NOT NULL DEFAULT 0.000,
+    total_amount   DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '订单总额',
+    platform_fee   DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '平台抽成',
+    payable_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '应打给运营商',
+    status         ENUM('DRAFT','CONFIRMED','INVOICED','CLOSED') NOT NULL DEFAULT 'DRAFT',
+    created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (bill_id),
+    UNIQUE KEY uk_bill_month (operator_id, station_id, bill_month),
+    CONSTRAINT ck_bill_money CHECK (total_amount >= 0 AND platform_fee >= 0 AND payable_amount >= 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='月度结算单（业务线5）';
+
+-- 对账差异：账单和订单对不上时记一行，指回具体订单
+CREATE TABLE reconcile_diff (
+    diff_id       BIGINT       NOT NULL AUTO_INCREMENT,
+    bill_id       BIGINT       NOT NULL,
+    order_id      BIGINT       NULL COMMENT '能定位到单就填，聚合类差异可空',
+    diff_type     ENUM('MISSING_ORDER','AMOUNT_MISMATCH','DUPLICATE_PAY','UNPAID') NOT NULL,
+    expect_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+    actual_amount DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+    diff_amount   DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '实际减应得',
+    resolved      TINYINT(1)   NOT NULL DEFAULT 0,
+    remark        VARCHAR(200) NULL,
+    created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (diff_id),
+    KEY idx_diff_bill (bill_id, resolved),
+    CONSTRAINT fk_diff_bill FOREIGN KEY (bill_id) REFERENCES settlement_bill (bill_id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='对账差异（业务线5）';
+
+-- 开票记录：红冲不删原票，另开一张负数票，用 red_flush_of 指回去
+CREATE TABLE invoice_record (
+    invoice_id   BIGINT       NOT NULL AUTO_INCREMENT,
+    bill_id      BIGINT       NOT NULL,
+    invoice_no   VARCHAR(32)  NOT NULL,
+    amount       DECIMAL(12,2) NOT NULL COMMENT '红冲票为负数',
+    invoice_type ENUM('NORMAL','SPECIAL') NOT NULL DEFAULT 'NORMAL',
+    status       ENUM('ISSUED','RED_FLUSHED') NOT NULL DEFAULT 'ISSUED',
+    red_flush_of BIGINT       NULL COMMENT '红冲的是哪张票',
+    issued_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (invoice_id),
+    UNIQUE KEY uk_invoice_no (invoice_no),
+    KEY idx_invoice_bill (bill_id),
+    CONSTRAINT fk_invoice_bill FOREIGN KEY (bill_id) REFERENCES settlement_bill (bill_id),
+    CONSTRAINT fk_invoice_red FOREIGN KEY (red_flush_of) REFERENCES invoice_record (invoice_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='开票记录（业务线5）';
+
+-- ============================================================
+-- 跨线外键：等线1（station / charging_gun）、线4（user_account / vehicle）建完表再执行
+-- 类型必须都是 BIGINT UNSIGNED，名字不一致就改这里
+-- ============================================================
+-- ALTER TABLE charge_order
+--     ADD CONSTRAINT fk_order_station FOREIGN KEY (station_id) REFERENCES station (station_id),
+--     ADD CONSTRAINT fk_order_gun     FOREIGN KEY (gun_id)     REFERENCES charging_gun (gun_id),
+--     ADD CONSTRAINT fk_order_user    FOREIGN KEY (user_id)    REFERENCES user_account (user_id),
+--     ADD CONSTRAINT fk_order_vehicle FOREIGN KEY (vehicle_id) REFERENCES vehicle (vehicle_id);

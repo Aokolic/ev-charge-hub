@@ -284,5 +284,116 @@ LEFT JOIN (
 
 
 -- ============================================================================
--- 【业务线 2 ~ 业务线 5】视图占位区（各负责成员按需追加，每线 >= 3 个视图）
+-- 【业务线 2】订单计费隔离视图（负责人：成员 2 / 孙墨涵，共 3 个）
 -- ============================================================================
+
+-- ============================================================
+-- 业务线 2：订单计费（孙墨涵 / 02-develop）
+-- ============================================================
+
+-- 车主视角：自己的订单，去掉内部主键和冗余字段
+CREATE OR REPLACE VIEW v_order_owner AS
+SELECT o.order_id,
+       o.order_no,
+       o.user_id,
+       o.station_id,
+       o.gun_id,
+       o.start_time,
+       o.end_time,
+       o.kwh,
+       o.total_amount,
+       o.paid_amount,
+       o.total_amount - o.paid_amount AS unpaid_amount,
+       o.status,
+       CASE o.status
+            WHEN 'CHARGING' THEN '充电中'
+            WHEN 'FINISHED' THEN '待支付'
+            WHEN 'PAID'     THEN '已支付'
+            WHEN 'CANCELLED' THEN '已取消'
+            WHEN 'REFUNDED' THEN '已退款'
+       END AS status_text
+FROM charge_order o;
+
+-- 站内视角：运维看本站当天每把枪的情况
+CREATE OR REPLACE VIEW v_order_station_daily AS
+SELECT DATE(o.start_time) AS stat_date,
+       o.station_id,
+       o.gun_id,
+       COUNT(*) AS order_cnt,
+       SUM(CASE WHEN o.status = 'PAID' THEN 1 ELSE 0 END) AS paid_cnt,
+       SUM(o.kwh)           AS total_kwh,
+       SUM(o.energy_fee)    AS energy_fee,
+       SUM(o.service_fee)   AS service_fee,
+       SUM(o.total_amount)  AS total_amount
+FROM charge_order o
+GROUP BY DATE(o.start_time), o.station_id, o.gun_id;
+
+-- 分时结构视角：峰平谷各卖了多少电、平均单价多少，用来验证分时规则真的生效了
+CREATE OR REPLACE VIEW v_order_period_stat AS
+SELECT d.period,
+       DATE(d.begin_time) AS stat_date,
+       COUNT(DISTINCT d.order_id) AS order_cnt,
+       SUM(d.kwh)         AS total_kwh,
+       SUM(d.energy_fee)  AS energy_fee,
+       SUM(d.service_fee) AS service_fee,
+       ROUND(SUM(d.energy_fee + d.service_fee) / NULLIF(SUM(d.kwh), 0), 4) AS avg_price
+FROM order_fee_detail d
+GROUP BY d.period, DATE(d.begin_time);
+
+-- ============================================================
+-- 业务线 5：结算对账（孙墨涵 / 05-develop）
+-- ============================================================
+
+-- 账单总览：带已开票金额和未处理差异笔数，结算专员一眼看完
+CREATE OR REPLACE VIEW v_settle_bill_detail AS
+SELECT b.bill_id,
+       b.operator_id,
+       b.station_id,
+       b.bill_month,
+       b.order_count,
+       b.total_kwh,
+       b.total_amount,
+       b.platform_fee,
+       b.payable_amount,
+       b.status,
+       COALESCE(inv.invoiced_amount, 0) AS invoiced_amount,
+       b.payable_amount - COALESCE(inv.invoiced_amount, 0) AS uninvoiced_amount,
+       COALESCE(df.diff_cnt, 0) AS open_diff_cnt
+FROM settlement_bill b
+LEFT JOIN (SELECT bill_id, SUM(amount) AS invoiced_amount
+           FROM invoice_record
+           GROUP BY bill_id) inv ON inv.bill_id = b.bill_id
+LEFT JOIN (SELECT bill_id, COUNT(*) AS diff_cnt
+           FROM reconcile_diff
+           WHERE resolved = 0
+           GROUP BY bill_id) df ON df.bill_id = b.bill_id;
+
+-- 月度订单池：按站按月汇总，生成结算单前先看这个数
+CREATE OR REPLACE VIEW v_settle_order_month AS
+SELECT DATE_FORMAT(o.start_time, '%Y-%m') AS bill_month,
+       o.station_id,
+       COUNT(*) AS order_cnt,
+       SUM(o.kwh)          AS total_kwh,
+       SUM(o.total_amount) AS total_amount,
+       SUM(o.paid_amount)  AS paid_amount,
+       SUM(o.total_amount - o.paid_amount) AS unpaid_amount
+FROM charge_order o
+WHERE o.status IN ('PAID', 'FINISHED')
+GROUP BY DATE_FORMAT(o.start_time, '%Y-%m'), o.station_id;
+
+-- 未处理差异：对账员的工作台
+CREATE OR REPLACE VIEW v_settle_diff_open AS
+SELECT d.diff_id,
+       d.bill_id,
+       b.bill_month,
+       b.operator_id,
+       d.order_id,
+       d.diff_type,
+       d.expect_amount,
+       d.actual_amount,
+       d.diff_amount,
+       d.remark,
+       d.created_at
+FROM reconcile_diff d
+JOIN settlement_bill b ON b.bill_id = d.bill_id
+WHERE d.resolved = 0;
