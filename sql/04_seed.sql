@@ -243,10 +243,10 @@ SET @skip_auto_status_log = NULL;
 -- ============================================================================
 -- 【业务线 2 & 业务线 5】订单计费与结算对账测试数据（负责人：成员 2 / 孙墨涵）
 -- ============================================================================
--- 前置：线1 的 station / charging_gun、线4 的 user_account / vehicle 已有数据
---       本脚本用 station_id 1~4、gun_id 1001~1020、user_id 9001~9020、vehicle_id 5001~5020
+-- 前置：线1 的 station / charging_gun / charging_pile 已有数据
+--       枪号和站号都从库里实时取，不写死；user_id 9001~9020、vehicle_id 5001~5020 是虚构值
 
--- 1) 电价规则：4 个站 × 5 个时段 = 20 条
+-- 1) 电价规则：全部场站 × 5 个时段（条数随 station 表行数变化，20 个站即 100 条）
 INSERT INTO pricing_rule
 (station_id, period, start_time, end_time, energy_price, service_price,
  free_minutes, min_charge, effective_from, effective_to, is_active)
@@ -288,7 +288,9 @@ CREATE PROCEDURE seed_calc()
 BEGIN
     DECLARE v_done INT DEFAULT 0;
     DECLARE v_oid BIGINT;
-    DECLARE cur CURSOR FOR SELECT order_id FROM charge_order WHERE end_time IS NOT NULL ORDER BY order_id;
+    -- 只算本脚本插入的种子订单，避免重跑时改动库里别人的历史订单
+    DECLARE cur CURSOR FOR SELECT order_id FROM charge_order
+        WHERE end_time IS NOT NULL AND order_no LIKE 'SEED2025%' ORDER BY order_id;
     DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = 1;
     OPEN cur;
     calc_loop: LOOP
