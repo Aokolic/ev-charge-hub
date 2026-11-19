@@ -6,8 +6,9 @@
     const state = {
         token: localStorage.getItem("ev_hub_token") || "",
         user: null,
+        authMode: localStorage.getItem("ev_hub_auth_mode") || "",
         rolesMap: {},
-        activePanel: "panel-driver",
+        activePanel: "panel-home",
         operatorsMode: "full",
         sessionInvoices: [],
         pages: {
@@ -34,20 +35,63 @@
         operatorCache: new Map(),
     };
 
+    const ROUTES = {
+        "#/home": {
+            panel: "panel-home",
+            title: "总览",
+            desc: "按角色查看充电网络的实时状态与业务入口",
+        },
+        "#/stations": {
+            panel: "panel-driver",
+            title: "找站与开单",
+            desc: "查询营业场站与充电枪可用状态，支持扫码启动充电",
+        },
+        "#/orders": {
+            panel: "panel-orders",
+            title: "订单与分时计费",
+            desc: "充电订单隔离查看、结束充电分时拆账与支付退款流水",
+        },
+        "#/ops": {
+            panel: "panel-ops",
+            title: "运维排障与巡检",
+            desc: "全网心跳离线巡检、故障枪/离线桩恢复与设备状态审计日志",
+        },
+        "#/assets": {
+            panel: "panel-admin",
+            title: "资产看板与建档",
+            desc: "全平台场站实时资产汇总、运营商档案与场站-桩-枪三级钻取建档",
+        },
+        "#/settle": {
+            panel: "panel-settle",
+            title: "结算对账与开票",
+            desc: "按月唯一结算单生成、未处理对账差异核销与发票开具/红冲",
+        },
+        "#/lab": {
+            panel: "panel-cross",
+            title: "权限与规则校验",
+            desc: "使用当前登录身份验证跨角色权限边界与业务防呆保护机制",
+        },
+    };
+
     const TAB_ACCESS = {
+        "panel-home": {
+            roles: ["driver", "fleet", "ops", "settlement", "admin"],
+            hint: "",
+            suggest: [],
+        },
         "panel-driver": {
             roles: ["driver", "fleet", "ops", "admin"],
-            hint: "找站与开单视图面向车主（driver）、车队（fleet）、运维与管理员；扫码开单限车主或车队角色。",
+            hint: "找站与开单面向车主、车队、运维与管理员；扫码开单仅限车主或车队角色。",
             suggest: ["driver", "fleet"],
         },
         "panel-orders": {
             roles: ["driver", "fleet", "ops", "settlement", "admin"],
-            hint: "全部角色均可查看订单列表（车主/车队自动按本人隔离，其余角色看全量）。",
+            hint: "全部角色均可查看订单列表（车主与车队仅看本人名下订单，其余角色可看全量）。",
             suggest: ["driver"],
         },
         "panel-ops": {
             roles: ["ops", "admin"],
-            hint: "运维排障、心跳巡检与设备状态日志仅限场站运维（ops）与平台管理员（admin）访问。",
+            hint: "运维排障、心跳巡检与设备状态日志仅限场站运维与平台管理员访问。",
             suggest: ["ops", "admin"],
         },
         "panel-admin": {
@@ -57,12 +101,12 @@
         },
         "panel-settle": {
             roles: ["settlement", "admin"],
-            hint: "月度结算单、对账差异核销与发票开具/红冲仅限结算专员（settlement）与管理员（admin）。",
+            hint: "月度结算单、对账差异核销与发票开具/红冲仅限结算专员与管理员。",
             suggest: ["settlement", "admin"],
         },
         "panel-cross": {
             roles: ["driver", "fleet", "ops", "settlement", "admin"],
-            hint: "支持使用任意角色 Token 实测越权拦截与数据库约束。",
+            hint: "支持切换任意身份实测权限边界与业务保护规则。",
             suggest: [],
         },
     };
@@ -74,6 +118,88 @@
         settlement: "结算专员",
         admin: "平台管理员",
     };
+
+    const ROLE_AVATAR = {
+        driver: "车",
+        fleet: "队",
+        ops: "维",
+        settlement: "结",
+        admin: "管",
+    };
+
+    const GUN_TYPE_LABELS = {
+        DC_FAST: "直流快充",
+        AC_SLOW: "交流慢充",
+    };
+
+    const DEVICE_TYPE_LABELS = {
+        PILE: "充电桩",
+        GUN: "充电枪",
+    };
+
+    const SOURCE_LABELS = {
+        MANUAL: "人工维护",
+        ORDER: "订单联动",
+        HEARTBEAT: "心跳巡检",
+        ALARM: "告警触发",
+    };
+
+    const DIFF_TYPE_LABELS = {
+        AMOUNT_MISMATCH: "金额不符",
+        MISSING_TXN: "流水缺失",
+        DUPLICATE_TXN: "重复流水",
+    };
+
+    const HOME_MODULES = [
+        {
+            href: "#/stations",
+            panel: "panel-driver",
+            icon: "i-bolt",
+            title: "找站与开单",
+            desc: "营业场站概览、快慢充空闲枪筛选与扫码开单",
+            roles: ["driver", "fleet", "ops", "admin"],
+        },
+        {
+            href: "#/orders",
+            panel: "panel-orders",
+            icon: "i-receipt",
+            title: "订单与分时计费",
+            desc: "充电中结束拆账、峰平谷统计与支付/退款流水",
+            roles: ["driver", "fleet", "ops", "settlement", "admin"],
+        },
+        {
+            href: "#/ops",
+            panel: "panel-ops",
+            icon: "i-wrench",
+            title: "运维排障与巡检",
+            desc: "全网心跳巡检、故障桩枪恢复与待办备注办结",
+            roles: ["ops", "admin"],
+        },
+        {
+            href: "#/assets",
+            panel: "panel-admin",
+            icon: "i-building",
+            title: "资产看板与建档",
+            desc: "场站实时资产汇总、运营商档案与桩枪三级建档",
+            roles: ["admin", "settlement", "ops"],
+        },
+        {
+            href: "#/settle",
+            panel: "panel-settle",
+            icon: "i-wallet",
+            title: "结算对账与开票",
+            desc: "按月结算单生成、对账差异核销与发票红冲",
+            roles: ["settlement", "admin"],
+        },
+        {
+            href: "#/lab",
+            panel: "panel-cross",
+            icon: "i-flask",
+            title: "权限与规则校验",
+            desc: "平台模块上线状态、角色隔离验证与业务防呆保护测试",
+            roles: ["driver", "fleet", "ops", "settlement", "admin"],
+        },
+    ];
 
     const $ = (id) => document.getElementById(id);
 
@@ -328,16 +454,19 @@
     // ------------------------------------------------------------------------
     // 网络请求与标准状态渲染
     // ------------------------------------------------------------------------
+    let sessionExpiring = false;
+
     async function apiFetch(url, options = {}) {
-        const headers = new Headers(options.headers || {});
+        const { skipAuthRedirect = false, ...fetchOptions } = options;
+        const headers = new Headers(fetchOptions.headers || {});
         if (state.token) {
             headers.set("Authorization", `Bearer ${state.token}`);
         }
-        if (options.body && !headers.has("Content-Type")) {
+        if (fetchOptions.body && !headers.has("Content-Type")) {
             headers.set("Content-Type", "application/json");
         }
         const started = performance.now();
-        const resp = await fetch(url, { ...options, headers });
+        const resp = await fetch(url, { ...fetchOptions, headers });
         const elapsedMs = Math.round(performance.now() - started);
         const text = await resp.text();
         let data = text;
@@ -351,6 +480,14 @@
                 typeof data === "object" && data !== null && data.detail
                     ? data.detail
                     : `请求失败 (${resp.status})`;
+            if (
+                resp.status === 401 &&
+                !skipAuthRedirect &&
+                !String(url).startsWith("/api/auth/") &&
+                (state.token || state.user)
+            ) {
+                handleSessionExpired(detail);
+            }
             const err = new Error(detail);
             err.status = resp.status;
             err.data = data;
@@ -362,30 +499,33 @@
 
     function statusBadge(st, customText = null) {
         const map = {
-            IDLE: ["IDLE 空闲", "badge-ok"],
-            OPEN: ["OPEN 营业中", "badge-ok"],
-            ACTIVE: ["ACTIVE 正常", "badge-ok"],
-            PASSED: ["PASSED 已验收", "badge-ok"],
-            DONE: ["DONE 已办结", "badge-ok"],
-            PAID: ["PAID 已支付", "badge-ok"],
-            ISSUED: ["ISSUED 已开具", "badge-ok"],
-            CONFIRMED: ["CONFIRMED 已确认", "badge-ok"],
-            INVOICED: ["INVOICED 已开票", "badge-info"],
-            OCCUPIED: ["OCCUPIED 占用", "badge-info"],
-            CHARGING: ["CHARGING 充电中", "badge-info"],
-            FINISHED: ["FINISHED 待支付", "badge-warn"],
-            PENDING: ["PENDING 待处理", "badge-warn"],
-            DRAFT: ["DRAFT 草稿", "badge-warn"],
-            MAINTENANCE: ["MAINTENANCE 维护", "badge-warn"],
-            SUSPENDED: ["SUSPENDED 暂停", "badge-warn"],
-            FAULT: ["FAULT 故障", "badge-danger"],
-            REJECTED: ["REJECTED 未通过", "badge-danger"],
-            RED_FLUSHED: ["RED_FLUSHED 已红冲", "badge-danger"],
-            REFUNDED: ["REFUNDED 已退款", "badge-warn"],
-            OFFLINE: ["OFFLINE 离线", "badge-muted"],
-            CLOSED: ["CLOSED 已关闭", "badge-muted"],
-            CANCELLED: ["CANCELLED 已取消", "badge-muted"],
-            NONE: ["NONE", "badge-muted"],
+            IDLE: ["空闲", "badge-ok"],
+            OPEN: ["营业中", "badge-ok"],
+            ACTIVE: ["正常", "badge-ok"],
+            PASSED: ["已验收", "badge-ok"],
+            DONE: ["已办结", "badge-ok"],
+            PAID: ["已支付", "badge-ok"],
+            ISSUED: ["已开具", "badge-ok"],
+            CONFIRMED: ["已确认", "badge-ok"],
+            INVOICED: ["已开票", "badge-info"],
+            OCCUPIED: ["占用", "badge-info"],
+            CHARGING: ["充电中", "badge-info"],
+            FINISHED: ["待支付", "badge-warn"],
+            PENDING: ["待处理", "badge-warn"],
+            DRAFT: ["草稿", "badge-warn"],
+            MAINTENANCE: ["维护中", "badge-warn"],
+            SUSPENDED: ["已暂停", "badge-warn"],
+            FAULT: ["故障", "badge-danger"],
+            REJECTED: ["未通过", "badge-danger"],
+            RED_FLUSHED: ["已红冲", "badge-danger"],
+            REFUNDED: ["已退款", "badge-warn"],
+            OFFLINE: ["离线", "badge-muted"],
+            CLOSED: ["已关闭", "badge-muted"],
+            CANCELLED: ["已取消", "badge-muted"],
+            NONE: ["无需处理", "badge-muted"],
+            PEAK: ["峰时", "badge-warn"],
+            FLAT: ["平时", "badge-info"],
+            VALLEY: ["谷时", "badge-ok"],
         };
         const [label, cls] = map[st] || [String(st || "-"), "badge-muted"];
         return `<span class="badge ${cls}">${escapeHtml(customText || label)}</span>`;
@@ -423,10 +563,10 @@
         try {
             const { data } = await apiFetch("/health/db");
             dot.className = "status-dot ok";
-            txt.textContent = `MySQL ${data.mysql_version} · ${data.database}`;
+            txt.textContent = `服务在线 · MySQL ${data.mysql_version}`;
         } catch (err) {
             dot.className = "status-dot err";
-            txt.textContent = `数据库不可用：${err.message}`;
+            txt.textContent = `服务异常：${err.message}`;
         }
     }
 
@@ -458,45 +598,213 @@
         actionsEl.innerHTML = cfg.suggest
             .map(
                 (r) =>
-                    `<button class="btn btn-outline btn-xs quick-role-btn" data-role="${escapeHtml(r)}" type="button">切换为 ${escapeHtml(ROLE_LABELS[r] || r)} (${escapeHtml(r)})</button>`
+                    `<button class="btn btn-outline btn-xs quick-role-btn" data-role="${escapeHtml(r)}" type="button">切换为 ${escapeHtml(ROLE_LABELS[r] || r)}</button>`
             )
             .join("");
         banner.hidden = false;
     }
 
+    function closeIdentityPopover() {
+        const pop = $("identityPopover");
+        if (!pop) return;
+        if (supportsPopover) {
+            try {
+                pop.hidePopover();
+            } catch {
+                // 已关闭时忽略状态异常
+            }
+        } else {
+            pop.classList.remove(":popover-open");
+        }
+    }
+
     function renderUserContext() {
         const chip = $("identityChipText");
+        const avatar = $("identityAvatar");
         const label = $("currentUserLabel");
+        const modeBadge = $("currentAuthModeBadge");
+        const accountMeta = $("currentAccountMeta");
         const desc = $("currentRoleDesc");
+        const popoverBtn = $("identityPopoverBtn");
+        const topbarLoginBtn = $("topbarLoginBtn");
+        const switchBtn = $("switchAccountBtn");
+        const logoutBtn = $("logoutBtn");
+        const devDetails = $("devContextDetails");
+        const currentRole = state.user?.role;
 
         document.querySelectorAll("#roleButtons .role-pill").forEach((btn) => {
             const active = Boolean(state.user && btn.dataset.role === state.user.role);
             btn.setAttribute("aria-pressed", active ? "true" : "false");
         });
 
+        document.querySelectorAll("#mainNav .nav-link[data-panel]").forEach((link) => {
+            const cfg = TAB_ACCESS[link.dataset.panel];
+            const allowed = !cfg || !currentRole || cfg.roles.includes(currentRole);
+            link.classList.toggle("is-locked", !allowed);
+        });
+
         if (!state.user) {
-            chip.textContent = "未认证";
-            label.textContent = "未认证";
-            desc.textContent = "请点击顶部任意角色按钮签发开发测试 Token。";
+            if (popoverBtn) popoverBtn.hidden = true;
+            if (topbarLoginBtn) topbarLoginBtn.hidden = false;
+            if (logoutBtn) logoutBtn.hidden = true;
+            if (devDetails) devDetails.hidden = true;
+            if (switchBtn) {
+                switchBtn.textContent = "去登录 / 注册";
+                switchBtn.className = "btn btn-primary btn-sm";
+            }
+            if (chip) chip.textContent = "未登录";
+            if (avatar) {
+                avatar.textContent = "?";
+                avatar.removeAttribute("data-role");
+            }
+            if (label) label.textContent = "未登录";
+            if (modeBadge) {
+                modeBadge.textContent = "未登录";
+                modeBadge.className = "badge badge-muted";
+            }
+            if (accountMeta) accountMeta.textContent = "";
+            if (desc) desc.textContent = "请先登录平台账号或选择演示角色进入工作台。";
             renderRoleNotice();
+            renderHomeOverview();
             return;
         }
 
-        const roleMeta = state.rolesMap[state.user.role];
-        const fleetNote = state.user.fleet_id ? ` · fleet=${state.user.fleet_id}` : "";
-        chip.textContent = `${state.user.role_label} · uid=${state.user.user_id}${fleetNote}`;
-        label.textContent = `${state.user.username}（${state.user.role_label} / ${state.user.role} · uid=${state.user.user_id}${fleetNote}）`;
-        desc.textContent = roleMeta ? roleMeta.description : "";
+        if (popoverBtn) popoverBtn.hidden = false;
+        if (topbarLoginBtn) topbarLoginBtn.hidden = true;
+        if (logoutBtn) logoutBtn.hidden = false;
+        if (devDetails) devDetails.hidden = false;
+        if (switchBtn) {
+            switchBtn.textContent = "切换 / 登录账号";
+            switchBtn.className = "btn btn-outline btn-sm";
+        }
 
-        // 同步联调参数输入框
+        const roleMeta = state.rolesMap[state.user.role];
+        const fleetNote = state.user.fleet_id ? ` · 车队 #${state.user.fleet_id}` : "";
+        const isDemo =
+            state.authMode === "demo" ||
+            (!state.authMode && String(state.user.username || "").startsWith("demo_"));
+
+        if (chip) {
+            chip.textContent = isDemo
+                ? `${state.user.role_label} · #${state.user.user_id}${fleetNote}`
+                : `${state.user.username} · ${state.user.role_label}`;
+        }
+        if (avatar) {
+            avatar.textContent = ROLE_AVATAR[state.user.role] || "用";
+            avatar.dataset.role = state.user.role;
+        }
+        if (label) label.textContent = state.user.role_label;
+        if (modeBadge) {
+            modeBadge.textContent = isDemo ? "演示身份" : "正式账号";
+            modeBadge.className = isDemo ? "badge badge-info" : "badge badge-ok";
+        }
+        if (accountMeta) {
+            const phoneNote = state.user.phone_masked ? ` · ${state.user.phone_masked}` : "";
+            accountMeta.textContent = `账号 ${state.user.username} · #${state.user.user_id}${fleetNote}${phoneNote}`;
+        }
+        if (desc) desc.textContent = roleMeta ? roleMeta.description : "";
+
+        // 同步账号参数输入框
         $("devUserId").value = state.user.user_id;
         if (state.user.fleet_id) {
             $("devFleetId").value = state.user.fleet_id;
         }
         renderRoleNotice();
+        renderHomeOverview();
     }
 
-    async function switchDevRole(role) {
+    function syncThemeToggles() {
+        const pressed = document.documentElement.dataset.theme === "dark" ? "true" : "false";
+        $("themeToggle")?.setAttribute("aria-pressed", pressed);
+        $("authThemeToggle")?.setAttribute("aria-pressed", pressed);
+    }
+
+    function toggleTheme() {
+        const cur = document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+        const next = cur === "dark" ? "light" : "dark";
+        document.documentElement.dataset.theme = next;
+        localStorage.setItem("ev_hub_theme", next);
+        syncThemeToggles();
+    }
+
+    function authModeFromHash(hash) {
+        if (hash === "#/register") return "register";
+        if (hash === "#/login") return "login";
+        return null;
+    }
+
+    function switchAuthMode(mode) {
+        const isLogin = mode !== "register";
+        $("loginForm").hidden = !isLogin;
+        $("registerForm").hidden = isLogin;
+        $("authQuickWrap").hidden = !isLogin;
+        $("authLoginSwitch").hidden = !isLogin;
+        $("authRegisterSwitch").hidden = isLogin;
+        $("authHeading").textContent = isLogin ? "欢迎回来" : "创建平台账号";
+        if (isLogin && state.token && state.user) {
+            $("authSubheading").textContent = `当前已登录 ${state.user.username}（${state.user.role_label}），可切换其他账号`;
+        } else {
+            $("authSubheading").textContent = isLogin
+                ? "登录您的 EV Charge Hub 账号"
+                : "注册成为普通车主或企业车队账号";
+        }
+        setInlineAlert($("authError"), "");
+    }
+
+    function showAuthView(mode = "login", { updateHash = true } = {}) {
+        const resolved = mode === "register" ? "register" : "login";
+        $("appShell").hidden = true;
+        $("authView").hidden = false;
+        switchAuthMode(resolved);
+        $("backToWorkspaceBtn").hidden = !Boolean(state.token && state.user);
+        syncThemeToggles();
+
+        if (updateHash) {
+            const targetHash = resolved === "register" ? "#/register" : "#/login";
+            if (location.hash !== targetHash) {
+                history.replaceState(null, "", targetHash);
+            }
+        }
+    }
+
+    function hideAuthView({ updateHash = true, fetchData = true } = {}) {
+        $("authView").hidden = true;
+        $("appShell").hidden = false;
+        syncThemeToggles();
+        activatePanel(state.activePanel || "panel-home", { updateHash, fetchData });
+    }
+
+    function handleSessionExpired(reason = "") {
+        if (sessionExpiring) return;
+        sessionExpiring = true;
+        state.token = "";
+        state.user = null;
+        state.authMode = "";
+        state.sessionInvoices = [];
+        localStorage.removeItem("ev_hub_token");
+        localStorage.removeItem("ev_hub_auth_mode");
+        closeIdentityPopover();
+        renderUserContext();
+        showAuthView("login", { updateHash: true });
+        setInlineAlert($("authError"), "登录状态已失效，请重新登录或选择演示角色进入。");
+        showToast(reason ? `登录已过期：${reason}` : "登录状态已失效，请重新登录", true);
+    }
+
+    function logoutUser() {
+        sessionExpiring = false;
+        state.token = "";
+        state.user = null;
+        state.authMode = "";
+        state.sessionInvoices = [];
+        localStorage.removeItem("ev_hub_token");
+        localStorage.removeItem("ev_hub_auth_mode");
+        closeIdentityPopover();
+        renderUserContext();
+        showAuthView("login", { updateHash: true });
+        showToast("已退出登录");
+    }
+
+    async function switchDevRole(role, { fetchData = true } = {}) {
         const userId = Math.max(1, Number($("devUserId").value || 9001));
         const fleetId = Math.max(1, Number($("devFleetId").value || 1));
         try {
@@ -509,30 +817,311 @@
                     fleet_id: role === "fleet" ? fleetId : null,
                 }),
             });
+            sessionExpiring = false;
             state.token = data.access_token;
             state.user = data.user;
+            state.authMode = "demo";
             localStorage.setItem("ev_hub_token", state.token);
+            localStorage.setItem("ev_hub_auth_mode", "demo");
             renderUserContext();
-            showToast(`已切换为 ${data.user.role_label}（uid=${data.user.user_id}）`);
-            refreshActivePanelData();
+            showToast(`已切换为 ${data.user.role_label}（#${data.user.user_id}）`);
+            if (fetchData) {
+                refreshActivePanelData();
+            }
+            return true;
         } catch (err) {
             showToast(err.message, true);
+            if ($("authView") && !$("authView").hidden) {
+                setInlineAlert($("authError"), `演示角色登录失败：${err.message}`);
+            }
+            return false;
         }
     }
 
-    async function restoreSessionOrDefault() {
-        if (state.token) {
-            try {
-                const { data } = await apiFetch("/api/auth/me");
-                state.user = data;
-                renderUserContext();
-                return;
-            } catch {
-                state.token = "";
-                localStorage.removeItem("ev_hub_token");
-            }
+    async function restoreSession() {
+        if (!state.token) return false;
+        try {
+            const { data } = await apiFetch("/api/auth/me");
+            sessionExpiring = false;
+            state.user = data;
+            const savedMode = localStorage.getItem("ev_hub_auth_mode");
+            state.authMode =
+                savedMode === "account" || savedMode === "demo"
+                    ? savedMode
+                    : String(data.username || "").startsWith("demo_")
+                    ? "demo"
+                    : "account";
+            renderUserContext();
+            return true;
+        } catch {
+            state.token = "";
+            state.user = null;
+            state.authMode = "";
+            localStorage.removeItem("ev_hub_token");
+            localStorage.removeItem("ev_hub_auth_mode");
+            return false;
         }
-        await switchDevRole("driver");
+    }
+
+    // ------------------------------------------------------------------------
+    // Page 0: 总览页与充电枪实时阵列
+    // ------------------------------------------------------------------------
+    function renderHomeOverview() {
+        const role = state.user?.role;
+        const greeting = $("homeGreeting");
+        const roleDesc = $("homeRoleDesc");
+        const ordersLabel = $("statOrdersLabel");
+        const quickActions = $("homeQuickActions");
+        const modulesBox = $("homeModules");
+
+        if (greeting) {
+            greeting.textContent = state.user
+                ? `${state.user.role_label}（账号 #${state.user.user_id}）`
+                : "未登录访客";
+        }
+        if (roleDesc) {
+            roleDesc.textContent = state.user
+                ? state.rolesMap[role]?.description || "当前身份权限已就绪，可通过下方模块卡片进入对应工作台。"
+                : "请在顶部选择角色身份，或点击右上角登录账号。";
+        }
+        if (ordersLabel) {
+            ordersLabel.textContent = role === "driver" || role === "fleet" ? "我的订单" : "平台订单";
+        }
+
+        if (quickActions) {
+            const actionMap = {
+                driver: [
+                    { href: "#/stations", label: "找站扫码开单", primary: true },
+                    { href: "#/orders", label: "查看我的订单", primary: false },
+                ],
+                fleet: [
+                    { href: "#/stations", label: "找站扫码开单", primary: true },
+                    { href: "#/orders", label: "查看车队订单", primary: false },
+                ],
+                ops: [
+                    { href: "#/ops", label: "运维排障与巡检", primary: true },
+                    { href: "#/assets", label: "桩枪三级钻取", primary: false },
+                ],
+                settlement: [
+                    { href: "#/settle", label: "月度结算与开票", primary: true },
+                    { href: "#/assets", label: "场站实时看板", primary: false },
+                ],
+                admin: [
+                    { href: "#/assets", label: "全平台资产看板", primary: true },
+                    { href: "#/ops", label: "运维巡检", primary: false },
+                    { href: "#/settle", label: "结算对账", primary: false },
+                ],
+            };
+            const list = actionMap[role] || [{ href: "#/lab", label: "进入权限校验", primary: true }];
+            quickActions.innerHTML = list
+                .map(
+                    (a) =>
+                        `<a class="btn btn-sm ${a.primary ? "btn-primary" : "btn-outline"}" href="${escapeHtml(a.href)}">${escapeHtml(a.label)}</a>`
+                )
+                .join("");
+        }
+
+        if (modulesBox) {
+            modulesBox.innerHTML = HOME_MODULES.map((m) => {
+                const allowed = !role || m.roles.includes(role);
+                const lockBadge = allowed
+                    ? ""
+                    : `<span class="module-lock"><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>当前身份受限</span>`;
+                const chipsHtml = m.roles
+                    .map(
+                        (r) =>
+                            `<span class="role-chip ${r === role ? "is-current" : ""}">${escapeHtml(ROLE_LABELS[r] || r)}</span>`
+                    )
+                    .join("");
+                return `
+                    <li>
+                        <a class="module-card ${allowed ? "" : "is-locked"}" href="${escapeHtml(m.href)}">
+                            <div class="module-head-row">
+                                <div class="module-title">
+                                    <svg class="icon" aria-hidden="true"><use href="#${escapeHtml(m.icon)}"/></svg>
+                                    <span>${escapeHtml(m.title)}</span>
+                                </div>
+                                ${lockBadge}
+                            </div>
+                            <p class="module-desc">${escapeHtml(m.desc)}</p>
+                            <div class="module-foot">
+                                <div class="module-roles">${chipsHtml}</div>
+                                <span class="module-enter">进入模块 →</span>
+                            </div>
+                        </a>
+                    </li>`;
+            }).join("");
+        }
+    }
+
+    async function loadHomeData() {
+        const matrixBox = $("gunMatrix");
+        const statStations = $("statStations");
+        const statGuns = $("statGuns");
+        const statOrders = $("statOrders");
+        const role = state.user?.role;
+
+        const updateLegend = (counts) => {
+            ["IDLE", "OCCUPIED", "FAULT", "OFFLINE"].forEach((st) => {
+                const el = document.querySelector(`#gunMatrixLegend [data-legend="${st}"]`);
+                if (el) el.textContent = String(counts[st] || 0);
+            });
+        };
+
+        // 1. 订单总数
+        if (state.user) {
+            apiFetch("/api/orders?page=1&page_size=1")
+                .then(({ data }) => {
+                    if (statOrders) statOrders.textContent = String(data?.total ?? 0);
+                })
+                .catch(() => {
+                    if (statOrders) statOrders.textContent = "—";
+                });
+        } else if (statOrders) {
+            statOrders.textContent = "—";
+        }
+
+        if (!matrixBox) return;
+        if (!state.user) {
+            if (statStations) statStations.textContent = "—";
+            if (statGuns) statGuns.textContent = "—";
+            updateLegend({ IDLE: 0, OCCUPIED: 0, FAULT: 0, OFFLINE: 0 });
+            matrixBox.innerHTML = '<div class="empty-hint">请先在顶栏切换任意角色，以加载充电枪实时阵列。</div>';
+            return;
+        }
+
+        const statusMap = {
+            IDLE: { cls: "s-idle", text: "空闲" },
+            OCCUPIED: { cls: "s-occupied", text: "充电中" },
+            FAULT: { cls: "s-fault", text: "故障" },
+            OFFLINE: { cls: "s-offline", text: "离线" },
+        };
+
+        try {
+            if (role === "settlement") {
+                // 结算专员无 /api/stations/overview 权限，改用 /api/stations/realtime-status 合成阵列
+                const { data } = await apiFetch("/api/stations/realtime-status?page=1&page_size=20");
+                const items = data?.items || [];
+                const totalGuns = items.reduce((acc, s) => acc + Number(s.total_guns || 0), 0);
+                if (statStations) statStations.textContent = String(data?.total ?? 0);
+                if (statGuns) statGuns.textContent = String(totalGuns);
+
+                const counts = { IDLE: 0, OCCUPIED: 0, FAULT: 0, OFFLINE: 0 };
+                const rowsHtml = items
+                    .filter((s) => Number(s.total_guns || 0) > 0)
+                    .map((s) => {
+                        const idleCnt = Number(s.idle_guns || 0);
+                        const occCnt = Number(s.occupied_guns || 0);
+                        const fltCnt = Number(s.fault_guns || 0);
+                        const offCnt = Number(s.offline_guns || 0);
+                        counts.IDLE += idleCnt;
+                        counts.OCCUPIED += occCnt;
+                        counts.FAULT += fltCnt;
+                        counts.OFFLINE += offCnt;
+
+                        const seqList = [
+                            ...Array(idleCnt).fill("IDLE"),
+                            ...Array(occCnt).fill("OCCUPIED"),
+                            ...Array(fltCnt).fill("FAULT"),
+                            ...Array(offCnt).fill("OFFLINE"),
+                        ];
+                        const cellsHtml = seqList
+                            .map((st, idx) => {
+                                const info = statusMap[st] || statusMap.OFFLINE;
+                                return `<span class="gun-cell ${info.cls}" title="${escapeHtml(s.station_name)} · #${idx + 1} · ${info.text}">${String(idx + 1).padStart(2, "0")}</span>`;
+                            })
+                            .join("");
+
+                        return `
+                            <div class="matrix-row">
+                                <div class="matrix-station" title="${escapeHtml(s.station_name)}">
+                                    ${escapeHtml(s.station_name)}
+                                    <small>${escapeHtml(s.station_code)}</small>
+                                </div>
+                                <div class="matrix-cells">${cellsHtml}</div>
+                                <div class="matrix-count"><b>${idleCnt}</b> / ${seqList.length} 闲</div>
+                            </div>`;
+                    })
+                    .join("");
+
+                updateLegend(counts);
+                matrixBox.innerHTML =
+                    rowsHtml || '<div class="empty-hint">当前暂无可展示的充电枪状态数据。</div>';
+                return;
+            }
+
+            const [stationsResp, gunsResp] = await Promise.all([
+                apiFetch("/api/stations/overview?page=1&page_size=20"),
+                apiFetch("/api/stations/guns/availability?page=1&page_size=100"),
+            ]);
+
+            const stationItems = stationsResp.data?.items || [];
+            const gunItems = gunsResp.data?.items || [];
+
+            if (statStations) statStations.textContent = String(stationsResp.data?.total ?? 0);
+            if (statGuns) statGuns.textContent = String(gunsResp.data?.total ?? 0);
+
+            const stationMap = new Map();
+            for (const s of stationItems) {
+                stationMap.set(s.station_id, {
+                    station_id: s.station_id,
+                    station_code: s.station_code,
+                    station_name: s.station_name,
+                    guns: [],
+                });
+            }
+            const counts = { IDLE: 0, OCCUPIED: 0, FAULT: 0, OFFLINE: 0 };
+            for (const g of gunItems) {
+                if (Object.hasOwn(counts, g.gun_status)) {
+                    counts[g.gun_status] += 1;
+                }
+                if (!stationMap.has(g.station_id)) {
+                    stationMap.set(g.station_id, {
+                        station_id: g.station_id,
+                        station_code: g.station_code,
+                        station_name: g.station_name,
+                        guns: [],
+                    });
+                }
+                stationMap.get(g.station_id).guns.push(g);
+            }
+
+            updateLegend(counts);
+
+            const rowsHtml = Array.from(stationMap.values())
+                .filter((st) => st.guns.length > 0)
+                .map((st) => {
+                    st.guns.sort((a, b) => (a.pile_id - b.pile_id) || (a.gun_seq - b.gun_seq) || (a.gun_id - b.gun_id));
+                    let idleCnt = 0;
+                    const cellsHtml = st.guns
+                        .map((g) => {
+                            if (g.gun_status === "IDLE") idleCnt += 1;
+                            const info = statusMap[g.gun_status] || statusMap.OFFLINE;
+                            const typeLabel = g.gun_type === "DC_FAST" ? "直流快充" : "交流慢充";
+                            const tip = `${g.gun_code} · ${typeLabel} ${g.max_power}kW · ${info.text}`;
+                            return `<span class="gun-cell ${info.cls}" data-gun-id="${escapeHtml(g.gun_id)}" data-station-id="${escapeHtml(g.station_id)}" data-station-name="${escapeHtml(st.station_name)}" data-gun-code="${escapeHtml(g.gun_code)}" data-gun-status="${escapeHtml(g.gun_status)}" title="${escapeHtml(tip)}">${escapeHtml(String(g.gun_seq).padStart(2, "0"))}</span>`;
+                        })
+                        .join("");
+
+                    return `
+                        <div class="matrix-row">
+                            <div class="matrix-station" title="${escapeHtml(st.station_name)}">
+                                ${escapeHtml(st.station_name)}
+                                <small>${escapeHtml(st.station_code)}</small>
+                            </div>
+                            <div class="matrix-cells">${cellsHtml}</div>
+                            <div class="matrix-count"><b>${idleCnt}</b> / ${st.guns.length} 闲</div>
+                        </div>`;
+                })
+                .join("");
+
+            matrixBox.innerHTML = rowsHtml || '<div class="empty-hint">暂无营业中的充电枪状态数据。</div>';
+        } catch (err) {
+            if (statStations) statStations.textContent = "—";
+            if (statGuns) statGuns.textContent = "—";
+            updateLegend({ IDLE: 0, OCCUPIED: 0, FAULT: 0, OFFLINE: 0 });
+            matrixBox.innerHTML = `<div class="empty-hint">加载充电枪阵列失败 (${escapeHtml(err.status || "-")})：${escapeHtml(err.message)}</div>`;
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -561,37 +1150,54 @@
                 .map((s) => {
                     const spacePct = pctRatio(s.available_spaces, s.total_spaces);
                     const gunPct = pctRatio(s.idle_gun_count, s.total_gun_count);
+                    const hasFast = Number(s.idle_fast_gun_count) > 0;
+                    const statusTag = hasFast
+                        ? `<span class="badge badge-ok">快充可用</span>`
+                        : `<span class="badge badge-muted">慢充为主</span>`;
                     return `
                         <article class="station-card">
                             <div class="station-card-head">
-                                <div>
+                                <div class="station-title-row">
                                     <h3>${escapeHtml(s.station_name)}</h3>
-                                    <p class="meta">${escapeHtml(s.station_code)} · ${escapeHtml(s.operator_name)}</p>
+                                    ${statusTag}
                                 </div>
-                                <span class="badge badge-ok">营业中</span>
+                                <p class="meta">${escapeHtml(s.station_code)} · ${escapeHtml(s.operator_name)}</p>
                             </div>
                             <div class="station-card-body">
-                                <p class="meta">${escapeHtml(s.address)}</p>
-                                <p class="meta">营业：${escapeHtml(s.business_hours)} ｜ 停车费：¥${escapeHtml(s.parking_fee_rate)}/h</p>
+                                <p class="station-addr">${escapeHtml(s.address)}</p>
+                                <div class="station-metrics">
+                                    <div class="station-metric">
+                                        <span>空闲快充</span>
+                                        <strong>${escapeHtml(s.idle_fast_gun_count)}</strong>
+                                    </div>
+                                    <div class="station-metric">
+                                        <span>空闲慢充</span>
+                                        <strong>${escapeHtml(s.idle_slow_gun_count)}</strong>
+                                    </div>
+                                    <div class="station-metric">
+                                        <span>车位余量</span>
+                                        <strong>${escapeHtml(s.available_spaces)} / ${escapeHtml(s.total_spaces)}</strong>
+                                    </div>
+                                </div>
                                 <div class="station-meters">
                                     <div class="meter-row">
                                         <div class="meter-label">
-                                            <span>空闲车位</span>
-                                            <strong>${escapeHtml(s.available_spaces)} / ${escapeHtml(s.total_spaces)}</strong>
-                                        </div>
-                                        <div class="meter-track"><div class="meter-fill meter-blue" style="--pct:${spacePct}%"></div></div>
-                                    </div>
-                                    <div class="meter-row">
-                                        <div class="meter-label">
-                                            <span>空闲充电枪（快 ${escapeHtml(s.idle_fast_gun_count)} / 慢 ${escapeHtml(s.idle_slow_gun_count)}）</span>
+                                            <span>空闲充电枪</span>
                                             <strong>${escapeHtml(s.idle_gun_count)} / ${escapeHtml(s.total_gun_count)}</strong>
                                         </div>
                                         <div class="meter-track"><div class="meter-fill" style="--pct:${gunPct}%"></div></div>
                                     </div>
+                                    <div class="meter-row">
+                                        <div class="meter-label">
+                                            <span>活跃充电桩</span>
+                                            <strong>${escapeHtml(s.active_pile_count)} 台</strong>
+                                        </div>
+                                        <div class="meter-track"><div class="meter-fill meter-blue" style="--pct:${spacePct}%"></div></div>
+                                    </div>
                                 </div>
                             </div>
                             <div class="station-card-foot">
-                                <span class="meta">活跃桩 ${escapeHtml(s.active_pile_count)} 台</span>
+                                <span class="meta">停车 ¥${escapeHtml(s.parking_fee_rate)}/h · ${escapeHtml(s.business_hours)}</span>
                                 <button class="btn btn-outline btn-xs view-station-guns" data-station-id="${escapeHtml(s.station_id)}" type="button">查看可用枪</button>
                             </div>
                         </article>`;
@@ -639,7 +1245,7 @@
                             <td data-label="枪编号"><code>${escapeHtml(g.gun_code)}</code></td>
                             <td data-label="所属场站">#${escapeHtml(g.station_id)} ${escapeHtml(g.station_name)}</td>
                             <td data-label="所属桩 / 额定功率"><code>${escapeHtml(g.pile_code)}</code> (${escapeHtml(g.rated_power)}kW)</td>
-                            <td data-label="枪型">${escapeHtml(g.gun_type)}</td>
+                            <td data-label="枪型">${escapeHtml(GUN_TYPE_LABELS[g.gun_type] || g.gun_type)}</td>
                             <td data-label="接口标准">${escapeHtml(g.connector_standard)}</td>
                             <td data-label="最大功率 (kW)" class="num">${escapeHtml(g.max_power)}</td>
                             <td data-label="当前状态">${statusBadge(g.gun_status)}</td>
@@ -651,7 +1257,7 @@
                                     data-gun-id="${escapeHtml(g.gun_id)}"
                                     data-gun-code="${escapeHtml(g.gun_code)}"
                                     type="button"
-                                    ${canOrder ? "" : 'title="仅 driver / fleet 角色可执行扫码开单"'}
+                                    ${canOrder ? "" : 'title="仅车主或车队角色可执行扫码开单"'}
                                 >${orderBtnLabel}</button>
                             </td>
                         </tr>`;
@@ -674,7 +1280,7 @@
         $("soStartSoc").value = "25";
         const targetSummary = gunCode
             ? `场站 #${stationId} ${stationName} · 充电枪 #${gunId}（${gunCode}）`
-            : `手动指定场站 #${stationId} · 充电枪 #${gunId}（同枪若已有 CHARGING 订单将触发 1062 -> HTTP 409）`;
+            : `手动指定场站 #${stationId} · 充电枪 #${gunId}（正在充电中的枪不可重复开单）`;
         $("startOrderTargetInfo").textContent = targetSummary;
         dlg.showModal();
     }
@@ -689,9 +1295,9 @@
         const scopeDesc = $("orderScopeDesc");
         if (state.user) {
             const isPersonal = state.user.role === "driver" || state.user.role === "fleet";
-            scopeDesc.innerHTML = isPersonal
-                ? `数据源：视图 <code>v_order_owner</code> · 当前仅显示 <code>uid=${escapeHtml(state.user.user_id)}</code> 的本人订单`
-                : `数据源：视图 <code>v_order_owner</code> · 当前角色可查看全平台全部订单`;
+            scopeDesc.textContent = isPersonal
+                ? `当前仅展示账号 #${state.user.user_id} 本人名下的充电订单与计费状态`
+                : "当前展示全平台充电订单与实时计费状态";
         }
 
         const qs = new URLSearchParams({
@@ -702,7 +1308,7 @@
         try {
             const { data } = await apiFetch(`/api/orders?${qs.toString()}`);
             if (!data.items.length) {
-                tbody.innerHTML = '<tr><td colspan="10"><div class="empty-hint">当前视角下暂无充电订单（可在“找站与开单”扫码开单，或将联调 user_id 设为 9001 查看种子订单）。</div></td></tr>';
+                tbody.innerHTML = '<tr><td colspan="10"><div class="empty-hint">当前视角下暂无充电订单（可在“找站与开单”扫码启动充电，或在右上角将用户编号切为 9001 查看示例订单）。</div></td></tr>';
                 pager.innerHTML = "";
                 return;
             }
@@ -724,7 +1330,7 @@
                             <td data-label="电量 (kWh)" class="num">${escapeHtml(o.kwh)}</td>
                             <td data-label="应付 (¥)" class="num"><strong>¥${escapeHtml(o.total_amount)}</strong></td>
                             <td data-label="已付 / 待付 (¥)" class="num">¥${escapeHtml(o.paid_amount)} / <span class="${Number(o.unpaid_amount) > 0 ? "badge badge-warn" : "meta"}">¥${escapeHtml(o.unpaid_amount)}</span></td>
-                            <td data-label="状态">${statusBadge(o.status, o.status_text || o.status)}</td>
+                            <td data-label="状态">${statusBadge(o.status)}</td>
                             <td data-label="操作" class="actions-cell">
                                 <div class="row-actions">
                                     <button class="btn btn-outline btn-xs view-order-detail-btn" data-order-id="${escapeHtml(o.order_id)}" type="button">分时明细</button>
@@ -781,7 +1387,7 @@
                                     .map(
                                         (d) => `
                                         <tr>
-                                            <td data-label="时段">${statusBadge(d.period, d.period)}</td>
+                                            <td data-label="时段">${statusBadge(d.period)}</td>
                                             <td data-label="起始时间">${escapeHtml(formatTime(d.begin_time))}</td>
                                             <td data-label="结束时间">${escapeHtml(formatTime(d.end_time))}</td>
                                             <td data-label="电量 (kWh)" class="num">${escapeHtml(d.kwh)}</td>
@@ -795,7 +1401,7 @@
                             </tbody>
                         </table>
                     </div>`
-                : '<div class="empty-hint">该订单暂无分时费用明细（充电结束后由存储过程 sp_order_calc 生成）。</div>';
+                : '<div class="empty-hint">该订单暂无分时费用明细（充电结束后自动按峰平谷时段生成）。</div>';
 
             $("detailDialogBody").innerHTML = `
                 <div class="detail-kv-grid">
@@ -846,7 +1452,7 @@
                                 (r) => `
                                 <tr>
                                     <td data-label="统计日期">${escapeHtml(r.stat_date)}</td>
-                                    <td data-label="时段">${escapeHtml(r.period)}</td>
+                                    <td data-label="时段">${statusBadge(r.period)}</td>
                                     <td data-label="订单数" class="num">${escapeHtml(r.order_cnt)}</td>
                                     <td data-label="总电量 (kWh)" class="num">${escapeHtml(r.total_kwh)}</td>
                                     <td data-label="电费 (¥)" class="num">¥${escapeHtml(r.energy_fee)}</td>
@@ -860,7 +1466,9 @@
             `;
         } catch (err) {
             if (err.status === 500) {
-                box.innerHTML = `<div class="empty-hint">后端 <code>GET /api/orders/stats/period</code> 返回 HTTP 500（已知线 2 <code>PeriodStatOut.stat_date</code> 类型定义与数据库 <code>DATE</code> 列待对齐），已安全隔离不影响其他功能。</div>`;
+                box.innerHTML = '<div class="empty-hint">分时统计服务暂不可用，请稍后重试。</div>';
+            } else if (err.status === 403) {
+                box.innerHTML = '<div class="empty-hint">请切换至“运维”或“管理员”身份后查询分时电价统计。</div>';
             } else {
                 box.innerHTML = `<div class="empty-hint">查询失败 (${escapeHtml(err.status || "-")})：${escapeHtml(err.message)}</div>`;
             }
@@ -951,9 +1559,9 @@
                     <tr>
                         <td data-label="日志 ID">${escapeHtml(l.log_id)}</td>
                         <td data-label="场站">#${escapeHtml(l.station_id)} ${escapeHtml(l.station_name)}</td>
-                        <td data-label="设备">${escapeHtml(l.device_type)} · <code>${escapeHtml(l.gun_code || l.pile_code)}</code></td>
-                        <td data-label="状态变迁">${escapeHtml(l.prev_status || "NULL")} → ${statusBadge(l.new_status)}</td>
-                        <td data-label="来源">${escapeHtml(l.change_source)}</td>
+                        <td data-label="设备">${escapeHtml(DEVICE_TYPE_LABELS[l.device_type] || l.device_type)} · <code>${escapeHtml(l.gun_code || l.pile_code)}</code></td>
+                        <td data-label="状态变迁">${l.prev_status ? statusBadge(l.prev_status) : '<span class="meta">初始</span>'} → ${statusBadge(l.new_status)}</td>
+                        <td data-label="来源">${escapeHtml(SOURCE_LABELS[l.change_source] || l.change_source)}</td>
                         <td data-label="待办">${statusBadge(l.todo_status)}</td>
                         <td data-label="备注说明">${escapeHtml(l.remark || "-")}</td>
                         <td data-label="变更时间">${escapeHtml(formatTime(l.changed_at))}</td>
@@ -1228,7 +1836,7 @@
                                     <td data-label="枪 ID">${escapeHtml(g.gun_id)}</td>
                                     <td data-label="编码"><code>${escapeHtml(g.gun_code)}</code></td>
                                     <td data-label="序号">${escapeHtml(g.gun_seq)}</td>
-                                    <td data-label="枪型">${escapeHtml(g.gun_type)}</td>
+                                    <td data-label="枪型">${escapeHtml(GUN_TYPE_LABELS[g.gun_type] || g.gun_type)}</td>
                                     <td data-label="标准">${escapeHtml(g.connector_standard)}</td>
                                     <td data-label="最大功率" class="num">${escapeHtml(g.max_power)}kW</td>
                                     <td data-label="状态">${statusBadge(g.current_status)}</td>
@@ -1329,7 +1937,7 @@
                         <td data-label="差异 ID">${escapeHtml(d.diff_id)}</td>
                         <td data-label="账单 / 账期">账单#${escapeHtml(d.bill_id)} (${escapeHtml(d.bill_month)})</td>
                         <td data-label="关联订单">${d.order_id ? `订单#${escapeHtml(d.order_id)}` : "-"}</td>
-                        <td data-label="类型"><code>${escapeHtml(d.diff_type)}</code></td>
+                        <td data-label="类型">${escapeHtml(DIFF_TYPE_LABELS[d.diff_type] || d.diff_type)}</td>
                         <td data-label="差额 (¥)" class="num"><strong>¥${escapeHtml(d.diff_amount)}</strong><br><span class="meta">应${escapeHtml(d.expect_amount)} / 实${escapeHtml(d.actual_amount)}</span></td>
                         <td data-label="说明">${escapeHtml(d.remark || "-")}</td>
                         <td data-label="操作" class="actions-cell">
@@ -1406,6 +2014,7 @@
             const res = await apiFetch(url, {
                 method,
                 body: body ? JSON.stringify(body) : undefined,
+                skipAuthRedirect: true,
             });
             logConsole(method, url, res.status, res.data, res.elapsedMs);
             showToast(`${method} ${url} -> HTTP ${res.status}`);
@@ -1473,23 +2082,42 @@
     }
 
     // ------------------------------------------------------------------------
-    // Tab 切换与面板数据调度
+    // Hash 路由与面板数据调度
     // ------------------------------------------------------------------------
-    function activatePanel(panelId, shouldFocusTab = false) {
-        state.activePanel = panelId;
-        document.querySelectorAll('#mainTabs [role="tab"]').forEach((tab) => {
-            const selected = tab.dataset.panel === panelId;
-            tab.setAttribute("aria-selected", selected ? "true" : "false");
-            tab.tabIndex = selected ? 0 : -1;
-            if (selected) {
-                tab.scrollIntoView({ block: "nearest", inline: "nearest", container: "nearest" });
-                if (shouldFocusTab) tab.focus();
+    function panelFromHash(hash) {
+        if (hash && Object.hasOwn(ROUTES, hash)) {
+            return ROUTES[hash].panel;
+        }
+        return "panel-home";
+    }
+
+    function hashFromPanel(panelId) {
+        for (const [hash, cfg] of Object.entries(ROUTES)) {
+            if (cfg.panel === panelId) return hash;
+        }
+        return "#/home";
+    }
+
+    function activatePanel(panelId, { updateHash = true, fetchData = true } = {}) {
+        const targetHash = hashFromPanel(panelId);
+        const routeCfg = ROUTES[targetHash] || ROUTES["#/home"];
+        const resolvedPanel = routeCfg.panel;
+
+        state.activePanel = resolvedPanel;
+
+        if ($("pageTitle")) $("pageTitle").textContent = routeCfg.title;
+        if ($("pageDesc")) $("pageDesc").textContent = routeCfg.desc;
+
+        document.querySelectorAll("#mainNav .nav-link[data-panel]").forEach((link) => {
+            if (link.dataset.panel === resolvedPanel) {
+                link.setAttribute("aria-current", "page");
+            } else {
+                link.removeAttribute("aria-current");
             }
         });
 
-        document.querySelectorAll('[role="tabpanel"]').forEach((panel) => {
-            const isTarget = panel.id === panelId;
-            if (isTarget) {
+        document.querySelectorAll(".tabpanel").forEach((panel) => {
+            if (panel.id === resolvedPanel) {
                 panel.removeAttribute("hidden");
                 panel.tabIndex = 0;
             } else {
@@ -1498,17 +2126,35 @@
             }
         });
 
+        if (updateHash && location.hash !== targetHash) {
+            history.replaceState(null, "", targetHash);
+        }
+
         renderRoleNotice();
-        refreshActivePanelData();
+        if (fetchData) refreshActivePanelData();
+    }
+
+    function renderTableEmptyRow(tbody, colspan, message) {
+        if (!tbody) return;
+        tbody.innerHTML = `<tr><td colspan="${colspan}"><div class="empty-hint">${escapeHtml(message)}</div></td></tr>`;
     }
 
     function refreshActivePanelData() {
         const role = state.user?.role;
         const p = state.activePanel;
-        if (p === "panel-driver") {
+        if (p === "panel-home") {
+            renderHomeOverview();
+            loadHomeData();
+        } else if (p === "panel-driver") {
             if (!role || TAB_ACCESS[p].roles.includes(role)) {
                 loadDriverStations();
                 loadDriverGuns();
+            } else {
+                const msg = "当前身份无权访问车主找站视图，请顶部切换为 车主 / 车队 / 运维 / 管理员";
+                $("driverStationGrid").innerHTML = `<div class="empty-hint">${msg}</div>`;
+                $("driverStationPager").innerHTML = "";
+                renderTableEmptyRow($("driverGunsBody"), 9, msg);
+                $("driverGunsPager").innerHTML = "";
             }
         } else if (p === "panel-orders") {
             loadOrders();
@@ -1516,18 +2162,43 @@
             if (!role || TAB_ACCESS[p].roles.includes(role)) {
                 loadFaults();
                 loadStatusLogs();
+            } else {
+                const msg = "当前身份无权查看运维排障数据，请切换为 场站运维 (ops) 或 平台管理员 (admin)";
+                renderTableEmptyRow($("faultsBody"), 8, msg);
+                $("faultsPager").innerHTML = "";
+                renderTableEmptyRow($("statusLogsBody"), 9, msg);
+                $("logsPager").innerHTML = "";
             }
         } else if (p === "panel-admin") {
             if (role === "admin" || role === "settlement") {
                 loadRealtimeBoard();
                 loadOperators(role === "settlement");
-            } else if (role === "ops") {
+            } else {
+                const msg = "实时资产看板与运营商档案限 平台管理员 (admin) 或 结算专员 (settlement) 查看";
+                $("realtimeKpis").innerHTML = "";
+                $("realtimePager").innerHTML = "";
+                renderTableEmptyRow($("realtimeBody"), 8, msg);
+                renderTableEmptyRow($("operatorsBody"), 7, msg);
+            }
+            if (role === "ops") {
                 drillPiles(Number($("drillStationId").value || 1));
+            } else if (role !== "admin") {
+                const box = $("drillResultBox");
+                if (box) {
+                    box.className = "empty-hint";
+                    box.textContent = "桩 / 枪明细钻取限 场站运维 (ops) 或 平台管理员 (admin) 使用。";
+                }
             }
         } else if (p === "panel-settle") {
             if (!role || TAB_ACCESS[p].roles.includes(role)) {
                 loadBills();
                 loadDiffs();
+            } else {
+                const msg = "月度结算单与对账差异限 结算专员 (settlement) 或 平台管理员 (admin) 查看";
+                renderTableEmptyRow($("billsBody"), 12, msg);
+                $("billsPager").innerHTML = "";
+                renderTableEmptyRow($("diffsBody"), 7, msg);
+                $("diffsPager").innerHTML = "";
             }
         }
     }
@@ -1538,21 +2209,53 @@
     function bindEvents() {
         setupDialogs();
 
-        // Scroll-state 不支持时的顶部指挥栏滚动收起降级
-        if (!CSS.supports("container-type", "scroll-state")) {
-            const bar = document.querySelector(".topbar");
-            let lastY = window.scrollY;
-            window.addEventListener(
-                "scroll",
-                () => {
-                    const y = Math.max(0, Math.min(window.scrollY, document.documentElement.scrollHeight - window.innerHeight));
-                    if (y === lastY) return;
-                    bar?.classList.toggle("is-hidden", y > lastY && y > bar.offsetHeight);
-                    lastY = y;
-                },
-                { passive: true }
-            );
-        }
+        // 主题切换（浅色 / 深色，顶栏与登录页双向同步）
+        $("themeToggle")?.addEventListener("click", toggleTheme);
+        $("authThemeToggle")?.addEventListener("click", toggleTheme);
+
+        // 侧边导航与 Hash 路由同步
+        $("mainNav")?.addEventListener("click", (e) => {
+            const link = e.target.closest(".nav-link[data-panel]");
+            if (!link) return;
+            e.preventDefault();
+            activatePanel(link.dataset.panel);
+        });
+        window.addEventListener("hashchange", () => {
+            const authMode = authModeFromHash(location.hash);
+            if (authMode) {
+                showAuthView(authMode, { updateHash: false });
+                return;
+            }
+            const nextPanel = panelFromHash(location.hash);
+            if (!state.user) {
+                state.activePanel = nextPanel;
+                showAuthView("login", { updateHash: true });
+                return;
+            }
+            if ($("authView") && !$("authView").hidden) {
+                $("authView").hidden = true;
+                $("appShell").hidden = false;
+            }
+            activatePanel(nextPanel, { updateHash: false });
+        });
+
+        // 总览页充电枪阵列点击交互
+        $("gunMatrix")?.addEventListener("click", (e) => {
+            const cell = e.target.closest(".gun-cell[data-gun-id]");
+            if (!cell) return;
+            const canOrder = state.user && (state.user.role === "driver" || state.user.role === "fleet");
+            if (cell.dataset.gunStatus === "IDLE" && canOrder) {
+                openStartOrderModal({
+                    stationId: cell.dataset.stationId,
+                    gunId: cell.dataset.gunId,
+                    stationName: cell.dataset.stationName,
+                    gunCode: cell.dataset.gunCode,
+                });
+            } else {
+                $("gunStationFilter").value = cell.dataset.stationId || "";
+                activatePanel("panel-driver");
+            }
+        });
 
         // 角色切换（顶部 + 引导条）
         $("roleButtons").addEventListener("click", (e) => {
@@ -1574,30 +2277,63 @@
             e.preventDefault();
             const currentRole = state.user?.role || "driver";
             await switchDevRole(currentRole);
-            if (supportsPopover) {
-                $("identityPopover").hidePopover();
-            } else {
-                $("identityPopover").classList.remove(":popover-open");
-            }
+            closeIdentityPopover();
+        });
+        $("topbarLoginBtn").addEventListener("click", () => {
+            showAuthView("login", { updateHash: true });
+        });
+        $("switchAccountBtn").addEventListener("click", () => {
+            closeIdentityPopover();
+            showAuthView("login", { updateHash: true });
+        });
+        $("logoutBtn").addEventListener("click", () => {
+            closeIdentityPopover();
+            logoutUser();
         });
 
-        // 登录 / 注册 Modal
-        $("openAuthDialogBtn").addEventListener("click", () => {
-            setInlineAlert($("authDialogError"), "");
-            $("authDialog").showModal();
+        // 独立全屏登录 / 注册页（login-04）交互
+        $("goRegisterBtn").addEventListener("click", () => {
+            showAuthView("register", { updateHash: true });
+            $("regUsername")?.focus();
         });
-        const switchAuthMode = (mode) => {
-            const isLogin = mode === "login";
-            $("loginForm").hidden = !isLogin;
-            $("registerForm").hidden = isLogin;
-            $("modeLoginBtn").className = `btn btn-xs ${isLogin ? "btn-primary" : "btn-outline"}`;
-            $("modeRegisterBtn").className = `btn btn-xs ${isLogin ? "btn-outline" : "btn-primary"}`;
-            $("modeLoginBtn").setAttribute("aria-pressed", isLogin ? "true" : "false");
-            $("modeRegisterBtn").setAttribute("aria-pressed", isLogin ? "false" : "true");
-            setInlineAlert($("authDialogError"), "");
-        };
-        $("modeLoginBtn").addEventListener("click", () => switchAuthMode("login"));
-        $("modeRegisterBtn").addEventListener("click", () => switchAuthMode("register"));
+        $("goLoginBtn").addEventListener("click", () => {
+            showAuthView("login", { updateHash: true });
+            $("loginUsername")?.focus();
+        });
+        $("backToWorkspaceBtn").addEventListener("click", () => {
+            hideAuthView({ updateHash: true, fetchData: false });
+        });
+
+        document.querySelectorAll(".auth-role-btn[data-quick-role]").forEach((btn) => {
+            btn.addEventListener("click", async () => {
+                const role = btn.dataset.quickRole;
+                if (!role) return;
+                setInlineAlert($("authError"), "");
+                btn.disabled = true;
+                try {
+                    const ok = await switchDevRole(role, { fetchData: false });
+                    if (ok) {
+                        hideAuthView({ updateHash: true, fetchData: true });
+                    }
+                } finally {
+                    btn.disabled = false;
+                }
+            });
+        });
+
+        // 多标签页清空登录凭证时同步退回登录页
+        window.addEventListener("storage", (e) => {
+            if (e.key !== "ev_hub_token") return;
+            if (!e.newValue && (state.token || state.user)) {
+                state.token = "";
+                state.user = null;
+                state.authMode = "";
+                state.sessionInvoices = [];
+                closeIdentityPopover();
+                renderUserContext();
+                showAuthView("login", { updateHash: true });
+            }
+        });
 
         const setupPwdToggle = (btnId, inputId, labelShow, labelHide) => {
             $(btnId).addEventListener("click", () => {
@@ -1624,7 +2360,7 @@
             e.preventDefault();
             const submitBtn = $("loginSubmitBtn");
             submitBtn.disabled = true;
-            setInlineAlert($("authDialogError"), "");
+            setInlineAlert($("authError"), "");
             try {
                 const { data } = await apiFetch("/api/auth/login", {
                     method: "POST",
@@ -1633,19 +2369,22 @@
                         password: $("loginPassword").value,
                     }),
                 });
+                sessionExpiring = false;
                 state.token = data.access_token;
                 state.user = data.user;
+                state.authMode = "account";
                 localStorage.setItem("ev_hub_token", state.token);
+                localStorage.setItem("ev_hub_auth_mode", "account");
+                $("loginPassword").value = "";
                 renderUserContext();
-                $("authDialog").close();
+                hideAuthView({ updateHash: true, fetchData: true });
                 showToast(`登录成功：${data.user.username}`);
-                refreshActivePanelData();
             } catch (err) {
                 const msg =
                     err.status === 500
-                        ? `登录失败 (HTTP 500)：当前数据库尚未合并业务线 4 的 user_account 表，请先关闭弹窗并使用顶栏快捷签发角色 Token。`
+                        ? "账号登录服务暂未开通，可点击下方演示角色快速体验对应工作台。"
                         : `登录失败 (${err.status || "-"})：${err.message}`;
-                setInlineAlert($("authDialogError"), msg);
+                setInlineAlert($("authError"), msg);
             } finally {
                 submitBtn.disabled = false;
             }
@@ -1655,7 +2394,7 @@
             e.preventDefault();
             const submitBtn = $("registerSubmitBtn");
             submitBtn.disabled = true;
-            setInlineAlert($("authDialogError"), "");
+            setInlineAlert($("authError"), "");
             try {
                 const role = $("regRole").value;
                 const payload = {
@@ -1669,42 +2408,24 @@
                     method: "POST",
                     body: JSON.stringify(payload),
                 });
-                switchAuthMode("login");
+                $("regPassword").value = "";
+                showAuthView("login", { updateHash: true });
                 $("loginUsername").value = data.username;
-                setInlineAlert($("authDialogError"), "");
-                $("authDialog").close();
+                $("loginPassword")?.focus();
                 showToast(`账号 ${data.username} 注册成功，请登录`);
             } catch (err) {
                 const msg =
                     err.status === 500
-                        ? `注册失败 (HTTP 500)：需业务线 4（user_account）合入建表后可用。`
+                        ? "自助注册服务暂未开通，可点击下方演示角色快速体验对应工作台。"
                         : `注册失败 (${err.status || "-"})：${err.message}`;
-                setInlineAlert($("authDialogError"), msg);
+                setInlineAlert($("authError"), msg);
             } finally {
                 submitBtn.disabled = false;
             }
         });
 
-        // Tabs 鼠标与键盘导航（selection by activation）
-        const tabs = Array.from(document.querySelectorAll('#mainTabs [role="tab"]'));
-        $("mainTabs").addEventListener("click", (e) => {
-            const btn = e.target.closest('[role="tab"]');
-            if (btn) activatePanel(btn.dataset.panel);
-        });
-        $("mainTabs").addEventListener("keydown", (e) => {
-            const currentIdx = tabs.indexOf(document.activeElement);
-            if (currentIdx === -1) return;
-            let nextIdx = null;
-            if (e.key === "ArrowRight") nextIdx = (currentIdx + 1) % tabs.length;
-            else if (e.key === "ArrowLeft") nextIdx = (currentIdx - 1 + tabs.length) % tabs.length;
-            else if (e.key === "Home") nextIdx = 0;
-            else if (e.key === "End") nextIdx = tabs.length - 1;
-            if (nextIdx !== null) {
-                e.preventDefault();
-                tabs[nextIdx].focus();
-            }
-        });
-        document.querySelectorAll('[role="tabpanel"]').forEach((panel) => {
+        // hidden="until-found" 页内查找自动展开对应面板
+        document.querySelectorAll(".tabpanel").forEach((panel) => {
             panel.addEventListener("beforematch", () => {
                 activatePanel(panel.id);
             });
@@ -1769,6 +2490,7 @@
                 });
                 $("startOrderDialog").close();
                 showToast(`开单成功：${data.order_no}（订单 #${data.order_id}）`);
+                if (state.activePanel === "panel-home") loadHomeData();
                 if (state.activePanel === "panel-driver") loadDriverGuns();
                 if (state.activePanel === "panel-orders") loadOrders(1);
             } catch (err) {
@@ -1798,7 +2520,7 @@
             } else if (finishBtn) {
                 setInlineAlert($("finishOrderError"), "");
                 $("foOrderId").value = finishBtn.dataset.orderId;
-                $("finishOrderInfo").textContent = `正在结束订单 #${finishBtn.dataset.orderId}（${finishBtn.dataset.orderNo}），提交后调用 sp_order_calc 按峰平谷拆账。`;
+                $("finishOrderInfo").textContent = `正在结束订单 #${finishBtn.dataset.orderId}（${finishBtn.dataset.orderNo}），提交后将自动按峰、平、谷时段核算电费与服务费。`;
                 $("finishOrderDialog").showModal();
             } else if (payBtn) {
                 setInlineAlert($("payOrderError"), "");
@@ -1911,7 +2633,7 @@
                             remark: "运维调度台快速恢复充电桩为空闲",
                         }),
                     });
-                    showToast(`充电桩 #${pid} 已恢复 IDLE`);
+                    showToast(`充电桩 #${pid} 已恢复空闲`);
                     loadFaults();
                     loadStatusLogs(1);
                 } else if (gunBtn) {
@@ -1925,7 +2647,7 @@
                             remark: "运维调度台快速恢复充电枪为空闲",
                         }),
                     });
-                    showToast(`充电枪 #${gid} 已恢复 IDLE`);
+                    showToast(`充电枪 #${gid} 已恢复空闲`);
                     loadFaults();
                     loadStatusLogs(1);
                 } else if (customBtn) {
@@ -1942,7 +2664,7 @@
             const logId = btn.dataset.logId;
             openActionDialog({
                 title: `办结运维待办 #${logId}`,
-                desc: `目标设备：${btn.dataset.device}。提交后会将待办置为 DONE 并追加处置备注。`,
+                desc: `目标设备：${btn.dataset.device}。提交后会将待办置为已办结并追加处置备注。`,
                 submitText: "确认办结",
                 fields: [
                     { name: "remark", label: "现场处置备注", type: "text", value: "运维工程师已现场排查并确认恢复", required: true, maxlength: 255 },
@@ -1967,7 +2689,7 @@
         $("loadOperatorsSummaryBtn").addEventListener("click", () => loadOperators(true));
         $("openCreateOperatorBtn").addEventListener("click", () => {
             openActionDialog({
-                title: "新增合作运营商（仅 admin）",
+                title: "新增合作运营商",
                 submitText: "创建运营商",
                 fields: [
                     { name: "operator_code", label: "运营商编码（3~32位）", value: "OP-DEMO-101", minlength: 3, maxlength: 32, required: true },
@@ -1981,8 +2703,8 @@
                         type: "select",
                         value: "ACTIVE",
                         options: [
-                            { value: "ACTIVE", label: "ACTIVE 正常合作" },
-                            { value: "SUSPENDED", label: "SUSPENDED 暂停合作" },
+                            { value: "ACTIVE", label: "正常合作" },
+                            { value: "SUSPENDED", label: "暂停合作" },
                         ],
                     },
                 ],
@@ -2015,8 +2737,8 @@
                         type: "select",
                         value: op.status,
                         options: [
-                            { value: "ACTIVE", label: "ACTIVE 正常合作" },
-                            { value: "SUSPENDED", label: "SUSPENDED 暂停合作" },
+                            { value: "ACTIVE", label: "正常合作" },
+                            { value: "SUSPENDED", label: "暂停合作" },
                         ],
                     },
                 ],
@@ -2041,7 +2763,7 @@
                 if (!st) return;
                 openActionDialog({
                     title: `编辑场站 #${st.station_id}（${st.station_code}）`,
-                    desc: "提示：若将空闲车位改到大于总车位数，会触发数据库 CHECK 约束 3819 拦截。",
+                    desc: "提示：空闲车位不可大于总车位数，否则提交将被系统校验拦截。",
                     submitText: "保存场站变更",
                     fields: [
                         { name: "station_name", label: "场站名称", value: st.station_name, minlength: 2, maxlength: 120, required: true },
@@ -2056,9 +2778,9 @@
                             type: "select",
                             value: st.station_status,
                             options: [
-                                { value: "OPEN", label: "OPEN 营业中" },
-                                { value: "MAINTENANCE", label: "MAINTENANCE 维护中" },
-                                { value: "CLOSED", label: "CLOSED 已关闭" },
+                                { value: "OPEN", label: "营业中" },
+                                { value: "MAINTENANCE", label: "维护中" },
+                                { value: "CLOSED", label: "已关闭" },
                             ],
                         },
                     ],
@@ -2194,7 +2916,7 @@
                 const uninvoiced = invBtn.dataset.uninvoiced;
                 openActionDialog({
                     title: `为结算单 #${billId} 开具发票`,
-                    desc: `账单应付 ¥${invBtn.dataset.payable}，当前剩余未开票 ¥${uninvoiced}。超额开票将触发触发器 1644 拦截。`,
+                    desc: `账单应付 ¥${invBtn.dataset.payable}，当前剩余未开票 ¥${uninvoiced}。开票金额不可超出剩余未开票额度。`,
                     submitText: "确认开票",
                     fields: [
                         { name: "invoice_no", label: "发票号码", value: genTxnNo("INV").slice(0, 18), minlength: 4, maxlength: 32, required: true },
@@ -2205,8 +2927,8 @@
                             type: "select",
                             value: "NORMAL",
                             options: [
-                                { value: "NORMAL", label: "NORMAL 普通发票" },
-                                { value: "SPECIAL", label: "SPECIAL 专用发票" },
+                                { value: "NORMAL", label: "普通发票" },
+                                { value: "SPECIAL", label: "专用发票" },
                             ],
                         },
                     ],
@@ -2306,7 +3028,7 @@
         $("probeOrdersBtn").addEventListener("click", () => probeEndpoint("GET", "/api/orders?page=1&page_size=5"));
         $("probeBillsBtn").addEventListener("click", () => probeEndpoint("GET", "/api/settlements?page=1&page_size=5"));
         $("probeCommission1Btn").addEventListener("click", () =>
-            probeEndpoint("POST", "/api/stations/piles/1/commission", { remark: "触发重复投运1644" })
+            probeEndpoint("POST", "/api/stations/piles/1/commission", { remark: "重复验收已投运充电桩" })
         );
         $("probeOverpayBtn").addEventListener("click", async () => {
             let targetOrderId = 6;
@@ -2343,7 +3065,7 @@
         const today = new Date().toISOString().slice(0, 10);
         openActionDialog({
             title: `充电桩 #${pileId} 协议联调验收投运`,
-            desc: "调用存储过程 proc_commission_charging_pile；未配枪或已验收桩将触发 1644 拦截。",
+            desc: "仅已配置充电枪且未验收的充电桩可执行投运；未配枪或重复验收将被规则拦截。",
             submitText: "确认投运",
             fields: [
                 { name: "commissioned_date", label: "投运日期", type: "date", value: today },
@@ -2357,7 +3079,7 @@
                         remark: vals.remark.trim(),
                     }),
                 });
-                showToast(`桩 #${data.pile_id} (${data.pile_code}) 已验收投运：${data.acceptance_status} / ${data.current_status}`);
+                showToast(`桩 #${data.pile_id} (${data.pile_code}) 已验收投运`);
                 if (onSuccess) onSuccess();
                 else loadStatusLogs(1);
             },
@@ -2369,7 +3091,7 @@
         const endpoint = isPile ? `/api/stations/piles/${targetId}/status` : `/api/stations/guns/${targetId}/status`;
         openActionDialog({
             title: `变更${isPile ? "充电桩" : "充电枪"} #${targetId} 运行状态`,
-            desc: "通过会话变量透传触发来源至 MySQL 审计触发器，状态变迁将自动写入 device_status_log。",
+            desc: "提交后将实时更新设备运行状态，并自动记录至设备状态变更历史。",
             submitText: "提交状态变更",
             fields: [
                 {
@@ -2378,10 +3100,10 @@
                     type: "select",
                     value: currentStatus,
                     options: [
-                        { value: "IDLE", label: "IDLE 空闲" },
-                        { value: "OCCUPIED", label: "OCCUPIED 占用" },
-                        { value: "FAULT", label: "FAULT 故障" },
-                        { value: "OFFLINE", label: "OFFLINE 离线" },
+                        { value: "IDLE", label: "空闲" },
+                        { value: "OCCUPIED", label: "占用" },
+                        { value: "FAULT", label: "故障" },
+                        { value: "OFFLINE", label: "离线" },
                     ],
                 },
                 {
@@ -2390,9 +3112,9 @@
                     type: "select",
                     value: "MANUAL",
                     options: [
-                        { value: "MANUAL", label: "MANUAL 人工维护" },
-                        { value: "ALARM", label: "ALARM 告警触发" },
-                        { value: "HEARTBEAT", label: "HEARTBEAT 心跳检测" },
+                        { value: "MANUAL", label: "人工维护" },
+                        { value: "ALARM", label: "告警触发" },
+                        { value: "HEARTBEAT", label: "心跳检测" },
                     ],
                 },
                 {
@@ -2401,10 +3123,10 @@
                     type: "select",
                     value: "",
                     options: [
-                        { value: "", label: "自动判定（故障/离线自动 PENDING）" },
-                        { value: "PENDING", label: "PENDING 待处理" },
-                        { value: "DONE", label: "DONE 已办结" },
-                        { value: "NONE", label: "NONE 无需处理" },
+                        { value: "", label: "自动判定（故障或离线时自动生成待处理）" },
+                        { value: "PENDING", label: "待处理" },
+                        { value: "DONE", label: "已办结" },
+                        { value: "NONE", label: "无需处理" },
                     ],
                 },
                 { name: "remark", label: "变更说明", value: "运维调度台手动变更设备状态", maxlength: 255, required: true },
@@ -2431,10 +3153,40 @@
     }
 
     async function init() {
+        const urlParams = new URLSearchParams(location.search);
+        const themeParam = urlParams.get("theme");
+        if (themeParam === "dark" || themeParam === "light") {
+            document.documentElement.dataset.theme = themeParam;
+            localStorage.setItem("ev_hub_theme", themeParam);
+        }
+
+        syncThemeToggles();
         bindEvents();
+
+        const initialAuthMode = authModeFromHash(location.hash);
+        state.activePanel = initialAuthMode ? "panel-home" : panelFromHash(location.hash);
         await Promise.all([checkDbHealth(), loadRolesMeta()]);
-        await restoreSessionOrDefault();
-        refreshActivePanelData();
+
+        const roleParam = urlParams.get("role");
+        const validRoles = ["driver", "fleet", "ops", "settlement", "admin"];
+        if (roleParam && validRoles.includes(roleParam)) {
+            const ok = await switchDevRole(roleParam, { fetchData: false });
+            if (ok) {
+                hideAuthView({ updateHash: true, fetchData: true });
+            } else {
+                renderUserContext();
+                showAuthView("login", { updateHash: true });
+            }
+            return;
+        }
+
+        const restored = await restoreSession();
+        if (restored) {
+            hideAuthView({ updateHash: true, fetchData: true });
+        } else {
+            renderUserContext();
+            showAuthView(initialAuthMode || "login", { updateHash: true });
+        }
     }
 
     init();
