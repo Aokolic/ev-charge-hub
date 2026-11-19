@@ -135,9 +135,12 @@ from app.routers import order as order_routes  # noqa: E402
 from app.routers import settle as settle_routes  # noqa: E402
 from app.routers import station as station_routes  # noqa: E402
 from app.routers import monitor as monitor_routes  # noqa: E402
+# 业务线 4（李海波）：用户、车辆、企业车队与优惠券
+from app.routers import user as user_routes  # noqa: E402
 
 app.include_router(auth_routes.router)
 app.include_router(station_routes.router)
 app.include_router(order_routes.router)
 app.include_router(settle_routes.router)
 app.include_router(monitor_routes.router)
+app.include_router(user_routes.router)

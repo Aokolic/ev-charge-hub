@@ -27,5 +27,5 @@
 | `station.py` | 业务线 1（成员 1 / 组长） | `operator`、`station`、`charging_pile`、`charging_gun`、`device_status_log` | **场站→桩→枪三级独立实体**（枪是最小计费粒度，禁止做成桩字段）；单枪最大功率 ≤ 所属桩额定功率 |
 | `order.py` | 业务线 2（成员 2） | `pricing_rule`、`charge_order`、`order_fee_detail`、`payment_record` | 生成列 `active_gun_id` + `UNIQUE` 防同枪并发；分时计费明细按峰/平/谷拆分；订单与支付 `1:N` |
 | `monitor.py` | 业务线 3（成员 3） | `pile_telemetry`、`alarm_record`、`repair_order` | `pile_telemetry` 按桩/月 `RANGE` 分区（无外键）；告警与维修工单为 `1:N` 关系 |
-| `user.py` | 业务线 4（成员 4） | `user_account`、`vehicle`、`fleet_account`、`coupon_campaign`、`coupon_record` | 手机号/车牌加密存储；1 车同刻仅归 1 主；优惠券发放与核销分离，核销与订单 `1:1` 绑定 |
+| `user.py` | 业务线 4（成员 4） | `user_account`、`vehicle`、`fleet_account`、`coupon_campaign`、`coupon_record`、`coupon_redeem_record` | 手机号/车牌加密存储；1 车同刻仅归 1 主；优惠券发放与核销两表分离，核销对 `coupon_id`/`order_id` 各建唯一索引（一券一销、一单一券） |
 | `settle.py` | 业务线 5（成员 2） | `settlement_bill`、`reconcile_diff`、`invoice_record` | `(运营商, 场站, 账期)` 联合唯一；差异回指具体 `order_id`；开票红冲新增冲正行、禁删原票 |

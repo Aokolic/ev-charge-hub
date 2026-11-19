@@ -833,5 +833,310 @@ END //
 DELIMITER ;
 
 -- ============================================================================
--- 【业务线 4】存储过程与触发器占位区（各负责成员按需追加）
+-- 【业务线 4】用户与会员 —— 触发器与存储过程（负责人：成员 4 / 李海波）
+-- 设计说明：
+--   1. 发券与核销的业务规则全部下沉到数据库：活动有效期/投放状态、券量上限、
+--      每人限领、场站适用性、订单归属与使用门槛，均由触发器在写入瞬间校验，
+--      Python 侧只负责组装参数，避免“应用层校验”与“直接改库”两条口径不一致；
+--   2. 券状态（ISSUED -> REDEEMED）由核销触发器自动回写，保证券表与核销表永不脱节；
+--   3. 核销一次性完成“写核销记录 + 回写券状态 + 抵扣订单金额”，整段处于同一事务；
+--   4. 初始化脚本可置 @skip_coupon_guard = 1 跳过校验批量造数（与线 1 的
+--      @skip_auto_status_log 同一约定），业务运行期该变量为空，校验始终生效。
 -- ============================================================================
+
+DROP TRIGGER IF EXISTS trg_coupon_issue_guard;
+DROP TRIGGER IF EXISTS trg_coupon_issued_count;
+DROP TRIGGER IF EXISTS trg_coupon_redeem_guard;
+DROP TRIGGER IF EXISTS trg_coupon_redeem_after;
+DROP PROCEDURE IF EXISTS sp_issue_coupon_pack;
+DROP PROCEDURE IF EXISTS sp_coupon_redeem;
+
+DELIMITER $$
+
+-- ----------------------------------------------------------------------------
+-- 触发器 4.1：发券守卫（活动投放中、有效期内、券量未超发、每人限领、面额快照一致）
+-- ----------------------------------------------------------------------------
+CREATE TRIGGER trg_coupon_issue_guard
+BEFORE INSERT ON coupon_record
+FOR EACH ROW
+BEGIN
+    DECLARE v_status VARCHAR(20);
+    DECLARE v_from   DATE;
+    DECLARE v_to     DATE;
+    DECLARE v_total  INT UNSIGNED;
+    DECLARE v_issued INT DEFAULT 0;
+    DECLARE v_limit  TINYINT UNSIGNED;
+    DECLARE v_face   DECIMAL(8,2);
+    DECLARE v_got    INT DEFAULT 0;
+
+    IF COALESCE(@skip_coupon_guard, 0) = 0 THEN
+        -- 锁住活动行：并发发券时串行化，防止 issued_count 超发
+        SELECT status, valid_from, valid_to, issue_total, issued_count, per_user_limit, face_value
+          INTO v_status, v_from, v_to, v_total, v_issued, v_limit, v_face
+          FROM coupon_campaign
+         WHERE campaign_id = NEW.campaign_id
+           FOR UPDATE;
+
+        IF v_status IS NULL THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '优惠活动不存在，无法发券';
+        END IF;
+        IF v_status <> 'ACTIVE' THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '优惠活动未在投放中，不能发券';
+        END IF;
+        IF CURDATE() < v_from OR CURDATE() > v_to THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '当前不在活动有效期内，不能发券';
+        END IF;
+        IF v_issued >= v_total THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '活动券量已发完，不能继续发放';
+        END IF;
+        IF NEW.expire_at > v_to THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '券到期日不得晚于活动失效日';
+        END IF;
+        IF NEW.face_value <> v_face THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '券面额与活动配置不一致';
+        END IF;
+
+        SELECT COUNT(*) INTO v_got
+          FROM coupon_record
+         WHERE user_id = NEW.user_id
+           AND campaign_id = NEW.campaign_id
+           AND status <> 'VOID';
+        IF v_got >= v_limit THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '该用户已达到本活动限领张数';
+        END IF;
+    END IF;
+END$$
+
+-- ----------------------------------------------------------------------------
+-- 触发器 4.2：发放量自动累加（与 4.1 同事务，供活动看板统计核销率）
+-- ----------------------------------------------------------------------------
+CREATE TRIGGER trg_coupon_issued_count
+AFTER INSERT ON coupon_record
+FOR EACH ROW
+BEGIN
+    IF COALESCE(@skip_coupon_guard, 0) = 0 THEN
+        UPDATE coupon_campaign
+           SET issued_count = issued_count + 1
+         WHERE campaign_id = NEW.campaign_id;
+    END IF;
+END$$
+
+-- ----------------------------------------------------------------------------
+-- 触发器 4.3：核销守卫（券归属、未核销、未过期、活动投放中、场站适用、门槛达标、
+--             订单归属本人且已结束、抵扣不超过券面额与订单金额）
+-- ----------------------------------------------------------------------------
+CREATE TRIGGER trg_coupon_redeem_guard
+BEFORE INSERT ON coupon_redeem_record
+FOR EACH ROW
+BEGIN
+    DECLARE v_owner    BIGINT UNSIGNED;
+    DECLARE v_status   VARCHAR(20);
+    DECLARE v_expire   DATE;
+    DECLARE v_face     DECIMAL(8,2);
+    DECLARE v_thresh   DECIMAL(8,2);
+    DECLARE v_campaign BIGINT UNSIGNED;
+    DECLARE v_c_status VARCHAR(20);
+    DECLARE v_c_from   DATE;
+    DECLARE v_c_to     DATE;
+    DECLARE v_c_station BIGINT UNSIGNED;
+    DECLARE v_o_owner  BIGINT UNSIGNED;
+    DECLARE v_o_status VARCHAR(20);
+
+    IF COALESCE(@skip_coupon_guard, 0) = 0 THEN
+        SELECT user_id, status, expire_at, face_value, threshold_amount, campaign_id
+          INTO v_owner, v_status, v_expire, v_face, v_thresh, v_campaign
+          FROM coupon_record
+         WHERE coupon_id = NEW.coupon_id
+           FOR UPDATE;
+
+        IF v_owner IS NULL THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '优惠券不存在';
+        END IF;
+        IF v_owner <> NEW.user_id THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '该券不属于当前用户，禁止核销';
+        END IF;
+        IF v_status <> 'ISSUED' THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '该券已核销或已作废，不能重复核销';
+        END IF;
+        IF v_expire < CURDATE() THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '优惠券已过期';
+        END IF;
+
+        SELECT status, valid_from, valid_to, applicable_station_id
+          INTO v_c_status, v_c_from, v_c_to, v_c_station
+          FROM coupon_campaign
+         WHERE campaign_id = v_campaign;
+        IF v_c_status <> 'ACTIVE' THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '所属优惠活动已停止投放，不能核销';
+        END IF;
+        IF CURDATE() < v_c_from OR CURDATE() > v_c_to THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '当前不在活动有效期内，不能核销';
+        END IF;
+        IF v_c_station IS NOT NULL AND v_c_station <> NEW.station_id THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '该券仅限指定场站使用';
+        END IF;
+
+        SELECT user_id, status
+          INTO v_o_owner, v_o_status
+          FROM charge_order
+         WHERE order_id = NEW.order_id;
+        IF v_o_owner IS NULL THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '核销关联的充电订单不存在';
+        END IF;
+        IF v_o_owner <> NEW.user_id THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单不属于当前用户，禁止核销';
+        END IF;
+        IF v_o_status = 'CHARGING' THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单仍在充电中，结束后才能核销优惠券';
+        END IF;
+
+        IF NEW.order_amount < v_thresh THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单金额未达到优惠券使用门槛';
+        END IF;
+        IF NEW.face_value > v_face THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '抵扣金额超过券面额';
+        END IF;
+        IF NEW.face_value > NEW.order_amount THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '抵扣金额不能超过订单金额';
+        END IF;
+    END IF;
+END$$
+
+-- ----------------------------------------------------------------------------
+-- 触发器 4.4：核销成功后自动把券置为 REDEEMED（券表状态永远跟随核销表）
+-- 说明：
+--   1. 初始化脚本若用 INSERT ... SELECT ... FROM coupon_record 批量造核销数据，
+--      MySQL 会因“外层语句正在读 coupon_record”而拒绝触发器再写该表（ERROR 1442），
+--      故批量造数期间统一置 @skip_coupon_guard = 1 跳过本触发器；
+--   2. 正常业务路径（单行 INSERT / 存储过程）不受影响；即便券已是 REDEEMED，
+--      这里也先比对再更新，避免无谓写入与自增锁。
+-- ----------------------------------------------------------------------------
+CREATE TRIGGER trg_coupon_redeem_after
+AFTER INSERT ON coupon_redeem_record
+FOR EACH ROW
+BEGIN
+    DECLARE v_status VARCHAR(20);
+
+    IF COALESCE(@skip_coupon_guard, 0) = 0 THEN
+        SELECT status INTO v_status
+          FROM coupon_record
+         WHERE coupon_id = NEW.coupon_id;
+
+        IF v_status IS NOT NULL AND v_status <> 'REDEEMED' THEN
+            UPDATE coupon_record
+               SET status = 'REDEEMED'
+             WHERE coupon_id = NEW.coupon_id;
+        END IF;
+    END IF;
+END$$
+
+-- ----------------------------------------------------------------------------
+-- 存储过程 4.1：批量发券（新人券包 / 运营定向投放），逐张过 4.1 触发器校验
+-- 调用方式：CALL sp_issue_coupon_pack(9001, 1, 2, 'NEW_USER_PACK', @issued);
+-- ----------------------------------------------------------------------------
+CREATE PROCEDURE sp_issue_coupon_pack(
+    IN  p_user_id     BIGINT UNSIGNED,
+    IN  p_campaign_id BIGINT UNSIGNED,
+    IN  p_count       TINYINT UNSIGNED,
+    -- 显式声明表列的字符集与排序规则：过程参数默认继承“建库时的库默认排序规则”，
+    -- 若测试库用 utf8mb4_0900_ai_ci 而表是 utf8mb4_unicode_ci，字符串比对会报 1267
+    IN  p_channel     VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
+    OUT p_issued      INT
+)
+BEGIN
+    DECLARE v_i        TINYINT UNSIGNED DEFAULT 0;
+    DECLARE v_valid_to DATE;
+    DECLARE v_face     DECIMAL(8,2);
+    DECLARE v_thresh   DECIMAL(8,2);
+    DECLARE v_channel  VARCHAR(20);
+
+    IF p_count IS NULL OR p_count < 1 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '发券张数必须大于 0';
+    END IF;
+
+    SELECT valid_to, face_value, threshold_amount
+      INTO v_valid_to, v_face, v_thresh
+      FROM coupon_campaign
+     WHERE campaign_id = p_campaign_id;
+    IF v_face IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '优惠活动不存在';
+    END IF;
+
+    SET v_channel = COALESCE(p_channel, 'OPS_GRANT');
+    SET p_issued  = 0;
+
+    WHILE v_i < p_count DO
+        -- 券码：CP + 30 位无连字符 UUID，满足 VARCHAR(32) 与唯一索引约束
+        INSERT INTO coupon_record
+            (coupon_no, campaign_id, user_id, face_value, threshold_amount,
+             issue_channel, issued_by, expire_at, status)
+        VALUES
+            (CONCAT('CP', SUBSTRING(REPLACE(UUID(), '-', ''), 1, 30)),
+             p_campaign_id, p_user_id, v_face, v_thresh,
+             v_channel, NULL, v_valid_to, 'ISSUED');
+        SET v_i      = v_i + 1;
+        SET p_issued = p_issued + 1;
+    END WHILE;
+END$$
+
+-- ----------------------------------------------------------------------------
+-- 存储过程 4.2：优惠券核销（写核销记录 -> 触发器回写券状态 -> 抵扣订单金额）
+-- 说明：抵扣额取 LEAST(券面额, 订单金额)，因此 chk_redeem_face 与门槛校验仍成立；
+--       整个过程一条事务：任一步失败（触发器 SIGNAL / 唯一索引冲突）整体回滚，
+--       订单不会被脏扣，券也不会变成“已核销”。
+-- 调用方式：CALL sp_coupon_redeem('CPxxxx', 10001, @discount);
+-- ----------------------------------------------------------------------------
+CREATE PROCEDURE sp_coupon_redeem(
+    -- 券码参数显式指定表列的排序规则，避免与 coupon_record.coupon_no 比对时报 1267
+    IN  p_coupon_no VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
+    IN  p_order_id  BIGINT,
+    OUT p_discount  DECIMAL(10,2)
+)
+BEGIN
+    DECLARE v_coupon_id  BIGINT UNSIGNED;
+    DECLARE v_face       DECIMAL(8,2);
+    DECLARE v_order_user BIGINT UNSIGNED;
+    DECLARE v_station    BIGINT UNSIGNED;
+    DECLARE v_amount     DECIMAL(10,2);
+    DECLARE v_discount   DECIMAL(10,2);
+
+    SELECT coupon_id, face_value
+      INTO v_coupon_id, v_face
+      FROM coupon_record
+     WHERE coupon_no = p_coupon_no;
+    IF v_coupon_id IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '券码不存在';
+    END IF;
+
+    SELECT user_id, station_id, COALESCE(total_amount, 0.00)
+      INTO v_order_user, v_station, v_amount
+      FROM charge_order
+     WHERE order_id = p_order_id;
+    IF v_order_user IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '充电订单不存在';
+    END IF;
+    IF v_amount <= 0.00 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单金额为 0，无法使用优惠券';
+    END IF;
+
+    SET v_discount = LEAST(v_face, v_amount);
+
+    INSERT INTO coupon_redeem_record
+        (coupon_id, order_id, user_id, station_id, face_value, order_amount)
+    VALUES
+        (v_coupon_id, p_order_id, v_order_user, v_station, v_discount, v_amount);
+
+    UPDATE charge_order
+       SET discount_amount = discount_amount + v_discount,
+           total_amount    = GREATEST(total_amount - v_discount, 0.00)
+     WHERE order_id = p_order_id;
+
+    SET p_discount = v_discount;
+END$$
+
+DELIMITER ;
+
+-- ============================================================================
+-- 业务线 4 结束
+-- ============================================================================
+
