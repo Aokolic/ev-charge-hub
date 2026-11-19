@@ -6,6 +6,7 @@
     const state = {
         token: localStorage.getItem("ev_hub_token") || "",
         user: null,
+        authMode: localStorage.getItem("ev_hub_auth_mode") || "",
         rolesMap: {},
         activePanel: "panel-home",
         operatorsMode: "full",
@@ -453,16 +454,19 @@
     // ------------------------------------------------------------------------
     // 网络请求与标准状态渲染
     // ------------------------------------------------------------------------
+    let sessionExpiring = false;
+
     async function apiFetch(url, options = {}) {
-        const headers = new Headers(options.headers || {});
+        const { skipAuthRedirect = false, ...fetchOptions } = options;
+        const headers = new Headers(fetchOptions.headers || {});
         if (state.token) {
             headers.set("Authorization", `Bearer ${state.token}`);
         }
-        if (options.body && !headers.has("Content-Type")) {
+        if (fetchOptions.body && !headers.has("Content-Type")) {
             headers.set("Content-Type", "application/json");
         }
         const started = performance.now();
-        const resp = await fetch(url, { ...options, headers });
+        const resp = await fetch(url, { ...fetchOptions, headers });
         const elapsedMs = Math.round(performance.now() - started);
         const text = await resp.text();
         let data = text;
@@ -476,6 +480,14 @@
                 typeof data === "object" && data !== null && data.detail
                     ? data.detail
                     : `请求失败 (${resp.status})`;
+            if (
+                resp.status === 401 &&
+                !skipAuthRedirect &&
+                !String(url).startsWith("/api/auth/") &&
+                (state.token || state.user)
+            ) {
+                handleSessionExpired(detail);
+            }
             const err = new Error(detail);
             err.status = resp.status;
             err.data = data;
@@ -592,11 +604,32 @@
         banner.hidden = false;
     }
 
+    function closeIdentityPopover() {
+        const pop = $("identityPopover");
+        if (!pop) return;
+        if (supportsPopover) {
+            try {
+                pop.hidePopover();
+            } catch {
+                // 已关闭时忽略状态异常
+            }
+        } else {
+            pop.classList.remove(":popover-open");
+        }
+    }
+
     function renderUserContext() {
         const chip = $("identityChipText");
         const avatar = $("identityAvatar");
         const label = $("currentUserLabel");
+        const modeBadge = $("currentAuthModeBadge");
+        const accountMeta = $("currentAccountMeta");
         const desc = $("currentRoleDesc");
+        const popoverBtn = $("identityPopoverBtn");
+        const topbarLoginBtn = $("topbarLoginBtn");
+        const switchBtn = $("switchAccountBtn");
+        const logoutBtn = $("logoutBtn");
+        const devDetails = $("devContextDetails");
         const currentRole = state.user?.role;
 
         document.querySelectorAll("#roleButtons .role-pill").forEach((btn) => {
@@ -611,27 +644,65 @@
         });
 
         if (!state.user) {
-            chip.textContent = "未登录";
+            if (popoverBtn) popoverBtn.hidden = true;
+            if (topbarLoginBtn) topbarLoginBtn.hidden = false;
+            if (logoutBtn) logoutBtn.hidden = true;
+            if (devDetails) devDetails.hidden = true;
+            if (switchBtn) {
+                switchBtn.textContent = "去登录 / 注册";
+                switchBtn.className = "btn btn-primary btn-sm";
+            }
+            if (chip) chip.textContent = "未登录";
             if (avatar) {
                 avatar.textContent = "?";
                 avatar.removeAttribute("data-role");
             }
-            label.textContent = "未登录";
-            desc.textContent = "可在页面顶部快速切换不同业务角色体验对应工作台。";
+            if (label) label.textContent = "未登录";
+            if (modeBadge) {
+                modeBadge.textContent = "未登录";
+                modeBadge.className = "badge badge-muted";
+            }
+            if (accountMeta) accountMeta.textContent = "";
+            if (desc) desc.textContent = "请先登录平台账号或选择演示角色进入工作台。";
             renderRoleNotice();
             renderHomeOverview();
             return;
         }
 
+        if (popoverBtn) popoverBtn.hidden = false;
+        if (topbarLoginBtn) topbarLoginBtn.hidden = true;
+        if (logoutBtn) logoutBtn.hidden = false;
+        if (devDetails) devDetails.hidden = false;
+        if (switchBtn) {
+            switchBtn.textContent = "切换 / 登录账号";
+            switchBtn.className = "btn btn-outline btn-sm";
+        }
+
         const roleMeta = state.rolesMap[state.user.role];
         const fleetNote = state.user.fleet_id ? ` · 车队 #${state.user.fleet_id}` : "";
-        chip.textContent = `${state.user.role_label} · #${state.user.user_id}${fleetNote}`;
+        const isDemo =
+            state.authMode === "demo" ||
+            (!state.authMode && String(state.user.username || "").startsWith("demo_"));
+
+        if (chip) {
+            chip.textContent = isDemo
+                ? `${state.user.role_label} · #${state.user.user_id}${fleetNote}`
+                : `${state.user.username} · ${state.user.role_label}`;
+        }
         if (avatar) {
             avatar.textContent = ROLE_AVATAR[state.user.role] || "用";
             avatar.dataset.role = state.user.role;
         }
-        label.textContent = `${state.user.role_label}（账号 #${state.user.user_id}${fleetNote}）`;
-        desc.textContent = roleMeta ? roleMeta.description : "";
+        if (label) label.textContent = state.user.role_label;
+        if (modeBadge) {
+            modeBadge.textContent = isDemo ? "演示身份" : "正式账号";
+            modeBadge.className = isDemo ? "badge badge-info" : "badge badge-ok";
+        }
+        if (accountMeta) {
+            const phoneNote = state.user.phone_masked ? ` · ${state.user.phone_masked}` : "";
+            accountMeta.textContent = `账号 ${state.user.username} · #${state.user.user_id}${fleetNote}${phoneNote}`;
+        }
+        if (desc) desc.textContent = roleMeta ? roleMeta.description : "";
 
         // 同步账号参数输入框
         $("devUserId").value = state.user.user_id;
@@ -642,7 +713,98 @@
         renderHomeOverview();
     }
 
-    async function switchDevRole(role) {
+    function syncThemeToggles() {
+        const pressed = document.documentElement.dataset.theme === "dark" ? "true" : "false";
+        $("themeToggle")?.setAttribute("aria-pressed", pressed);
+        $("authThemeToggle")?.setAttribute("aria-pressed", pressed);
+    }
+
+    function toggleTheme() {
+        const cur = document.documentElement.dataset.theme === "dark" ? "dark" : "light";
+        const next = cur === "dark" ? "light" : "dark";
+        document.documentElement.dataset.theme = next;
+        localStorage.setItem("ev_hub_theme", next);
+        syncThemeToggles();
+    }
+
+    function authModeFromHash(hash) {
+        if (hash === "#/register") return "register";
+        if (hash === "#/login") return "login";
+        return null;
+    }
+
+    function switchAuthMode(mode) {
+        const isLogin = mode !== "register";
+        $("loginForm").hidden = !isLogin;
+        $("registerForm").hidden = isLogin;
+        $("authQuickWrap").hidden = !isLogin;
+        $("authLoginSwitch").hidden = !isLogin;
+        $("authRegisterSwitch").hidden = isLogin;
+        $("authHeading").textContent = isLogin ? "欢迎回来" : "创建平台账号";
+        if (isLogin && state.token && state.user) {
+            $("authSubheading").textContent = `当前已登录 ${state.user.username}（${state.user.role_label}），可切换其他账号`;
+        } else {
+            $("authSubheading").textContent = isLogin
+                ? "登录您的 EV Charge Hub 账号"
+                : "注册成为普通车主或企业车队账号";
+        }
+        setInlineAlert($("authError"), "");
+    }
+
+    function showAuthView(mode = "login", { updateHash = true } = {}) {
+        const resolved = mode === "register" ? "register" : "login";
+        $("appShell").hidden = true;
+        $("authView").hidden = false;
+        switchAuthMode(resolved);
+        $("backToWorkspaceBtn").hidden = !Boolean(state.token && state.user);
+        syncThemeToggles();
+
+        if (updateHash) {
+            const targetHash = resolved === "register" ? "#/register" : "#/login";
+            if (location.hash !== targetHash) {
+                history.replaceState(null, "", targetHash);
+            }
+        }
+    }
+
+    function hideAuthView({ updateHash = true, fetchData = true } = {}) {
+        $("authView").hidden = true;
+        $("appShell").hidden = false;
+        syncThemeToggles();
+        activatePanel(state.activePanel || "panel-home", { updateHash, fetchData });
+    }
+
+    function handleSessionExpired(reason = "") {
+        if (sessionExpiring) return;
+        sessionExpiring = true;
+        state.token = "";
+        state.user = null;
+        state.authMode = "";
+        state.sessionInvoices = [];
+        localStorage.removeItem("ev_hub_token");
+        localStorage.removeItem("ev_hub_auth_mode");
+        closeIdentityPopover();
+        renderUserContext();
+        showAuthView("login", { updateHash: true });
+        setInlineAlert($("authError"), "登录状态已失效，请重新登录或选择演示角色进入。");
+        showToast(reason ? `登录已过期：${reason}` : "登录状态已失效，请重新登录", true);
+    }
+
+    function logoutUser() {
+        sessionExpiring = false;
+        state.token = "";
+        state.user = null;
+        state.authMode = "";
+        state.sessionInvoices = [];
+        localStorage.removeItem("ev_hub_token");
+        localStorage.removeItem("ev_hub_auth_mode");
+        closeIdentityPopover();
+        renderUserContext();
+        showAuthView("login", { updateHash: true });
+        showToast("已退出登录");
+    }
+
+    async function switchDevRole(role, { fetchData = true } = {}) {
         const userId = Math.max(1, Number($("devUserId").value || 9001));
         const fleetId = Math.max(1, Number($("devFleetId").value || 1));
         try {
@@ -655,31 +817,50 @@
                     fleet_id: role === "fleet" ? fleetId : null,
                 }),
             });
+            sessionExpiring = false;
             state.token = data.access_token;
             state.user = data.user;
+            state.authMode = "demo";
             localStorage.setItem("ev_hub_token", state.token);
+            localStorage.setItem("ev_hub_auth_mode", "demo");
             renderUserContext();
             showToast(`已切换为 ${data.user.role_label}（#${data.user.user_id}）`);
-            refreshActivePanelData();
+            if (fetchData) {
+                refreshActivePanelData();
+            }
+            return true;
         } catch (err) {
             showToast(err.message, true);
+            if ($("authView") && !$("authView").hidden) {
+                setInlineAlert($("authError"), `演示角色登录失败：${err.message}`);
+            }
+            return false;
         }
     }
 
-    async function restoreSessionOrDefault() {
-        if (state.token) {
-            try {
-                const { data } = await apiFetch("/api/auth/me");
-                state.user = data;
-                renderUserContext();
-                return false;
-            } catch {
-                state.token = "";
-                localStorage.removeItem("ev_hub_token");
-            }
+    async function restoreSession() {
+        if (!state.token) return false;
+        try {
+            const { data } = await apiFetch("/api/auth/me");
+            sessionExpiring = false;
+            state.user = data;
+            const savedMode = localStorage.getItem("ev_hub_auth_mode");
+            state.authMode =
+                savedMode === "account" || savedMode === "demo"
+                    ? savedMode
+                    : String(data.username || "").startsWith("demo_")
+                    ? "demo"
+                    : "account";
+            renderUserContext();
+            return true;
+        } catch {
+            state.token = "";
+            state.user = null;
+            state.authMode = "";
+            localStorage.removeItem("ev_hub_token");
+            localStorage.removeItem("ev_hub_auth_mode");
+            return false;
         }
-        await switchDevRole("driver");
-        return true;
     }
 
     // ------------------------------------------------------------------------
@@ -1833,6 +2014,7 @@
             const res = await apiFetch(url, {
                 method,
                 body: body ? JSON.stringify(body) : undefined,
+                skipAuthRedirect: true,
             });
             logConsole(method, url, res.status, res.data, res.elapsedMs);
             showToast(`${method} ${url} -> HTTP ${res.status}`);
@@ -2027,14 +2209,9 @@
     function bindEvents() {
         setupDialogs();
 
-        // 主题切换（浅色 / 深色）
-        $("themeToggle")?.addEventListener("click", () => {
-            const cur = document.documentElement.dataset.theme === "dark" ? "dark" : "light";
-            const next = cur === "dark" ? "light" : "dark";
-            document.documentElement.dataset.theme = next;
-            localStorage.setItem("ev_hub_theme", next);
-            $("themeToggle").setAttribute("aria-pressed", next === "dark" ? "true" : "false");
-        });
+        // 主题切换（浅色 / 深色，顶栏与登录页双向同步）
+        $("themeToggle")?.addEventListener("click", toggleTheme);
+        $("authThemeToggle")?.addEventListener("click", toggleTheme);
 
         // 侧边导航与 Hash 路由同步
         $("mainNav")?.addEventListener("click", (e) => {
@@ -2044,7 +2221,22 @@
             activatePanel(link.dataset.panel);
         });
         window.addEventListener("hashchange", () => {
-            activatePanel(panelFromHash(location.hash), { updateHash: false });
+            const authMode = authModeFromHash(location.hash);
+            if (authMode) {
+                showAuthView(authMode, { updateHash: false });
+                return;
+            }
+            const nextPanel = panelFromHash(location.hash);
+            if (!state.user) {
+                state.activePanel = nextPanel;
+                showAuthView("login", { updateHash: true });
+                return;
+            }
+            if ($("authView") && !$("authView").hidden) {
+                $("authView").hidden = true;
+                $("appShell").hidden = false;
+            }
+            activatePanel(nextPanel, { updateHash: false });
         });
 
         // 总览页充电枪阵列点击交互
@@ -2085,30 +2277,63 @@
             e.preventDefault();
             const currentRole = state.user?.role || "driver";
             await switchDevRole(currentRole);
-            if (supportsPopover) {
-                $("identityPopover").hidePopover();
-            } else {
-                $("identityPopover").classList.remove(":popover-open");
-            }
+            closeIdentityPopover();
+        });
+        $("topbarLoginBtn").addEventListener("click", () => {
+            showAuthView("login", { updateHash: true });
+        });
+        $("switchAccountBtn").addEventListener("click", () => {
+            closeIdentityPopover();
+            showAuthView("login", { updateHash: true });
+        });
+        $("logoutBtn").addEventListener("click", () => {
+            closeIdentityPopover();
+            logoutUser();
         });
 
-        // 登录 / 注册 Modal
-        $("openAuthDialogBtn").addEventListener("click", () => {
-            setInlineAlert($("authDialogError"), "");
-            $("authDialog").showModal();
+        // 独立全屏登录 / 注册页（login-04）交互
+        $("goRegisterBtn").addEventListener("click", () => {
+            showAuthView("register", { updateHash: true });
+            $("regUsername")?.focus();
         });
-        const switchAuthMode = (mode) => {
-            const isLogin = mode === "login";
-            $("loginForm").hidden = !isLogin;
-            $("registerForm").hidden = isLogin;
-            $("modeLoginBtn").className = `btn btn-xs ${isLogin ? "btn-primary" : "btn-outline"}`;
-            $("modeRegisterBtn").className = `btn btn-xs ${isLogin ? "btn-outline" : "btn-primary"}`;
-            $("modeLoginBtn").setAttribute("aria-pressed", isLogin ? "true" : "false");
-            $("modeRegisterBtn").setAttribute("aria-pressed", isLogin ? "false" : "true");
-            setInlineAlert($("authDialogError"), "");
-        };
-        $("modeLoginBtn").addEventListener("click", () => switchAuthMode("login"));
-        $("modeRegisterBtn").addEventListener("click", () => switchAuthMode("register"));
+        $("goLoginBtn").addEventListener("click", () => {
+            showAuthView("login", { updateHash: true });
+            $("loginUsername")?.focus();
+        });
+        $("backToWorkspaceBtn").addEventListener("click", () => {
+            hideAuthView({ updateHash: true, fetchData: false });
+        });
+
+        document.querySelectorAll(".auth-role-btn[data-quick-role]").forEach((btn) => {
+            btn.addEventListener("click", async () => {
+                const role = btn.dataset.quickRole;
+                if (!role) return;
+                setInlineAlert($("authError"), "");
+                btn.disabled = true;
+                try {
+                    const ok = await switchDevRole(role, { fetchData: false });
+                    if (ok) {
+                        hideAuthView({ updateHash: true, fetchData: true });
+                    }
+                } finally {
+                    btn.disabled = false;
+                }
+            });
+        });
+
+        // 多标签页清空登录凭证时同步退回登录页
+        window.addEventListener("storage", (e) => {
+            if (e.key !== "ev_hub_token") return;
+            if (!e.newValue && (state.token || state.user)) {
+                state.token = "";
+                state.user = null;
+                state.authMode = "";
+                state.sessionInvoices = [];
+                closeIdentityPopover();
+                renderUserContext();
+                showAuthView("login", { updateHash: true });
+            }
+        });
 
         const setupPwdToggle = (btnId, inputId, labelShow, labelHide) => {
             $(btnId).addEventListener("click", () => {
@@ -2135,7 +2360,7 @@
             e.preventDefault();
             const submitBtn = $("loginSubmitBtn");
             submitBtn.disabled = true;
-            setInlineAlert($("authDialogError"), "");
+            setInlineAlert($("authError"), "");
             try {
                 const { data } = await apiFetch("/api/auth/login", {
                     method: "POST",
@@ -2144,19 +2369,22 @@
                         password: $("loginPassword").value,
                     }),
                 });
+                sessionExpiring = false;
                 state.token = data.access_token;
                 state.user = data.user;
+                state.authMode = "account";
                 localStorage.setItem("ev_hub_token", state.token);
+                localStorage.setItem("ev_hub_auth_mode", "account");
+                $("loginPassword").value = "";
                 renderUserContext();
-                $("authDialog").close();
+                hideAuthView({ updateHash: true, fetchData: true });
                 showToast(`登录成功：${data.user.username}`);
-                refreshActivePanelData();
             } catch (err) {
                 const msg =
                     err.status === 500
-                        ? "账号登录服务暂未开通，请在顶栏直接切换角色体验对应功能。"
+                        ? "账号登录服务暂未开通，可点击下方演示角色快速体验对应工作台。"
                         : `登录失败 (${err.status || "-"})：${err.message}`;
-                setInlineAlert($("authDialogError"), msg);
+                setInlineAlert($("authError"), msg);
             } finally {
                 submitBtn.disabled = false;
             }
@@ -2166,7 +2394,7 @@
             e.preventDefault();
             const submitBtn = $("registerSubmitBtn");
             submitBtn.disabled = true;
-            setInlineAlert($("authDialogError"), "");
+            setInlineAlert($("authError"), "");
             try {
                 const role = $("regRole").value;
                 const payload = {
@@ -2180,17 +2408,17 @@
                     method: "POST",
                     body: JSON.stringify(payload),
                 });
-                switchAuthMode("login");
+                $("regPassword").value = "";
+                showAuthView("login", { updateHash: true });
                 $("loginUsername").value = data.username;
-                setInlineAlert($("authDialogError"), "");
-                $("authDialog").close();
+                $("loginPassword")?.focus();
                 showToast(`账号 ${data.username} 注册成功，请登录`);
             } catch (err) {
                 const msg =
                     err.status === 500
-                        ? "自助注册服务暂未开通，请在顶栏直接切换角色体验对应功能。"
+                        ? "自助注册服务暂未开通，可点击下方演示角色快速体验对应工作台。"
                         : `注册失败 (${err.status || "-"})：${err.message}`;
-                setInlineAlert($("authDialogError"), msg);
+                setInlineAlert($("authError"), msg);
             } finally {
                 submitBtn.disabled = false;
             }
@@ -2932,29 +3160,32 @@
             localStorage.setItem("ev_hub_theme", themeParam);
         }
 
-        const themeToggle = $("themeToggle");
-        if (themeToggle) {
-            themeToggle.setAttribute(
-                "aria-pressed",
-                document.documentElement.dataset.theme === "dark" ? "true" : "false"
-            );
-        }
+        syncThemeToggles();
         bindEvents();
-        activatePanel(panelFromHash(location.hash), { updateHash: true, fetchData: false });
+
+        const initialAuthMode = authModeFromHash(location.hash);
+        state.activePanel = initialAuthMode ? "panel-home" : panelFromHash(location.hash);
         await Promise.all([checkDbHealth(), loadRolesMeta()]);
 
         const roleParam = urlParams.get("role");
         const validRoles = ["driver", "fleet", "ops", "settlement", "admin"];
-        let didSwitch = false;
         if (roleParam && validRoles.includes(roleParam)) {
-            await switchDevRole(roleParam);
-            didSwitch = true;
-        } else {
-            didSwitch = await restoreSessionOrDefault();
+            const ok = await switchDevRole(roleParam, { fetchData: false });
+            if (ok) {
+                hideAuthView({ updateHash: true, fetchData: true });
+            } else {
+                renderUserContext();
+                showAuthView("login", { updateHash: true });
+            }
+            return;
         }
-        renderUserContext();
-        if (!didSwitch) {
-            refreshActivePanelData();
+
+        const restored = await restoreSession();
+        if (restored) {
+            hideAuthView({ updateHash: true, fetchData: true });
+        } else {
+            renderUserContext();
+            showAuthView(initialAuthMode || "login", { updateHash: true });
         }
     }
 

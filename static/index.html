@@ -16,7 +16,7 @@
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2318181b'/%3E%3Cpath d='M17 6 8.5 17.5H15L14 26l8.5-11.5H16L17 6z' fill='none' stroke='%23fafafa' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="/static/styles.css?v=20261119b">
 </head>
 <body>
     <a class="skip-link visually-hidden" href="#workspace-main">跳至主工作区</a>
@@ -38,7 +38,192 @@
         <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
     </svg>
 
-    <div class="app-shell">
+    <!-- 独立全屏登录与注册视图（shadcn/ui login-04 双栏布局） -->
+    <section id="authView" class="auth-view" aria-label="登录与注册" hidden>
+        <div class="auth-top-tools">
+            <button id="backToWorkspaceBtn" class="btn btn-outline btn-sm" type="button" hidden>返回工作台</button>
+            <button id="authThemeToggle" class="icon-btn" type="button" aria-pressed="false" aria-label="切换深色模式" title="切换深色模式">
+                <svg class="icon icon-moon" aria-hidden="true"><use href="#i-moon"/></svg>
+                <svg class="icon icon-sun" aria-hidden="true"><use href="#i-sun"/></svg>
+            </button>
+        </div>
+
+        <div class="auth-stage">
+            <div class="auth-card">
+                <!-- 左栏：纯白登录 / 注册表单区 -->
+                <div class="auth-form-pane">
+                    <div class="auth-head">
+                        <h1 id="authHeading">欢迎回来</h1>
+                        <p id="authSubheading" class="auth-subtitle">登录您的 EV Charge Hub 账号</p>
+                    </div>
+
+                    <p id="authError" class="inline-alert" role="alert" hidden></p>
+
+                    <form id="loginForm" class="auth-form">
+                        <div class="field">
+                            <label for="loginUsername">用户名</label>
+                            <input
+                                id="loginUsername"
+                                name="username"
+                                type="text"
+                                autocomplete="username"
+                                autocorrect="off"
+                                autocapitalize="none"
+                                spellcheck="false"
+                                minlength="2"
+                                maxlength="50"
+                                placeholder="请输入平台用户名，如 demo_driver"
+                                required
+                                autofocus
+                            >
+                        </div>
+
+                        <div class="field">
+                            <div class="auth-label-row">
+                                <label for="loginPassword">密码</label>
+                                <span class="auth-label-note">演示环境可点击下方角色快速进入</span>
+                            </div>
+                            <div class="password-wrap">
+                                <input
+                                    id="loginPassword"
+                                    name="password"
+                                    type="password"
+                                    autocomplete="current-password"
+                                    minlength="6"
+                                    maxlength="128"
+                                    placeholder="请输入登录密码"
+                                    required
+                                >
+                                <button id="toggleLoginPwdBtn" class="btn btn-outline btn-xs" type="button" aria-pressed="false" aria-label="显示登录密码">显示</button>
+                            </div>
+                        </div>
+
+                        <button id="loginSubmitBtn" class="btn btn-primary btn-block" type="submit">登录</button>
+                    </form>
+
+                    <form id="registerForm" class="auth-form" hidden>
+                        <div class="field">
+                            <label for="regUsername">用户名（2~50 位字母、数字、下划线或中文）</label>
+                            <input
+                                id="regUsername"
+                                name="username"
+                                type="text"
+                                autocomplete="username"
+                                autocorrect="off"
+                                autocapitalize="none"
+                                spellcheck="false"
+                                minlength="2"
+                                maxlength="50"
+                                placeholder="设置登录用户名"
+                                required
+                            >
+                        </div>
+
+                        <div class="field">
+                            <label for="regPhone">11 位手机号</label>
+                            <input
+                                id="regPhone"
+                                name="phone"
+                                type="tel"
+                                autocomplete="tel"
+                                inputmode="numeric"
+                                pattern="1[3-9]\d{9}"
+                                placeholder="如：13800138000"
+                                required
+                            >
+                        </div>
+
+                        <div class="field">
+                            <label for="regPassword">设置密码（6~128 位）</label>
+                            <div class="password-wrap">
+                                <input
+                                    id="regPassword"
+                                    name="password"
+                                    type="password"
+                                    autocomplete="new-password"
+                                    minlength="6"
+                                    maxlength="128"
+                                    placeholder="至少 6 位字符"
+                                    required
+                                >
+                                <button id="toggleRegPwdBtn" class="btn btn-outline btn-xs" type="button" aria-pressed="false" aria-label="显示注册密码">显示</button>
+                            </div>
+                        </div>
+
+                        <div class="field-row">
+                            <div class="field">
+                                <label for="regRole">注册角色</label>
+                                <select id="regRole" name="role">
+                                    <option value="driver">普通车主</option>
+                                    <option value="fleet">企业车队</option>
+                                </select>
+                            </div>
+                            <div class="field" id="regFleetWrap" hidden>
+                                <label for="regFleetId">所属车队 ID</label>
+                                <input id="regFleetId" name="fleet_id" type="number" min="1" inputmode="numeric" placeholder="车队角色必填">
+                            </div>
+                        </div>
+
+                        <button id="registerSubmitBtn" class="btn btn-primary btn-block" type="submit">注册账号</button>
+                    </form>
+
+                    <div id="authQuickWrap" class="auth-quick-wrap">
+                        <div class="auth-divider"><span>或使用演示角色快速进入</span></div>
+                        <div class="auth-role-grid" role="group" aria-label="演示角色快速登录">
+                            <button class="btn btn-outline btn-sm auth-role-btn" data-quick-role="driver" type="button">车主</button>
+                            <button class="btn btn-outline btn-sm auth-role-btn" data-quick-role="fleet" type="button">车队</button>
+                            <button class="btn btn-outline btn-sm auth-role-btn" data-quick-role="ops" type="button">运维</button>
+                            <button class="btn btn-outline btn-sm auth-role-btn" data-quick-role="settlement" type="button">结算</button>
+                            <button class="btn btn-outline btn-sm auth-role-btn" data-quick-role="admin" type="button">管理员</button>
+                        </div>
+                    </div>
+
+                    <div class="auth-switch">
+                        <p id="authLoginSwitch">还没有账号？<button id="goRegisterBtn" class="auth-link-btn" type="button">立即注册</button></p>
+                        <p id="authRegisterSwitch" hidden>已有平台账号？<button id="goLoginBtn" class="auth-link-btn" type="button">返回登录</button></p>
+                    </div>
+                </div>
+
+                <!-- 右栏：中性灰系统特性视觉面板（移动端自动隐藏） -->
+                <aside class="auth-visual-pane" aria-label="平台安全与架构特性">
+                    <div class="auth-visual-top">
+                        <div class="auth-visual-brand">
+                            <span class="brand-mark" aria-hidden="true"><svg class="icon"><use href="#i-bolt"/></svg></span>
+                            <span class="brand-text">
+                                <span class="brand-name">EV Charge Hub</span>
+                                <span class="brand-sub">新能源汽车充电桩运营服务平台</span>
+                            </span>
+                        </div>
+                        <h2 class="auth-visual-title">五角色协同与全链路数据库运营工作台</h2>
+                        <p class="auth-visual-desc">覆盖场站资产、扫码充电、分钟级遥测巡检与运营商月度对账闭环。</p>
+                    </div>
+
+                    <ul class="auth-spec-list">
+                        <li class="auth-spec-item">
+                            <strong>RBAC 五角色隔离</strong>
+                            <span>车主 · 车队 · 运维 · 结算 · 管理员按数据库视图隔离访问范围。</span>
+                        </li>
+                        <li class="auth-spec-item">
+                            <strong>PBKDF2 哈希与防暴破锁定</strong>
+                            <span>账号口令采用随机盐迭代摘要存储，连续校验失败自动触发临时锁定。</span>
+                        </li>
+                        <li class="auth-spec-item">
+                            <strong>手机号加密与盲索引去重</strong>
+                            <span>敏感字段 Fernet 加密落库，HMAC 盲索引支持精准查重与脱敏返回。</span>
+                        </li>
+                    </ul>
+
+                    <div class="auth-visual-foot">
+                        <span>FastAPI · SQLAlchemy 2.0 · MySQL 8/9 · RBAC Views</span>
+                    </div>
+                </aside>
+            </div>
+
+            <p class="auth-footnote">新能源汽车充电桩运营服务平台 · 北京林业大学《数据库系统课程设计》</p>
+        </div>
+    </section>
+
+    <div id="appShell" class="app-shell" hidden>
         <!-- 1. 左侧导航：品牌、模块分组导航、数据库探活 -->
         <aside class="sidebar" aria-label="平台导航">
             <a class="brand" href="#/home">
@@ -119,9 +304,7 @@
                         <svg class="icon icon-sun" aria-hidden="true"><use href="#i-sun"/></svg>
                     </button>
 
-                    <button id="openAuthDialogBtn" class="icon-btn" type="button" aria-label="账号登录" title="账号登录">
-                        <svg class="icon" aria-hidden="true"><use href="#i-login"/></svg>
-                    </button>
+                    <button id="topbarLoginBtn" class="btn btn-primary btn-sm" type="button" hidden>登录 / 注册</button>
 
                     <button
                         id="identityPopoverBtn"
@@ -129,44 +312,57 @@
                         type="button"
                         popovertarget="identityPopover"
                         aria-haspopup="true"
+                        hidden
                     >
                         <span id="identityAvatar" class="avatar" aria-hidden="true">?</span>
                         <span id="identityChipText" class="identity-text">未登录</span>
+                        <svg class="icon identity-caret" aria-hidden="true"><use href="#i-chevron"/></svg>
                     </button>
                 </div>
             </header>
 
-            <!-- 身份与账号参数 Popover -->
-            <aside id="identityPopover" class="identity-popover" popover="auto" aria-label="当前身份与账号切换">
+            <!-- 身份与账号菜单 Popover -->
+            <aside id="identityPopover" class="identity-popover" popover="auto" aria-label="当前账号与身份切换">
                 <div class="popover-head">
-                    <h2>当前身份与账号切换</h2>
+                    <h2>当前账号</h2>
                     <button class="btn btn-ghost btn-xs" type="button" popovertarget="identityPopover" popovertargetaction="hide" aria-label="关闭身份面板">关闭</button>
                 </div>
                 <div class="context-summary">
-                    <div><strong id="currentUserLabel">未登录</strong></div>
-                    <p id="currentRoleDesc" class="role-desc">可在页面顶部快速切换不同业务角色体验对应工作台。</p>
+                    <div class="popover-summary-head">
+                        <strong id="currentUserLabel">未登录</strong>
+                        <span id="currentAuthModeBadge" class="badge badge-muted">未登录</span>
+                    </div>
+                    <p id="currentAccountMeta" class="account-meta"></p>
+                    <p id="currentRoleDesc" class="role-desc">请先登录平台账号或选择演示角色进入工作台。</p>
                 </div>
-                <form id="devContextForm" class="popover-form">
-                    <div class="field-row">
-                        <div class="field">
-                            <label for="devUserId">当前用户编号</label>
-                            <input id="devUserId" name="user_id" type="number" min="1" value="9001" inputmode="numeric" required>
+                <div class="popover-account-actions">
+                    <button id="switchAccountBtn" class="btn btn-outline btn-sm" type="button">切换 / 登录账号</button>
+                    <button id="logoutBtn" class="btn btn-danger-outline btn-sm" type="button" hidden>退出登录</button>
+                </div>
+                <details id="devContextDetails" class="popover-details">
+                    <summary class="popover-details-summary">演示与联调参数（答辩专用）</summary>
+                    <form id="devContextForm" class="popover-form">
+                        <div class="field-row">
+                            <div class="field">
+                                <label for="devUserId">当前用户编号</label>
+                                <input id="devUserId" name="user_id" type="number" min="1" value="9001" inputmode="numeric" required>
+                            </div>
+                            <div class="field">
+                                <label for="devFleetId">所属车队编号（仅车队）</label>
+                                <input id="devFleetId" name="fleet_id" type="number" min="1" value="1" inputmode="numeric" required>
+                            </div>
                         </div>
-                        <div class="field">
-                            <label for="devFleetId">所属车队编号（仅车队）</label>
-                            <input id="devFleetId" name="fleet_id" type="number" min="1" value="1" inputmode="numeric" required>
+                        <div class="preset-row">
+                            <span class="hint">预设账号</span>
+                            <button class="btn btn-outline btn-xs uid-preset-btn" data-uid="9001" type="button">9001 充电中订单</button>
+                            <button class="btn btn-outline btn-xs uid-preset-btn" data-uid="9006" type="button">9006 已支付订单</button>
+                            <button class="btn btn-outline btn-xs uid-preset-btn" data-uid="1" type="button">1</button>
                         </div>
-                    </div>
-                    <div class="preset-row">
-                        <span class="hint">预设账号</span>
-                        <button class="btn btn-outline btn-xs uid-preset-btn" data-uid="9001" type="button">9001 充电中订单</button>
-                        <button class="btn btn-outline btn-xs uid-preset-btn" data-uid="9006" type="button">9006 已支付订单</button>
-                        <button class="btn btn-outline btn-xs uid-preset-btn" data-uid="1" type="button">1</button>
-                    </div>
-                    <div class="popover-actions">
-                        <button id="reissueRoleBtn" class="btn btn-primary btn-sm" type="submit">应用当前身份</button>
-                    </div>
-                </form>
+                        <div class="popover-actions">
+                            <button id="reissueRoleBtn" class="btn btn-primary btn-sm btn-block" type="submit">应用联调参数</button>
+                        </div>
+                    </form>
+                </details>
             </aside>
 
             <!-- 3. 主工作区：每个模块为一个独立页面（hash 路由切换） -->
@@ -949,76 +1145,7 @@
 
     <!-- 4. 原生 Modal 对话框集合 -->
 
-    <!-- 4.1 账号登录与自助注册 -->
-    <dialog id="authDialog" class="modal-dialog" aria-labelledby="authDialogTitle">
-        <div class="dialog-head">
-            <h2 id="authDialogTitle">登录平台账号</h2>
-            <button class="btn btn-ghost btn-xs dialog-close-x" type="button" data-close-dialog aria-label="关闭登录弹窗">关闭</button>
-        </div>
-        <div class="dialog-body">
-            <div class="dialog-mode-switch segmented" role="group" aria-label="认证模式切换">
-                <button id="modeLoginBtn" class="btn btn-primary btn-xs" type="button" aria-pressed="true">账号登录</button>
-                <button id="modeRegisterBtn" class="btn btn-outline btn-xs" type="button" aria-pressed="false">车主 / 车队注册</button>
-            </div>
-            <p id="authDialogError" class="inline-alert" role="alert" hidden></p>
-
-            <form id="loginForm" class="dialog-form">
-                <div class="field">
-                    <label for="loginUsername">用户名</label>
-                    <input id="loginUsername" name="username" type="text" autocomplete="username" autocorrect="off" autocapitalize="none" spellcheck="false" minlength="2" maxlength="50" required autofocus>
-                </div>
-                <div class="field">
-                    <label for="loginPassword">密码</label>
-                    <div class="password-wrap">
-                        <input id="loginPassword" name="password" type="password" autocomplete="current-password" minlength="6" maxlength="128" required>
-                        <button id="toggleLoginPwdBtn" class="btn btn-outline btn-xs" type="button" aria-pressed="false" aria-label="显示登录密码">显示</button>
-                    </div>
-                </div>
-                <p class="hint">演示环境下可直接在页面顶栏一键切换车主、车队、运维、结算或管理员身份。</p>
-                <div class="dialog-actions">
-                    <button class="btn btn-outline" type="button" data-close-dialog>取消</button>
-                    <button id="loginSubmitBtn" class="btn btn-primary" type="submit">登录</button>
-                </div>
-            </form>
-
-            <form id="registerForm" class="dialog-form" hidden>
-                <div class="field">
-                    <label for="regUsername">用户名（2~50 位字母、数字、下划线或中文）</label>
-                    <input id="regUsername" name="username" type="text" autocomplete="username" autocorrect="off" autocapitalize="none" spellcheck="false" minlength="2" maxlength="50" required>
-                </div>
-                <div class="field">
-                    <label for="regPhone">11 位手机号</label>
-                    <input id="regPhone" name="phone" type="tel" autocomplete="tel" inputmode="numeric" pattern="1[3-9]\d{9}" placeholder="如：13800138000" required>
-                </div>
-                <div class="field">
-                    <label for="regPassword">设置密码（6~128 位）</label>
-                    <div class="password-wrap">
-                        <input id="regPassword" name="password" type="password" autocomplete="new-password" minlength="6" maxlength="128" required>
-                        <button id="toggleRegPwdBtn" class="btn btn-outline btn-xs" type="button" aria-pressed="false" aria-label="显示注册密码">显示</button>
-                    </div>
-                </div>
-                <div class="field-row">
-                    <div class="field">
-                        <label for="regRole">注册角色</label>
-                        <select id="regRole" name="role">
-                            <option value="driver">普通车主</option>
-                            <option value="fleet">企业车队</option>
-                        </select>
-                    </div>
-                    <div class="field" id="regFleetWrap" hidden>
-                        <label for="regFleetId">所属车队 ID</label>
-                        <input id="regFleetId" name="fleet_id" type="number" min="1" inputmode="numeric" placeholder="车队角色必填">
-                    </div>
-                </div>
-                <div class="dialog-actions">
-                    <button class="btn btn-outline" type="button" data-close-dialog>取消</button>
-                    <button id="registerSubmitBtn" class="btn btn-primary" type="submit">注册账号</button>
-                </div>
-            </form>
-        </div>
-    </dialog>
-
-    <!-- 4.2 扫码开单 -->
+    <!-- 4.1 扫码开单 -->
     <dialog id="startOrderDialog" class="modal-dialog" aria-labelledby="startOrderTitle">
         <div class="dialog-head">
             <h2 id="startOrderTitle">扫码开单</h2>
@@ -1162,6 +1289,6 @@
     <div id="liveAnnouncer" class="visually-hidden" aria-live="polite" aria-atomic="true"></div>
     <div id="toastStack" class="toast-stack" role="region" aria-label="系统操作通知"></div>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20261119b"></script>
 </body>
 </html>
