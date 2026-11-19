@@ -821,5 +821,186 @@ GROUP BY s.station_id, s.station_name
 ORDER BY work_order_count DESC;
 
 -- ============================================================================
--- 【业务线 4】复杂 SQL 双实现与 EXPLAIN ANALYZE 对比占位区
+-- 【业务线 4】用户、车辆与优惠券复杂查询优化对比（负责人：成员 4 / 李海波，共 3 组）
+-- 说明：本文件与线 2/5 一样采用“写法 A 直查原表 / 写法 B 走 02_views.sql 的 RBAC 视图”的
+--       对照口径，每组两种写法的结果集完全一致，可直接用 EXPLAIN ANALYZE 比较扫描行数与耗时。
 -- ============================================================================
+
+-- ----------------------------------------------------------------------------
+-- 第 1 组（4 表关联：fleet_account + user_account + vehicle + coupon_record）
+-- 业务场景：车队管理页——列出正常合作车队下的用车人、绑定车辆数与当前可用券数
+-- ----------------------------------------------------------------------------
+
+-- [实现 A - 低效]：每行两次相关子查询 + 在 role 列上套 LOWER() 使 idx_user_role_status 失效
+EXPLAIN ANALYZE
+SELECT
+    f.fleet_code,
+    f.fleet_name,
+    u.user_id,
+    u.username,
+    u.phone_masked,
+    (SELECT COUNT(*)
+       FROM vehicle AS v
+      WHERE v.user_id = u.user_id
+        AND v.bind_status = 'BOUND')                                   AS vehicle_cnt,
+    (SELECT COUNT(*)
+       FROM coupon_record AS c
+      WHERE c.user_id = u.user_id
+        AND c.status = 'ISSUED'
+        AND c.expire_at >= CURDATE())                                   AS usable_coupon_cnt
+FROM fleet_account AS f
+INNER JOIN user_account AS u
+    ON u.fleet_id = f.fleet_id
+WHERE f.status = 'ACTIVE'
+  AND LOWER(u.role) = 'fleet'
+ORDER BY f.fleet_code ASC, u.user_id ASC;
+
+-- [实现 B - 优化]：派生表单次预聚合后连接，并直接复用视图 v_user_masked_profile
+--                 （视图内已算好 vehicle_cnt / usable_coupon_cnt，且只出脱敏手机号）
+EXPLAIN ANALYZE
+SELECT
+    f.fleet_code,
+    f.fleet_name,
+    p.user_id,
+    p.username,
+    p.phone_masked,
+    COALESCE(v.vehicle_cnt, 0)                                          AS vehicle_cnt,
+    p.usable_coupon_cnt                                                 AS usable_coupon_cnt
+FROM fleet_account AS f
+INNER JOIN v_user_masked_profile AS p
+    ON p.fleet_id = f.fleet_id
+LEFT JOIN (
+    SELECT user_id, COUNT(*) AS vehicle_cnt
+    FROM vehicle
+    WHERE bind_status = 'BOUND'
+    GROUP BY user_id
+) AS v
+    ON v.user_id = p.user_id
+WHERE f.status = 'ACTIVE'
+  AND p.role = 'fleet'
+ORDER BY f.fleet_code ASC, p.user_id ASC;
+
+-- 结论：A 每个输出行要分别回表统计车辆与券（相关子查询按行数线性放大），
+--       且 LOWER(role) 让 idx_user_role_status 无法命中；
+--       B 的券统计在视图内一次性预聚合，车辆统计走 idx_vehicle_user_status，
+--       扫描行数由“行数 × 2 次回表”降为“每个派生表各扫一遍”。
+
+
+-- ----------------------------------------------------------------------------
+-- 第 2 组（4 表关联：coupon_campaign + coupon_record + coupon_redeem_record + station）
+-- 业务场景：运营看板——活动投放量、已核销量、核销率与适用场站
+-- ----------------------------------------------------------------------------
+
+-- [实现 A - 低效]：三个标量子查询各扫一遍券表，且用 DATE_FORMAT(valid_from) 破坏索引
+EXPLAIN ANALYZE
+SELECT
+    cp.campaign_code,
+    cp.campaign_name,
+    s.station_name,
+    cp.face_value,
+    cp.issue_total,
+    (SELECT COUNT(*)
+       FROM coupon_record AS c
+      WHERE c.campaign_id = cp.campaign_id)                            AS issued_cnt,
+    (SELECT COUNT(*)
+       FROM coupon_redeem_record AS d
+       INNER JOIN coupon_record AS c2
+           ON c2.coupon_id = d.coupon_id
+      WHERE c2.campaign_id = cp.campaign_id)                           AS redeemed_cnt,
+    (SELECT ROUND(COUNT(*) / NULLIF(
+                (SELECT COUNT(*) FROM coupon_record AS c3
+                  WHERE c3.campaign_id = cp.campaign_id), 0), 4)
+       FROM coupon_redeem_record AS d2
+       INNER JOIN coupon_record AS c4
+           ON c4.coupon_id = d2.coupon_id
+      WHERE c4.campaign_id = cp.campaign_id)                           AS redeem_rate
+FROM coupon_campaign AS cp
+LEFT JOIN station AS s
+    ON s.station_id = cp.applicable_station_id
+WHERE DATE_FORMAT(cp.valid_from, '%Y') = '2026'
+ORDER BY cp.campaign_id ASC;
+
+-- [实现 B - 优化]：直接查视图 v_coupon_campaign_stat（内部一次预聚合出核销量与核销率），
+--                 有效期改为范围条件以命中 idx_campaign_status_valid
+EXPLAIN ANALYZE
+SELECT
+    campaign_code,
+    campaign_name,
+    station_name,
+    face_value,
+    issue_total,
+    issued_count        AS issued_cnt,
+    redeemed_cnt,
+    redeem_rate
+FROM v_coupon_campaign_stat
+WHERE valid_from >= '2026-01-01'
+  AND valid_from <  '2027-01-01'
+ORDER BY campaign_id ASC;
+
+-- 结论：A 的 4 个标量子查询把券表扫了 4 遍，代价随活动数线性增长；
+--       B 只扫一次 coupon_record + 一次 coupon_redeem_record 派生聚合，
+--       核销率在视图内用 NULLIF 兜零除，避免应用层再补一次除法判断。
+
+
+-- ----------------------------------------------------------------------------
+-- 第 3 组（4 表关联：user_account + charge_order + coupon_redeem_record + coupon_record）
+-- 业务场景：2025 年 3 月车主充电对账——单量、订单金额、券抵扣金额（按金额倒序）
+-- ----------------------------------------------------------------------------
+
+-- [实现 A - 低效]：在 start_time 上套 DATE_FORMAT 导致 idx_order_user 失效，
+--                 并用 OR 连接两个角色值，优化器只能退化为全表扫描后再过滤
+EXPLAIN ANALYZE
+SELECT
+    u.user_id,
+    u.username,
+    u.member_level,
+    COUNT(o.order_id)                                                   AS order_cnt,
+    COALESCE(SUM(o.total_amount), 0.00)                                 AS total_amount,
+    COALESCE(SUM(d.face_value), 0.00)                                   AS coupon_discount
+FROM user_account AS u
+LEFT JOIN charge_order AS o
+    ON o.user_id = u.user_id
+   AND DATE_FORMAT(o.start_time, '%Y-%m') = '2025-03'
+LEFT JOIN coupon_redeem_record AS d
+    ON d.order_id = o.order_id
+   AND d.user_id = u.user_id
+WHERE u.role = 'driver' OR u.role = 'fleet'
+GROUP BY u.user_id, u.username, u.member_level
+ORDER BY total_amount DESC;
+
+-- [实现 B - 优化]：时间改半开区间命中 idx_order_user 的范围扫描，
+--                 角色改 IN 命中 idx_user_role_status，券抵扣先按订单聚合再并入
+EXPLAIN ANALYZE
+SELECT
+    u.user_id,
+    u.username,
+    u.member_level,
+    COALESCE(agg.order_cnt, 0)                                           AS order_cnt,
+    COALESCE(agg.total_amount, 0.00)                                     AS total_amount,
+    COALESCE(agg.coupon_discount, 0.00)                                  AS coupon_discount
+FROM user_account AS u
+LEFT JOIN (
+    SELECT o.user_id,
+           COUNT(*)                            AS order_cnt,
+           SUM(o.total_amount)                 AS total_amount,
+           SUM(COALESCE(d.face_value, 0.00))   AS coupon_discount
+    FROM charge_order AS o
+    LEFT JOIN (
+        SELECT order_id, SUM(face_value) AS face_value
+        FROM coupon_redeem_record
+        GROUP BY order_id
+    ) AS d
+        ON d.order_id = o.order_id
+    WHERE o.start_time >= '2025-03-01'
+      AND o.start_time <  '2025-04-01'
+    GROUP BY o.user_id
+) AS agg
+    ON agg.user_id = u.user_id
+WHERE u.role IN ('driver', 'fleet')
+ORDER BY total_amount DESC;
+
+-- 结论：A 因为 DATE_FORMAT 与 OR 双重破坏索引，只能全表扫 charge_order 再逐行过滤；
+--       B 的 start_time 半开区间走 idx_order_user(user_id, start_time)，
+--       角色 IN 走 idx_user_role_status，券抵扣按订单分组后只保留 1:1 的一行，
+--       聚合行数从“订单数 × 券数”降到“订单数”，在券量上来后差距最明显。
+

@@ -152,9 +152,209 @@ CREATE TABLE IF NOT EXISTS device_status_log (
 
 
 -- ============================================================================
--- 【业务线 4】用户账号、车辆、车队与优惠券（负责人：成员 4 / 李海波，待补充）
--- 说明：须优先于业务线2建表；user_account 字段须与 app/dao/common.py 契约对齐
+-- 【业务线 4】用户、车辆、企业车队与优惠券（负责人：成员 4 / 李海波）
+-- 说明：
+--   1. 本段须优先于业务线 2 建表：charge_order.user_id / vehicle_id 逻辑引用本段；
+--   2. user_account 的账号字段（username / password_hash / role / fleet_id /
+--      phone_cipher / phone_hash / phone_masked / status / failed_login_count /
+--      locked_until / last_login_at）须与 app/dao/common.py 的认证契约严格对齐；
+--   3. 敏感信息三列分离：*_cipher 存 Fernet 密文、*_hash 存 HMAC-SHA256 盲索引
+--      （支撑“按手机号/车牌等值检索”而不落明文）、*_masked 存脱敏展示值（供视图直出）；
+--   4. 优惠券采用“发放记录 + 核销记录”两表分离：发放一行一张券，核销一行一次抵扣，
+--      核销表对 coupon_id 与 order_id 各建唯一索引，从结构上杜绝重复核销与一单多券；
+--   5. 删除顺序按外键依赖倒序排列，保证本脚本可反复重跑。
 -- ============================================================================
+
+DROP TABLE IF EXISTS coupon_redeem_record;
+DROP TABLE IF EXISTS coupon_record;
+DROP TABLE IF EXISTS coupon_campaign;
+DROP TABLE IF EXISTS vehicle;
+DROP TABLE IF EXISTS user_account;
+DROP TABLE IF EXISTS fleet_account;
+
+-- 4.1 企业车队（企业客户）档案表
+CREATE TABLE fleet_account (
+    fleet_id              BIGINT UNSIGNED                            NOT NULL AUTO_INCREMENT COMMENT '车队主键ID',
+    fleet_code            VARCHAR(32)                                NOT NULL                COMMENT '车队编号（如 FL-BJ-001）',
+    fleet_name            VARCHAR(120)                               NOT NULL                COMMENT '企业名称',
+    credit_code           CHAR(18)                                   NULL                    COMMENT '统一社会信用代码',
+    contact_name          VARCHAR(50)                                NOT NULL                COMMENT '企业业务对接人',
+    contact_phone_cipher  VARCHAR(255)                               NOT NULL                COMMENT '对接人手机号密文（Fernet）',
+    contact_phone_hash    CHAR(64)                                   NOT NULL                COMMENT '对接人手机号盲索引（HMAC-SHA256）',
+    contact_phone_masked  VARCHAR(20)                                NULL                    COMMENT '对接人手机号脱敏展示（如 138****5678）',
+    credit_limit          DECIMAL(12, 2)                             NOT NULL DEFAULT 0.00   COMMENT '月度授信额度（元）',
+    credit_used           DECIMAL(12, 2)                             NOT NULL DEFAULT 0.00   COMMENT '本月已用授信额度（元）',
+    status                ENUM('ACTIVE', 'SUSPENDED', 'CLOSED')      NOT NULL DEFAULT 'ACTIVE' COMMENT '合作状态：ACTIVE-正常, SUSPENDED-暂停, CLOSED-已终止',
+    created_at            DATETIME                                   NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+    updated_at            DATETIME                                   NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
+    PRIMARY KEY (fleet_id),
+    UNIQUE KEY uk_fleet_code (fleet_code),
+    KEY idx_fleet_status (status),
+    CONSTRAINT chk_fleet_credit CHECK (credit_limit >= 0.00 AND credit_used >= 0.00),
+    CONSTRAINT chk_fleet_credit_used CHECK (credit_used <= credit_limit)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='业务线4-企业车队档案表';
+
+-- 4.2 平台账号表（5 类角色统一账号；手机号加密存储 + 盲索引 + 脱敏展示）
+CREATE TABLE user_account (
+    user_id              BIGINT UNSIGNED                                     NOT NULL AUTO_INCREMENT COMMENT '用户主键ID',
+    username             VARCHAR(50)                                         NOT NULL                COMMENT '登录用户名',
+    password_hash        VARCHAR(255)                                        NOT NULL                COMMENT 'PBKDF2-SHA256 加盐哈希串',
+    role                 ENUM('driver', 'ops', 'settlement', 'fleet', 'admin') NOT NULL DEFAULT 'driver' COMMENT 'RBAC 角色（与 app/auth.py RoleEnum 对齐）',
+    fleet_id             BIGINT UNSIGNED                                     NULL                    COMMENT '所属企业车队ID（仅 fleet 角色非空）',
+    phone_cipher         VARCHAR(255)                                        NOT NULL                COMMENT '手机号密文（Fernet 对称加密）',
+    phone_hash           CHAR(64)                                            NOT NULL                COMMENT '手机号盲索引（HMAC-SHA256，供等值检索与唯一性校验）',
+    phone_masked         VARCHAR(20)                                         NULL                    COMMENT '手机号脱敏展示（如 138****5678）',
+    realname_status      ENUM('UNVERIFIED', 'PENDING', 'VERIFIED', 'REJECTED') NOT NULL DEFAULT 'UNVERIFIED' COMMENT '实名认证状态',
+    realname_verified_at DATETIME                                            NULL                    COMMENT '实名认证通过时间',
+    register_channel     ENUM('APP', 'MINI_PROGRAM', 'WEB', 'OFFLINE', 'FLEET_IMPORT') NOT NULL DEFAULT 'APP' COMMENT '注册渠道',
+    member_level         ENUM('NORMAL', 'SILVER', 'GOLD', 'PLATINUM')        NOT NULL DEFAULT 'NORMAL' COMMENT '会员等级',
+    balance              DECIMAL(12, 2)                                      NOT NULL DEFAULT 0.00   COMMENT '账户余额（元，禁止为负）',
+    status               ENUM('ACTIVE', 'FROZEN', 'DISABLED')                NOT NULL DEFAULT 'ACTIVE' COMMENT '账号状态：ACTIVE-正常, FROZEN-冻结, DISABLED-禁用',
+    failed_login_count   INT UNSIGNED                                        NOT NULL DEFAULT 0      COMMENT '连续登录失败次数（达阈值锁定）',
+    locked_until         DATETIME                                            NULL                    COMMENT '账号锁定截止时间（为空表示未锁定）',
+    last_login_at        DATETIME                                            NULL                    COMMENT '最近一次登录成功时间',
+    created_at           DATETIME                                            NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '注册时间',
+    updated_at           DATETIME                                            NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
+    PRIMARY KEY (user_id),
+    UNIQUE KEY uk_user_username (username),
+    UNIQUE KEY uk_user_phone_hash (phone_hash),
+    KEY idx_user_role_status (role, status),
+    KEY idx_user_fleet (fleet_id),
+    KEY idx_user_member (member_level, balance),
+    CONSTRAINT fk_user_fleet
+        FOREIGN KEY (fleet_id) REFERENCES fleet_account (fleet_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT,
+    CONSTRAINT chk_user_balance CHECK (balance >= 0.00),
+    CONSTRAINT chk_user_fleet_role CHECK (role <> 'fleet' OR fleet_id IS NOT NULL),
+    CONSTRAINT chk_user_failed_count CHECK (failed_login_count >= 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='业务线4-平台账号表';
+
+-- 4.3 车辆表（一个用户可绑定多辆车；车牌盲索引全局唯一 → 同一车牌同刻只能归属一个用户）
+CREATE TABLE vehicle (
+    vehicle_id           BIGINT UNSIGNED                             NOT NULL AUTO_INCREMENT COMMENT '车辆主键ID',
+    user_id              BIGINT UNSIGNED                             NULL                    COMMENT '当前归属车主ID（未绑定为 NULL）',
+    fleet_id             BIGINT UNSIGNED                             NULL                    COMMENT '所属企业车队ID（企业用车非空）',
+    plate_cipher         VARCHAR(255)                                NOT NULL                COMMENT '车牌号密文（Fernet）',
+    plate_hash           CHAR(64)                                    NOT NULL                COMMENT '车牌号盲索引（HMAC-SHA256，全局唯一 = 一车一主）',
+    plate_masked         VARCHAR(20)                                 NOT NULL                COMMENT '车牌号脱敏展示（如 京A***15）',
+    plate_color          ENUM('GREEN', 'BLUE', 'YELLOW', 'WHITE', 'BLACK') NOT NULL DEFAULT 'GREEN' COMMENT '号牌颜色（新能源多为 GREEN）',
+    vehicle_model        VARCHAR(64)                                 NOT NULL                COMMENT '车型（如 比亚迪 汉 EV）',
+    battery_capacity_kwh DECIMAL(8, 2)                               NOT NULL                COMMENT '电池容量（kWh）',
+    max_charge_power     DECIMAL(8, 2)                               NOT NULL                COMMENT '车辆最大充电功率（kW）',
+    supports_fast_charge TINYINT(1)                                  NOT NULL DEFAULT 1      COMMENT '是否支持直流快充：1-是, 0-否',
+    bind_status          ENUM('BOUND', 'UNBOUND', 'DISABLED')        NOT NULL DEFAULT 'BOUND' COMMENT '绑定状态：BOUND-已绑定, UNBOUND-已解绑, DISABLED-停用',
+    bound_at             DATETIME                                    NULL                    COMMENT '最近一次绑定时间',
+    created_at           DATETIME                                    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+    updated_at           DATETIME                                    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
+    PRIMARY KEY (vehicle_id),
+    UNIQUE KEY uk_vehicle_plate_hash (plate_hash),
+    KEY idx_vehicle_user_status (user_id, bind_status),
+    KEY idx_vehicle_fleet (fleet_id),
+    CONSTRAINT fk_vehicle_user
+        FOREIGN KEY (user_id) REFERENCES user_account (user_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT,
+    CONSTRAINT fk_vehicle_fleet
+        FOREIGN KEY (fleet_id) REFERENCES fleet_account (fleet_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT,
+    CONSTRAINT chk_vehicle_battery CHECK (battery_capacity_kwh > 0.00),
+    CONSTRAINT chk_vehicle_power CHECK (max_charge_power > 0.00 AND max_charge_power <= 500.00),
+    CONSTRAINT chk_vehicle_fast_charge CHECK (supports_fast_charge = 0 OR max_charge_power >= 30.00),
+    CONSTRAINT chk_vehicle_bound_owner CHECK (bind_status <> 'BOUND' OR user_id IS NOT NULL)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='业务线4-车辆表';
+
+-- 4.4 优惠活动表（运营人员按人群/场站/时段定向投放券）
+CREATE TABLE coupon_campaign (
+    campaign_id           BIGINT UNSIGNED                          NOT NULL AUTO_INCREMENT COMMENT '活动主键ID',
+    campaign_code         VARCHAR(32)                              NOT NULL                COMMENT '活动编号（如 CP-202611-NEW）',
+    campaign_name         VARCHAR(120)                             NOT NULL                COMMENT '活动名称',
+    coupon_kind           ENUM('CASH', 'DISCOUNT', 'SERVICE_FEE_FREE') NOT NULL DEFAULT 'CASH' COMMENT '券类型：CASH-立减券, DISCOUNT-折扣券, SERVICE_FEE_FREE-服务费减免券',
+    face_value            DECIMAL(8, 2)                            NOT NULL                COMMENT '券面额（元，折扣券存折扣权益折算金额）',
+    threshold_amount      DECIMAL(8, 2)                            NOT NULL DEFAULT 0.00   COMMENT '使用门槛：订单满该金额方可用（0 表示无门槛）',
+    applicable_station_id BIGINT UNSIGNED                          NULL                    COMMENT '适用场站ID（为空表示全场站通用）',
+    valid_from            DATE                                     NOT NULL                COMMENT '活动生效日期',
+    valid_to              DATE                                     NOT NULL                COMMENT '活动失效日期',
+    issue_total           INT UNSIGNED                             NOT NULL                COMMENT '计划发放总量',
+    issued_count          INT UNSIGNED                             NOT NULL DEFAULT 0      COMMENT '已发放数量（由触发器累加）',
+    per_user_limit        TINYINT UNSIGNED                         NOT NULL DEFAULT 1      COMMENT '每人限领张数（1~20）',
+    redeem_rule           VARCHAR(255)                             NOT NULL DEFAULT '单笔订单限用一张，不可与其他优惠叠加' COMMENT '核销规则说明',
+    status                ENUM('DRAFT', 'ACTIVE', 'PAUSED', 'ENDED') NOT NULL DEFAULT 'DRAFT' COMMENT '活动状态：DRAFT-草稿, ACTIVE-投放中, PAUSED-暂停, ENDED-已结束',
+    created_by            BIGINT UNSIGNED                          NULL                    COMMENT '创建该活动的运营管理员 user_id',
+    created_at            DATETIME                                 NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+    updated_at            DATETIME                                 NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
+    PRIMARY KEY (campaign_id),
+    UNIQUE KEY uk_campaign_code (campaign_code),
+    KEY idx_campaign_status_valid (status, valid_from, valid_to),
+    KEY idx_campaign_station (applicable_station_id),
+    CONSTRAINT fk_campaign_station
+        FOREIGN KEY (applicable_station_id) REFERENCES station (station_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT,
+    CONSTRAINT fk_campaign_creator
+        FOREIGN KEY (created_by) REFERENCES user_account (user_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT,
+    CONSTRAINT chk_campaign_face CHECK (face_value > 0.00),
+    CONSTRAINT chk_campaign_threshold CHECK (threshold_amount >= 0.00),
+    CONSTRAINT chk_campaign_valid CHECK (valid_to >= valid_from),
+    CONSTRAINT chk_campaign_quota CHECK (issue_total > 0 AND issued_count <= issue_total),
+    CONSTRAINT chk_campaign_per_user CHECK (per_user_limit BETWEEN 1 AND 20)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='业务线4-优惠活动表';
+
+-- 4.5 优惠券发放记录表（一张券一行，面额与门槛为发放时快照，活动后续调价不影响已发券）
+CREATE TABLE coupon_record (
+    coupon_id        BIGINT UNSIGNED                                        NOT NULL AUTO_INCREMENT COMMENT '券主键ID',
+    coupon_no        VARCHAR(32)                                            NOT NULL                COMMENT '券码（唯一）',
+    campaign_id      BIGINT UNSIGNED                                        NOT NULL                COMMENT '所属优惠活动ID',
+    user_id          BIGINT UNSIGNED                                        NOT NULL                COMMENT '持券人ID',
+    face_value       DECIMAL(8, 2)                                          NOT NULL                COMMENT '发放时券面额快照（元）',
+    threshold_amount DECIMAL(8, 2)                                          NOT NULL DEFAULT 0.00   COMMENT '发放时使用门槛快照（元）',
+    issue_channel    ENUM('NEW_USER_PACK', 'OPS_GRANT', 'ACTIVITY', 'COMPENSATION') NOT NULL DEFAULT 'OPS_GRANT' COMMENT '发放渠道',
+    issued_by        BIGINT UNSIGNED                                        NULL                    COMMENT '发券运营人员 user_id（系统/活动发放为空）',
+    issued_at        DATETIME                                               NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '发放时间',
+    expire_at        DATE                                                   NOT NULL                COMMENT '券到期日（核销时校验未过期）',
+    status           ENUM('ISSUED', 'REDEEMED', 'EXPIRED', 'VOID')           NOT NULL DEFAULT 'ISSUED' COMMENT '券状态：ISSUED-待使用, REDEEMED-已核销, EXPIRED-已过期, VOID-已作废',
+    created_at       DATETIME                                               NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
+    updated_at       DATETIME                                               NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
+    PRIMARY KEY (coupon_id),
+    UNIQUE KEY uk_coupon_no (coupon_no),
+    KEY idx_coupon_user_status (user_id, status, expire_at),
+    KEY idx_coupon_campaign (campaign_id, status),
+    CONSTRAINT fk_coupon_campaign
+        FOREIGN KEY (campaign_id) REFERENCES coupon_campaign (campaign_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT,
+    CONSTRAINT fk_coupon_user
+        FOREIGN KEY (user_id) REFERENCES user_account (user_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT,
+    CONSTRAINT chk_coupon_face CHECK (face_value > 0.00),
+    CONSTRAINT chk_coupon_threshold CHECK (threshold_amount >= 0.00)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='业务线4-优惠券发放记录表';
+
+-- 4.6 优惠券核销记录表（核销与订单 1:1：uk_redeem_order 保证一单一券，uk_redeem_coupon 保证一券一销）
+-- 说明：order_id 指向业务线 2 的 charge_order，属跨线逻辑外键（与 repair_order.maintainer_id 同一口径），
+--       不建物理外键以避免 01/02 两个分支的建表与删除顺序耦合。
+CREATE TABLE coupon_redeem_record (
+    redeem_id    BIGINT UNSIGNED   NOT NULL AUTO_INCREMENT COMMENT '核销主键ID',
+    coupon_id    BIGINT UNSIGNED   NOT NULL                COMMENT '被核销的券ID（一券一销）',
+    order_id     BIGINT            NOT NULL                COMMENT '核销对应的充电订单ID（逻辑引用 charge_order）',
+    user_id      BIGINT UNSIGNED   NOT NULL                COMMENT '核销人ID',
+    station_id   BIGINT UNSIGNED   NOT NULL                COMMENT '核销场站ID（校验活动适用场站）',
+    face_value   DECIMAL(8, 2)     NOT NULL                COMMENT '实际抵扣金额（元）',
+    order_amount DECIMAL(10, 2)    NOT NULL                COMMENT '核销时订单金额（用于门槛校验留痕）',
+    redeemed_at  DATETIME          NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '核销时间',
+    PRIMARY KEY (redeem_id),
+    UNIQUE KEY uk_redeem_coupon (coupon_id),
+    UNIQUE KEY uk_redeem_order (order_id),
+    KEY idx_redeem_user (user_id, redeemed_at),
+    KEY idx_redeem_station (station_id, redeemed_at),
+    CONSTRAINT fk_redeem_coupon
+        FOREIGN KEY (coupon_id) REFERENCES coupon_record (coupon_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT,
+    CONSTRAINT fk_redeem_user
+        FOREIGN KEY (user_id) REFERENCES user_account (user_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT,
+    CONSTRAINT fk_redeem_station
+        FOREIGN KEY (station_id) REFERENCES station (station_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT,
+    CONSTRAINT chk_redeem_face CHECK (face_value > 0.00 AND face_value <= order_amount)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='业务线4-优惠券核销记录表';
 
 
 -- ============================================================================

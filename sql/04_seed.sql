@@ -504,5 +504,411 @@ ON DUPLICATE KEY UPDATE
     result         = nv.result;
 
 -- ============================================================================
--- 【业务线 4】测试数据占位区（各负责成员追加，保证每表 >= 20 条）
+-- 【业务线 4】用户、车辆、企业车队与优惠券测试数据（负责人：成员 4 / 李海波）
+-- 数据规模：fleet_account(5) / user_account(32) / vehicle(25) / coupon_campaign(6)
+--           / coupon_record(24) / coupon_redeem_record(10)
+-- 说明：
+--   1. 插入顺序严格按外键依赖：fleet_account -> user_account -> vehicle ->
+--      coupon_campaign -> coupon_record -> coupon_redeem_record；
+--   2. 演示账号统一口令 Demo@123456（PBKDF2-SHA256，迭代 100000 次），
+--      32 个账号轮换使用 4 个真实哈希串，可直接 POST /api/auth/login 登录；
+--   3. 敏感字段三列分离：phone_cipher / plate_cipher 为 'SEED_FERNET::<明文>' 占位密文，
+--      真实写入路径走 app/dao/common.py 的 encrypt_sensitive（Fernet 对称加密）；
+--      phone_hash / plate_hash 为 SHA2(CONCAT('seed:', 明文), 256) 占位盲索引，
+--      真实写入路径走 hash_sensitive_lookup（HMAC-SHA256，密钥取自 SECRET_KEY），
+--      故演示库按盲索引等值检索与线上口径不同，重置真实数据请统一走 DAO 写入；
+--      phone_masked / plate_masked 为与明文严格对应的手写脱敏展示值；
+--      8 位新能源号牌按“保留前 2 位与后 2 位”脱敏，与 DDL 注释示例同形；
+--   4. 9001~9020 与业务线 2 的充电订单车主严格对齐（charge_order.user_id = 9000 + n、
+--      vehicle_id = 5000 + n），5001~5020 为对应车辆；2~5 是业务线 3 维修工单的
+--      maintainer_id；1 为平台管理员，6/7 为客服结算专员，9101~9105 绑定车队 1~5；
+--   5. 核销记录不写死订单号：用 INSERT ... SELECT 从 charge_order 实时取 status='PAID'
+--      的订单，逐条校验“券持有人 = 订单车主 + 场站取订单场站 + 抵扣额 = LEAST(券面额, 订单金额)”；
+--      因此本段必须排在业务线 2 之后执行（01 中跨线外键默认注释，未启用物理外键）；
+--   6. 发券/核销前临时置 @skip_coupon_guard = 1（理由见 03 脚本业务线 4 注释：
+--      可批量造出 PAUSED/ENDED 活动券、过期券与作废券），核销完成后重置为 NULL；
+--      跳过发券触发器后 issued_count 不再自动累加，故按实际发券张数回填且不超过计划量；
+--   7. 全部语句采用 INSERT ... AS nv ON DUPLICATE KEY UPDATE，保证脚本可反复重跑复位。
+-- ============================================================================
+
+-- 1. 企业车队档案表（5 条：4 家 ACTIVE 正常合作 + 1 家 SUSPENDED 暂停，授信均为 20 万级）
+INSERT INTO fleet_account (
+    fleet_id, fleet_code, fleet_name, credit_code, contact_name,
+    contact_phone_cipher, contact_phone_hash, contact_phone_masked,
+    credit_limit, credit_used, status
+) VALUES
+(1, 'FL-BJ-001', '北京公交集团电动出行分公司',   '91110108MA01F0011A', '李建国',
+ CONCAT('SEED_FERNET::', '13800000801'), SHA2(CONCAT('seed:', '13800000801'), 256), '138****0801',
+ 200000.00, 132480.50, 'ACTIVE'),
+(2, 'FL-BJ-002', '滴滴出行企业服务（北京）有限公司', '91110105MA01F0022B', '王海涛',
+ CONCAT('SEED_FERNET::', '13800000802'), SHA2(CONCAT('seed:', '13800000802'), 256), '138****0802',
+ 180000.00, 96500.00, 'ACTIVE'),
+(3, 'FL-BJ-003', '京东物流华北新能源车队',       '91110113MA01F0033C', '张春燕',
+ CONCAT('SEED_FERNET::', '13800000803'), SHA2(CONCAT('seed:', '13800000803'), 256), '138****0803',
+ 260000.00, 204300.00, 'ACTIVE'),
+(4, 'FL-BJ-004', '顺丰速运北京新能源运输队',     '91110112MA01F0044D', '刘志强',
+ CONCAT('SEED_FERNET::', '13800000804'), SHA2(CONCAT('seed:', '13800000804'), 256), '138****0804',
+ 150000.00, 48200.00, 'ACTIVE'),
+(5, 'FL-BJ-005', '首汽约车北京运营中心',         '91110106MA01F0055E', '陈晓东',
+ CONCAT('SEED_FERNET::', '13800000805'), SHA2(CONCAT('seed:', '13800000805'), 256), '138****0805',
+ 220000.00, 176800.00, 'SUSPENDED')
+AS nv
+ON DUPLICATE KEY UPDATE
+    fleet_code           = nv.fleet_code,
+    fleet_name           = nv.fleet_name,
+    credit_code          = nv.credit_code,
+    contact_name         = nv.contact_name,
+    contact_phone_cipher = nv.contact_phone_cipher,
+    contact_phone_hash   = nv.contact_phone_hash,
+    contact_phone_masked = nv.contact_phone_masked,
+    credit_limit         = nv.credit_limit,
+    credit_used          = nv.credit_used,
+    status               = nv.status;
+
+-- 2. 平台账号表（32 条：1 admin + 4 ops + 2 settlement + 20 driver + 5 fleet）
+--    1=admin（平台运营管理员）；2~5=ops（业务线 3 维修工单 maintainer_id）；
+--    6/7=settlement（客服与结算）；9001~9020=driver（业务线 2 订单车主）；
+--    9101~9105=fleet（企业用车人，fleet_id 依次为 1~5，满足 chk_user_fleet_role）
+INSERT INTO user_account (
+    user_id, username, password_hash, role, fleet_id,
+    phone_cipher, phone_hash, phone_masked,
+    realname_status, realname_verified_at, register_channel, member_level,
+    balance, status, failed_login_count, locked_until, last_login_at, created_at
+) VALUES
+(1, 'admin', 'pbkdf2_sha256$100000$00d3e2451f81d2171fdb590e75b52873$a0d8f72605c427fe93448a0e6dd2156d0557f9e106a74e16ae0eb57a9914eda4', 'admin', NULL,
+ CONCAT('SEED_FERNET::', '13800000001'), SHA2(CONCAT('seed:', '13800000001'), 256), '138****0001',
+ 'VERIFIED', '2025-09-01 10:30:00', 'OFFLINE', 'PLATINUM', 0.00, 'ACTIVE', 0, NULL, '2026-11-19 08:30:00', '2025-09-01 09:00:00'),
+(2, 'wang_ops', 'pbkdf2_sha256$100000$0ef0755bbe23ae477dd46ed6a2b3fd48$b77fd9afd84e370ef8a2d6d959127b7ea70d134b4d028be97d4f2867db315a2b', 'ops', NULL,
+ CONCAT('SEED_FERNET::', '13800000002'), SHA2(CONCAT('seed:', '13800000002'), 256), '138****0002',
+ 'VERIFIED', '2025-09-05 09:20:00', 'OFFLINE', 'GOLD', 0.00, 'ACTIVE', 0, NULL, '2026-11-19 07:50:00', '2025-09-05 09:00:00'),
+(3, 'liu_ops', 'pbkdf2_sha256$100000$fe887849a41bbc74aea9a610b61bf34b$6180e571270c27c54f8bc750aa1541c937b631657eae5df704d1e9e3c68dd500', 'ops', NULL,
+ CONCAT('SEED_FERNET::', '13800000003'), SHA2(CONCAT('seed:', '13800000003'), 256), '138****0003',
+ 'VERIFIED', '2025-09-06 14:10:00', 'OFFLINE', 'GOLD', 0.00, 'ACTIVE', 0, NULL, '2026-11-18 18:20:00', '2025-09-06 14:00:00'),
+(4, 'chen_ops', 'pbkdf2_sha256$100000$85e9b2f27eea77b026c8e551e99f4d10$3cc93153f43f40edb3b9ee01ad460078d5cd2b45df1b7f84da72c0078d678076', 'ops', NULL,
+ CONCAT('SEED_FERNET::', '13800000004'), SHA2(CONCAT('seed:', '13800000004'), 256), '138****0004',
+ 'VERIFIED', '2025-09-12 10:40:00', 'OFFLINE', 'SILVER', 0.00, 'ACTIVE', 0, NULL, '2026-11-19 06:40:00', '2025-09-12 10:30:00'),
+(5, 'zhao_ops', 'pbkdf2_sha256$100000$00d3e2451f81d2171fdb590e75b52873$a0d8f72605c427fe93448a0e6dd2156d0557f9e106a74e16ae0eb57a9914eda4', 'ops', NULL,
+ CONCAT('SEED_FERNET::', '13800000005'), SHA2(CONCAT('seed:', '13800000005'), 256), '138****0005',
+ 'VERIFIED', '2025-10-08 09:10:00', 'OFFLINE', 'SILVER', 0.00, 'ACTIVE', 0, NULL, '2026-11-17 20:05:00', '2025-10-08 09:00:00'),
+(6, 'zhang_settle', 'pbkdf2_sha256$100000$0ef0755bbe23ae477dd46ed6a2b3fd48$b77fd9afd84e370ef8a2d6d959127b7ea70d134b4d028be97d4f2867db315a2b', 'settlement', NULL,
+ CONCAT('SEED_FERNET::', '13800000006'), SHA2(CONCAT('seed:', '13800000006'), 256), '138****0006',
+ 'VERIFIED', '2025-09-20 11:00:00', 'OFFLINE', 'GOLD', 0.00, 'ACTIVE', 0, NULL, '2026-11-19 09:05:00', '2025-09-20 10:50:00'),
+(7, 'sun_settle', 'pbkdf2_sha256$100000$fe887849a41bbc74aea9a610b61bf34b$6180e571270c27c54f8bc750aa1541c937b631657eae5df704d1e9e3c68dd500', 'settlement', NULL,
+ CONCAT('SEED_FERNET::', '13800000007'), SHA2(CONCAT('seed:', '13800000007'), 256), '138****0007',
+ 'VERIFIED', '2025-09-22 15:30:00', 'OFFLINE', 'GOLD', 0.00, 'ACTIVE', 0, NULL, '2026-11-18 17:45:00', '2025-09-22 15:20:00'),
+(9001, 'driver_9001', 'pbkdf2_sha256$100000$85e9b2f27eea77b026c8e551e99f4d10$3cc93153f43f40edb3b9ee01ad460078d5cd2b45df1b7f84da72c0078d678076', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009001'), SHA2(CONCAT('seed:', '13800009001'), 256), '138****9001',
+ 'VERIFIED', '2025-10-12 10:00:00', 'APP', 'SILVER', 128.50, 'ACTIVE', 0, NULL, '2026-11-19 07:30:00', '2025-10-12 09:15:00'),
+(9002, 'driver_9002', 'pbkdf2_sha256$100000$00d3e2451f81d2171fdb590e75b52873$a0d8f72605c427fe93448a0e6dd2156d0557f9e106a74e16ae0eb57a9914eda4', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009002'), SHA2(CONCAT('seed:', '13800009002'), 256), '138****9002',
+ 'VERIFIED', '2025-10-18 21:00:00', 'MINI_PROGRAM', 'NORMAL', 46.00, 'ACTIVE', 0, NULL, '2026-11-18 21:10:00', '2025-10-18 20:30:00'),
+(9003, 'driver_9003', 'pbkdf2_sha256$100000$0ef0755bbe23ae477dd46ed6a2b3fd48$b77fd9afd84e370ef8a2d6d959127b7ea70d134b4d028be97d4f2867db315a2b', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009003'), SHA2(CONCAT('seed:', '13800009003'), 256), '138****9003',
+ 'VERIFIED', '2025-11-02 08:30:00', 'APP', 'NORMAL', 0.00, 'ACTIVE', 0, NULL, '2026-11-16 12:20:00', '2025-11-02 08:05:00'),
+(9004, 'driver_9004', 'pbkdf2_sha256$100000$fe887849a41bbc74aea9a610b61bf34b$6180e571270c27c54f8bc750aa1541c937b631657eae5df704d1e9e3c68dd500', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009004'), SHA2(CONCAT('seed:', '13800009004'), 256), '138****9004',
+ 'PENDING', NULL, 'MINI_PROGRAM', 'NORMAL', 200.00, 'ACTIVE', 0, NULL, '2026-11-15 19:00:00', '2025-11-21 19:40:00'),
+(9005, 'driver_9005', 'pbkdf2_sha256$100000$85e9b2f27eea77b026c8e551e99f4d10$3cc93153f43f40edb3b9ee01ad460078d5cd2b45df1b7f84da72c0078d678076', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009005'), SHA2(CONCAT('seed:', '13800009005'), 256), '138****9005',
+ 'VERIFIED', '2025-12-03 12:40:00', 'WEB', 'NORMAL', 0.00, 'ACTIVE', 0, NULL, '2026-11-14 08:15:00', '2025-12-03 12:10:00'),
+(9006, 'driver_9006', 'pbkdf2_sha256$100000$00d3e2451f81d2171fdb590e75b52873$a0d8f72605c427fe93448a0e6dd2156d0557f9e106a74e16ae0eb57a9914eda4', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009006'), SHA2(CONCAT('seed:', '13800009006'), 256), '138****9006',
+ 'VERIFIED', '2026-01-15 07:50:00', 'APP', 'SILVER', 88.80, 'ACTIVE', 0, NULL, '2026-11-19 06:55:00', '2026-01-15 07:20:00'),
+(9007, 'driver_9007', 'pbkdf2_sha256$100000$0ef0755bbe23ae477dd46ed6a2b3fd48$b77fd9afd84e370ef8a2d6d959127b7ea70d134b4d028be97d4f2867db315a2b', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009007'), SHA2(CONCAT('seed:', '13800009007'), 256), '138****9007',
+ 'VERIFIED', '2026-01-28 21:30:00', 'APP', 'NORMAL', 30.00, 'ACTIVE', 0, NULL, '2026-11-18 19:40:00', '2026-01-28 21:05:00'),
+(9008, 'driver_9008', 'pbkdf2_sha256$100000$fe887849a41bbc74aea9a610b61bf34b$6180e571270c27c54f8bc750aa1541c937b631657eae5df704d1e9e3c68dd500', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009008'), SHA2(CONCAT('seed:', '13800009008'), 256), '138****9008',
+ 'VERIFIED', '2026-02-11 11:10:00', 'MINI_PROGRAM', 'NORMAL', 0.00, 'ACTIVE', 0, NULL, '2026-11-16 17:30:00', '2026-02-11 10:45:00'),
+(9009, 'driver_9009', 'pbkdf2_sha256$100000$85e9b2f27eea77b026c8e551e99f4d10$3cc93153f43f40edb3b9ee01ad460078d5cd2b45df1b7f84da72c0078d678076', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009009'), SHA2(CONCAT('seed:', '13800009009'), 256), '138****9009',
+ 'VERIFIED', '2026-02-26 19:00:00', 'APP', 'NORMAL', 66.60, 'ACTIVE', 1, NULL, '2026-11-13 20:10:00', '2026-02-26 18:30:00'),
+(9010, 'driver_9010', 'pbkdf2_sha256$100000$00d3e2451f81d2171fdb590e75b52873$a0d8f72605c427fe93448a0e6dd2156d0557f9e106a74e16ae0eb57a9914eda4', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009010'), SHA2(CONCAT('seed:', '13800009010'), 256), '138****9010',
+ 'VERIFIED', '2026-03-08 09:30:00', 'WEB', 'GOLD', 520.00, 'ACTIVE', 0, NULL, '2026-11-19 09:20:00', '2026-03-08 09:00:00'),
+(9011, 'driver_9011', 'pbkdf2_sha256$100000$0ef0755bbe23ae477dd46ed6a2b3fd48$b77fd9afd84e370ef8a2d6d959127b7ea70d134b4d028be97d4f2867db315a2b', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009011'), SHA2(CONCAT('seed:', '13800009011'), 256), '138****9011',
+ 'VERIFIED', '2026-03-19 13:50:00', 'APP', 'SILVER', 150.00, 'ACTIVE', 0, NULL, '2026-11-17 18:00:00', '2026-03-19 13:25:00'),
+(9012, 'driver_9012', 'pbkdf2_sha256$100000$fe887849a41bbc74aea9a610b61bf34b$6180e571270c27c54f8bc750aa1541c937b631657eae5df704d1e9e3c68dd500', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009012'), SHA2(CONCAT('seed:', '13800009012'), 256), '138****9012',
+ 'VERIFIED', '2026-04-02 07:20:00', 'MINI_PROGRAM', 'NORMAL', 0.00, 'ACTIVE', 0, NULL, '2026-11-15 07:40:00', '2026-04-02 06:50:00'),
+(9013, 'driver_9013', 'pbkdf2_sha256$100000$85e9b2f27eea77b026c8e551e99f4d10$3cc93153f43f40edb3b9ee01ad460078d5cd2b45df1b7f84da72c0078d678076', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009013'), SHA2(CONCAT('seed:', '13800009013'), 256), '138****9013',
+ 'VERIFIED', '2026-04-17 22:40:00', 'APP', 'NORMAL', 75.50, 'ACTIVE', 0, NULL, '2026-11-16 22:30:00', '2026-04-17 22:10:00'),
+(9014, 'driver_9014', 'pbkdf2_sha256$100000$00d3e2451f81d2171fdb590e75b52873$a0d8f72605c427fe93448a0e6dd2156d0557f9e106a74e16ae0eb57a9914eda4', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009014'), SHA2(CONCAT('seed:', '13800009014'), 256), '138****9014',
+ 'VERIFIED', '2026-05-05 17:00:00', 'APP', 'NORMAL', 12.00, 'ACTIVE', 0, NULL, '2026-11-12 16:50:00', '2026-05-05 16:35:00'),
+(9015, 'driver_9015', 'pbkdf2_sha256$100000$0ef0755bbe23ae477dd46ed6a2b3fd48$b77fd9afd84e370ef8a2d6d959127b7ea70d134b4d028be97d4f2867db315a2b', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009015'), SHA2(CONCAT('seed:', '13800009015'), 256), '138****9015',
+ 'VERIFIED', '2026-05-23 11:40:00', 'MINI_PROGRAM', 'SILVER', 300.00, 'ACTIVE', 0, NULL, '2026-11-18 11:20:00', '2026-05-23 11:15:00'),
+(9016, 'driver_9016', 'pbkdf2_sha256$100000$fe887849a41bbc74aea9a610b61bf34b$6180e571270c27c54f8bc750aa1541c937b631657eae5df704d1e9e3c68dd500', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009016'), SHA2(CONCAT('seed:', '13800009016'), 256), '138****9016',
+ 'VERIFIED', '2026-06-09 09:10:00', 'APP', 'NORMAL', 0.00, 'ACTIVE', 0, NULL, '2026-11-16 09:05:00', '2026-06-09 08:40:00'),
+(9017, 'driver_9017', 'pbkdf2_sha256$100000$85e9b2f27eea77b026c8e551e99f4d10$3cc93153f43f40edb3b9ee01ad460078d5cd2b45df1b7f84da72c0078d678076', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009017'), SHA2(CONCAT('seed:', '13800009017'), 256), '138****9017',
+ 'VERIFIED', '2026-06-27 19:50:00', 'WEB', 'NORMAL', 45.00, 'ACTIVE', 0, NULL, '2026-11-14 19:30:00', '2026-06-27 19:20:00'),
+(9018, 'driver_9018', 'pbkdf2_sha256$100000$00d3e2451f81d2171fdb590e75b52873$a0d8f72605c427fe93448a0e6dd2156d0557f9e106a74e16ae0eb57a9914eda4', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009018'), SHA2(CONCAT('seed:', '13800009018'), 256), '138****9018',
+ 'VERIFIED', '2026-07-14 10:30:00', 'APP', 'SILVER', 180.00, 'ACTIVE', 0, NULL, '2026-11-19 08:10:00', '2026-07-14 10:05:00'),
+(9019, 'driver_9019', 'pbkdf2_sha256$100000$0ef0755bbe23ae477dd46ed6a2b3fd48$b77fd9afd84e370ef8a2d6d959127b7ea70d134b4d028be97d4f2867db315a2b', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009019'), SHA2(CONCAT('seed:', '13800009019'), 256), '138****9019',
+ 'UNVERIFIED', NULL, 'MINI_PROGRAM', 'NORMAL', 0.00, 'ACTIVE', 0, NULL, '2026-11-11 15:20:00', '2026-08-01 15:50:00'),
+(9020, 'driver_9020', 'pbkdf2_sha256$100000$fe887849a41bbc74aea9a610b61bf34b$6180e571270c27c54f8bc750aa1541c937b631657eae5df704d1e9e3c68dd500', 'driver', NULL,
+ CONCAT('SEED_FERNET::', '13800009020'), SHA2(CONCAT('seed:', '13800009020'), 256), '138****9020',
+ 'VERIFIED', '2026-10-10 10:00:00', 'APP', 'NORMAL', 58.00, 'ACTIVE', 0, NULL, '2026-11-18 09:45:00', '2026-10-10 09:30:00'),
+(9101, 'fleet_9101', 'pbkdf2_sha256$100000$85e9b2f27eea77b026c8e551e99f4d10$3cc93153f43f40edb3b9ee01ad460078d5cd2b45df1b7f84da72c0078d678076', 'fleet', 1,
+ CONCAT('SEED_FERNET::', '13800009101'), SHA2(CONCAT('seed:', '13800009101'), 256), '138****9101',
+ 'VERIFIED', '2025-08-20 10:00:00', 'FLEET_IMPORT', 'GOLD', 0.00, 'ACTIVE', 0, NULL, '2026-11-19 08:45:00', '2025-08-20 09:30:00'),
+(9102, 'fleet_9102', 'pbkdf2_sha256$100000$00d3e2451f81d2171fdb590e75b52873$a0d8f72605c427fe93448a0e6dd2156d0557f9e106a74e16ae0eb57a9914eda4', 'fleet', 2,
+ CONCAT('SEED_FERNET::', '13800009102'), SHA2(CONCAT('seed:', '13800009102'), 256), '138****9102',
+ 'VERIFIED', '2025-09-02 14:00:00', 'FLEET_IMPORT', 'SILVER', 0.00, 'ACTIVE', 0, NULL, '2026-11-18 14:30:00', '2025-09-02 13:40:00'),
+(9103, 'fleet_9103', 'pbkdf2_sha256$100000$0ef0755bbe23ae477dd46ed6a2b3fd48$b77fd9afd84e370ef8a2d6d959127b7ea70d134b4d028be97d4f2867db315a2b', 'fleet', 3,
+ CONCAT('SEED_FERNET::', '13800009103'), SHA2(CONCAT('seed:', '13800009103'), 256), '138****9103',
+ 'VERIFIED', '2025-10-15 09:30:00', 'FLEET_IMPORT', 'GOLD', 0.00, 'ACTIVE', 0, NULL, '2026-11-19 07:20:00', '2025-10-15 09:00:00'),
+(9104, 'fleet_9104', 'pbkdf2_sha256$100000$fe887849a41bbc74aea9a610b61bf34b$6180e571270c27c54f8bc750aa1541c937b631657eae5df704d1e9e3c68dd500', 'fleet', 4,
+ CONCAT('SEED_FERNET::', '13800009104'), SHA2(CONCAT('seed:', '13800009104'), 256), '138****9104',
+ 'VERIFIED', '2026-01-08 16:00:00', 'FLEET_IMPORT', 'SILVER', 0.00, 'ACTIVE', 0, NULL, '2026-11-17 16:10:00', '2026-01-08 15:40:00'),
+(9105, 'fleet_9105', 'pbkdf2_sha256$100000$85e9b2f27eea77b026c8e551e99f4d10$3cc93153f43f40edb3b9ee01ad460078d5cd2b45df1b7f84da72c0078d678076', 'fleet', 5,
+ CONCAT('SEED_FERNET::', '13800009105'), SHA2(CONCAT('seed:', '13800009105'), 256), '138****9105',
+ 'VERIFIED', '2026-04-20 11:00:00', 'FLEET_IMPORT', 'SILVER', 0.00, 'ACTIVE', 0, NULL, '2026-11-16 11:30:00', '2026-04-20 10:30:00')
+AS nv
+ON DUPLICATE KEY UPDATE
+    username             = nv.username,
+    password_hash        = nv.password_hash,
+    role                 = nv.role,
+    fleet_id             = nv.fleet_id,
+    phone_cipher         = nv.phone_cipher,
+    phone_hash           = nv.phone_hash,
+    phone_masked         = nv.phone_masked,
+    realname_status      = nv.realname_status,
+    realname_verified_at = nv.realname_verified_at,
+    register_channel     = nv.register_channel,
+    member_level         = nv.member_level,
+    balance              = nv.balance,
+    status               = nv.status,
+    failed_login_count   = nv.failed_login_count,
+    locked_until         = nv.locked_until,
+    last_login_at        = nv.last_login_at,
+    created_at           = nv.created_at;
+
+-- 3. 车辆表（25 条：20 辆私家车 + 5 辆企业车队车；3 辆交流慢充车 supports_fast_charge=0）
+--    5001~5020 与 driver 9001~9020 一一对应（vehicle_id = 5000 + n <-> user_id = 9000 + n），
+--    5101~5105 绑定 9101~9105 并填 fleet_id = 1~5；25 个车牌互不相同，plate_hash 全局唯一。
+INSERT INTO vehicle (
+    vehicle_id, user_id, fleet_id, plate_cipher, plate_hash, plate_masked, plate_color,
+    vehicle_model, battery_capacity_kwh, max_charge_power, supports_fast_charge, bind_status, bound_at
+) VALUES
+(5001, 9001, NULL, CONCAT('SEED_FERNET::', '京AD10001'), SHA2(CONCAT('seed:', '京AD10001'), 256), '京A***01',
+ 'GREEN', '比亚迪 汉 EV 2024款 605KM 尊贵型', 85.40, 120.00, 1, 'BOUND', '2025-10-12 10:20:00'),
+(5002, 9002, NULL, CONCAT('SEED_FERNET::', '京AD10002'), SHA2(CONCAT('seed:', '京AD10002'), 256), '京A***02',
+ 'GREEN', '特斯拉 Model 3 长续航全轮驱动版', 78.40, 250.00, 1, 'BOUND', '2025-10-18 21:20:00'),
+(5003, 9003, NULL, CONCAT('SEED_FERNET::', '京AD10003'), SHA2(CONCAT('seed:', '京AD10003'), 256), '京A***03',
+ 'GREEN', '蔚来 ES6 75kWh 签名版', 75.00, 180.00, 1, 'BOUND', '2025-11-02 08:40:00'),
+(5004, 9004, NULL, CONCAT('SEED_FERNET::', '京AD10004'), SHA2(CONCAT('seed:', '京AD10004'), 256), '京A***04',
+ 'GREEN', '小鹏 G6 580 长续航 Max', 66.00, 280.00, 1, 'BOUND', '2025-11-21 20:00:00'),
+(5005, 9005, NULL, CONCAT('SEED_FERNET::', '京AD10005'), SHA2(CONCAT('seed:', '京AD10005'), 256), '京A***05',
+ 'GREEN', '理想 L7 Max 增程版', 42.80, 90.00, 1, 'BOUND', '2025-12-03 12:50:00'),
+(5006, 9006, NULL, CONCAT('SEED_FERNET::', '京AD10006'), SHA2(CONCAT('seed:', '京AD10006'), 256), '京A***06',
+ 'GREEN', '比亚迪 秦 PLUS EV 510KM 豪华型', 57.60, 60.00, 1, 'BOUND', '2026-01-15 08:00:00'),
+(5007, 9007, NULL, CONCAT('SEED_FERNET::', '京AD10007'), SHA2(CONCAT('seed:', '京AD10007'), 256), '京A***07',
+ 'GREEN', '五菱宏光 MINI EV 马卡龙 215KM', 17.30, 7.00, 0, 'BOUND', '2026-01-28 21:40:00'),
+(5008, 9008, NULL, CONCAT('SEED_FERNET::', '京AD10008'), SHA2(CONCAT('seed:', '京AD10008'), 256), '京A***08',
+ 'GREEN', '广汽埃安 AION S Plus 70 智领版', 58.80, 90.00, 1, 'BOUND', '2026-02-11 11:20:00'),
+(5009, 9009, NULL, CONCAT('SEED_FERNET::', '京AD10009'), SHA2(CONCAT('seed:', '京AD10009'), 256), '京A***09',
+ 'GREEN', '极氪 001 WE 后驱版 100kWh', 100.00, 200.00, 1, 'BOUND', '2026-02-26 19:10:00'),
+(5010, 9010, NULL, CONCAT('SEED_FERNET::', '京AD10010'), SHA2(CONCAT('seed:', '京AD10010'), 256), '京A***10',
+ 'GREEN', '大众 ID.4 CROZZ 长续航 PRO', 84.80, 100.00, 1, 'BOUND', '2026-03-08 09:40:00'),
+(5011, 9011, NULL, CONCAT('SEED_FERNET::', '京AD10011'), SHA2(CONCAT('seed:', '京AD10011'), 256), '京A***11',
+ 'GREEN', '宝马 i3 eDrive35L', 70.30, 100.00, 1, 'BOUND', '2026-03-19 14:00:00'),
+(5012, 9012, NULL, CONCAT('SEED_FERNET::', '京AD10012'), SHA2(CONCAT('seed:', '京AD10012'), 256), '京A***12',
+ 'GREEN', '长安 Lumin 糯玉米 210KM', 27.00, 7.00, 0, 'BOUND', '2026-04-02 07:30:00'),
+(5013, 9013, NULL, CONCAT('SEED_FERNET::', '京AD10013'), SHA2(CONCAT('seed:', '京AD10013'), 256), '京A***13',
+ 'GREEN', '特斯拉 Model Y 后轮驱动版', 60.00, 170.00, 1, 'BOUND', '2026-04-17 22:50:00'),
+(5014, 9014, NULL, CONCAT('SEED_FERNET::', '京AD10014'), SHA2(CONCAT('seed:', '京AD10014'), 256), '京A***14',
+ 'GREEN', '问界 M5 智驾版 增程', 40.00, 100.00, 1, 'BOUND', '2026-05-05 17:10:00'),
+(5015, 9015, NULL, CONCAT('SEED_FERNET::', '京AD10015'), SHA2(CONCAT('seed:', '京AD10015'), 256), '京A***15',
+ 'GREEN', '比亚迪 海豹 06 DM-i 120KM 尊贵型', 60.50, 80.00, 1, 'BOUND', '2026-05-23 11:50:00'),
+(5016, 9016, NULL, CONCAT('SEED_FERNET::', '京AD10016'), SHA2(CONCAT('seed:', '京AD10016'), 256), '京A***16',
+ 'GREEN', '零跑 C11 增程 285 智享版', 43.70, 70.00, 1, 'BOUND', '2026-06-09 09:20:00'),
+(5017, 9017, NULL, CONCAT('SEED_FERNET::', '京AD10017'), SHA2(CONCAT('seed:', '京AD10017'), 256), '京A***17',
+ 'GREEN', '奇瑞 小蚂蚁 30.6kWh 磷酸铁锂版', 30.60, 7.00, 0, 'BOUND', '2026-06-27 20:00:00'),
+(5018, 9018, NULL, CONCAT('SEED_FERNET::', '京AD10018'), SHA2(CONCAT('seed:', '京AD10018'), 256), '京A***18',
+ 'GREEN', '深蓝 SL03 515 纯电版', 58.10, 100.00, 1, 'BOUND', '2026-07-14 10:40:00'),
+(5019, 9019, NULL, CONCAT('SEED_FERNET::', '京AD10019'), SHA2(CONCAT('seed:', '京AD10019'), 256), '京A***19',
+ 'GREEN', '哪吒 U-II 500 行业版', 68.20, 90.00, 1, 'BOUND', '2026-08-01 16:00:00'),
+(5020, 9020, NULL, CONCAT('SEED_FERNET::', '京AD10020'), SHA2(CONCAT('seed:', '京AD10020'), 256), '京A***20',
+ 'GREEN', '广汽传祺 E9 PHEV 宗师版', 25.60, 60.00, 1, 'BOUND', '2026-10-10 10:10:00'),
+(5101, 9101, 1, CONCAT('SEED_FERNET::', '京AF10021'), SHA2(CONCAT('seed:', '京AF10021'), 256), '京A***21',
+ 'GREEN', '比亚迪 e9 网约出行版', 63.40, 100.00, 1, 'BOUND', '2025-08-20 10:20:00'),
+(5102, 9102, 2, CONCAT('SEED_FERNET::', '京AF10022'), SHA2(CONCAT('seed:', '京AF10022'), 256), '京A***22',
+ 'GREEN', '广汽埃安 AION Y Plus 610 智享版', 61.50, 80.00, 1, 'BOUND', '2025-09-02 14:20:00'),
+(5103, 9103, 3, CONCAT('SEED_FERNET::', '京AF10023'), SHA2(CONCAT('seed:', '京AF10023'), 256), '京A***23',
+ 'GREEN', '东风风神 E70 500 网约版', 50.30, 60.00, 1, 'BOUND', '2025-10-15 09:40:00'),
+(5104, 9104, 4, CONCAT('SEED_FERNET::', '京AF10024'), SHA2(CONCAT('seed:', '京AF10024'), 256), '京A***24',
+ 'GREEN', '开瑞 优优 EV 厢式运输车', 41.90, 60.00, 1, 'BOUND', '2026-01-08 16:20:00'),
+(5105, 9105, 5, CONCAT('SEED_FERNET::', '京AF10025'), SHA2(CONCAT('seed:', '京AF10025'), 256), '京A***25',
+ 'GREEN', '荣威 Ei5 旅行版 网约车', 52.50, 60.00, 1, 'BOUND', '2026-04-20 11:10:00')
+AS nv
+ON DUPLICATE KEY UPDATE
+    user_id              = nv.user_id,
+    fleet_id             = nv.fleet_id,
+    plate_cipher         = nv.plate_cipher,
+    plate_hash           = nv.plate_hash,
+    plate_masked         = nv.plate_masked,
+    plate_color          = nv.plate_color,
+    vehicle_model        = nv.vehicle_model,
+    battery_capacity_kwh = nv.battery_capacity_kwh,
+    max_charge_power     = nv.max_charge_power,
+    supports_fast_charge = nv.supports_fast_charge,
+    bind_status          = nv.bind_status,
+    bound_at             = nv.bound_at;
+
+-- 4. 优惠活动表（6 条：ACTIVE 3 / PAUSED 1 / ENDED 1 / DRAFT 1；CASH 3 / DISCOUNT 1 / SERVICE_FEE_FREE 2）
+--    1 为「新人券包」全场站通用；2 仅限 station_id=2（五道口）、3 仅限 station_id=5（望京SOHO）；
+--    4/5/6 为全场站通用（applicable_station_id = NULL）。
+--    当下（2026-11-19）活动 1/2/4 均为 ACTIVE 且落在有效期内，可供发券与核销演示。
+INSERT INTO coupon_campaign (
+    campaign_id, campaign_code, campaign_name, coupon_kind, face_value, threshold_amount,
+    applicable_station_id, valid_from, valid_to, issue_total, issued_count, per_user_limit,
+    redeem_rule, status, created_by
+) VALUES
+(1, 'CP-202506-NEW01', '新人券包-首充20元无门槛立减', 'CASH', 20.00, 0.00,
+ NULL, '2025-06-01', '2027-06-30', 5000, 0, 1,
+ '新注册车主首笔充电可用，单笔订单限用一张，不可与其他优惠叠加', 'ACTIVE', 1),
+(2, 'CP-202511-ST02', '五道口购物中心站站庆10元立减', 'CASH', 10.00, 0.00,
+ 2, '2025-11-01', '2027-10-31', 1200, 0, 2,
+ '仅限五道口购物中心充电站（station_id=2）使用，单笔订单限用一张', 'ACTIVE', 1),
+(3, 'CP-202507-SVC05', '望京SOHO服务费5元减免券', 'SERVICE_FEE_FREE', 5.00, 0.00,
+ 5, '2025-07-01', '2026-09-30', 800, 0, 2,
+ '仅限望京SOHO地下超充站（station_id=5）使用，服务费减免不折现、不找零', 'PAUSED', 1),
+(4, 'CP-202611-D11', '双十一充电8元折扣券', 'DISCOUNT', 8.00, 0.00,
+ NULL, '2026-11-01', '2026-11-30', 2000, 0, 3,
+ '折扣权益按 8.00 元折算抵扣，单笔订单限用一张，不可与其他优惠叠加', 'ACTIVE', 1),
+(5, 'CP-202501-OLD15', '老用户回馈15元立减', 'CASH', 15.00, 30.00,
+ NULL, '2025-01-01', '2026-06-30', 1000, 0, 1,
+ '历史活动已结束，仅保留用于过期券与核销率统计演示', 'ENDED', 1),
+(6, 'CP-202612-WIN', '冬季暖充服务费6元减免券', 'SERVICE_FEE_FREE', 6.00, 0.00,
+ NULL, '2026-12-01', '2027-02-28', 3000, 0, 2,
+ '冬季投放草稿，待运营审核后上线，单笔订单限用一张', 'DRAFT', 1)
+AS nv
+ON DUPLICATE KEY UPDATE
+    campaign_code         = nv.campaign_code,
+    campaign_name         = nv.campaign_name,
+    coupon_kind           = nv.coupon_kind,
+    face_value            = nv.face_value,
+    threshold_amount      = nv.threshold_amount,
+    applicable_station_id = nv.applicable_station_id,
+    valid_from            = nv.valid_from,
+    valid_to              = nv.valid_to,
+    issue_total           = nv.issue_total,
+    issued_count          = nv.issued_count,
+    per_user_limit        = nv.per_user_limit,
+    redeem_rule           = nv.redeem_rule,
+    status                = nv.status,
+    created_by            = nv.created_by;
+
+-- 5. 优惠券发放记录表（24 条：REDEEMED 10 / ISSUED 6 / EXPIRED 4 / VOID 4）
+--    券 1~10 为已核销券（持券人 9006~9015，与核销表一一对应，且订单均为 PAID）；
+--    券 11~16 为待使用；17~20 为过期券（活动 3/5 已过期或结束）；21~24 为作废券。
+SET @skip_coupon_guard = 1;
+
+INSERT INTO coupon_record (
+    coupon_id, coupon_no, campaign_id, user_id, face_value, threshold_amount,
+    issue_channel, issued_by, issued_at, expire_at, status
+) VALUES
+(1,  'CP2026110001', 1, 9006, 20.00, 0.00, 'NEW_USER_PACK', NULL, '2026-01-15 09:16:00', '2027-06-30', 'REDEEMED'),
+(2,  'CP2026110002', 1, 9007, 20.00, 0.00, 'NEW_USER_PACK', NULL, '2026-01-28 21:06:00', '2027-06-30', 'REDEEMED'),
+(3,  'CP2026110003', 1, 9008, 20.00, 0.00, 'NEW_USER_PACK', NULL, '2026-02-11 10:46:00', '2027-06-30', 'REDEEMED'),
+(4,  'CP2026110004', 1, 9009, 20.00, 0.00, 'NEW_USER_PACK', NULL, '2026-02-26 18:31:00', '2027-06-30', 'REDEEMED'),
+(5,  'CP2026110005', 1, 9010, 20.00, 0.00, 'NEW_USER_PACK', NULL, '2026-03-08 09:01:00', '2027-06-30', 'REDEEMED'),
+(6,  'CP2026110006', 4, 9011, 8.00,  0.00, 'ACTIVITY',      1,    '2026-11-11 00:05:00', '2026-11-30', 'REDEEMED'),
+(7,  'CP2026110007', 4, 9012, 8.00,  0.00, 'ACTIVITY',      1,    '2026-11-11 00:06:00', '2026-11-30', 'REDEEMED'),
+(8,  'CP2026110008', 4, 9013, 8.00,  0.00, 'ACTIVITY',      1,    '2026-11-11 00:07:00', '2026-11-30', 'REDEEMED'),
+(9,  'CP2026110009', 4, 9014, 8.00,  0.00, 'ACTIVITY',      1,    '2026-11-11 09:30:00', '2026-11-30', 'REDEEMED'),
+(10, 'CP2026110010', 4, 9015, 8.00,  0.00, 'ACTIVITY',      1,    '2026-11-11 09:31:00', '2026-11-30', 'REDEEMED'),
+(11, 'CP2026110011', 1, 9016, 20.00, 0.00, 'NEW_USER_PACK', NULL, '2026-11-12 08:40:00', '2027-06-30', 'ISSUED'),
+(12, 'CP2026110012', 1, 9017, 20.00, 0.00, 'NEW_USER_PACK', NULL, '2026-11-12 08:41:00', '2027-06-30', 'ISSUED'),
+(13, 'CP2026110013', 4, 9001, 8.00,  0.00, 'ACTIVITY',      1,    '2026-11-11 09:40:00', '2026-11-30', 'ISSUED'),
+(14, 'CP2026110014', 4, 9002, 8.00,  0.00, 'ACTIVITY',      1,    '2026-11-11 09:41:00', '2026-11-30', 'ISSUED'),
+(15, 'CP2026110015', 2, 9018, 10.00, 0.00, 'ACTIVITY',      1,    '2026-11-08 14:20:00', '2027-10-31', 'ISSUED'),
+(16, 'CP2026110016', 2, 9019, 10.00, 0.00, 'ACTIVITY',      1,    '2026-11-08 14:21:00', '2027-10-31', 'ISSUED'),
+(17, 'CP2026110017', 5, 9020, 15.00, 30.00, 'OPS_GRANT',    1,    '2026-01-10 10:00:00', '2026-06-30', 'EXPIRED'),
+(18, 'CP2026110018', 5, 9001, 15.00, 30.00, 'OPS_GRANT',    1,    '2026-01-10 10:02:00', '2026-06-30', 'EXPIRED'),
+(19, 'CP2026110019', 3, 9003, 5.00,  0.00, 'OPS_GRANT',    1,    '2026-03-15 11:00:00', '2026-09-30', 'EXPIRED'),
+(20, 'CP2026110020', 3, 9004, 5.00,  0.00, 'OPS_GRANT',    1,    '2026-03-15 11:01:00', '2026-09-30', 'EXPIRED'),
+(21, 'CP2026110021', 1, 9020, 20.00, 0.00, 'COMPENSATION', 1,    '2026-11-10 16:30:00', '2027-06-30', 'VOID'),
+(22, 'CP2026110022', 2, 9005, 10.00, 0.00, 'OPS_GRANT',    2,    '2026-11-09 15:10:00', '2027-10-31', 'VOID'),
+(23, 'CP2026110023', 1, 9002, 20.00, 0.00, 'NEW_USER_PACK', NULL, '2026-11-13 09:00:00', '2027-06-30', 'VOID'),
+(24, 'CP2026110024', 4, 9003, 8.00,  0.00, 'ACTIVITY',      1,    '2026-11-11 12:40:00', '2026-11-30', 'VOID')
+AS nv
+ON DUPLICATE KEY UPDATE
+    coupon_no        = nv.coupon_no,
+    campaign_id      = nv.campaign_id,
+    user_id          = nv.user_id,
+    face_value       = nv.face_value,
+    threshold_amount = nv.threshold_amount,
+    issue_channel    = nv.issue_channel,
+    issued_by        = nv.issued_by,
+    issued_at        = nv.issued_at,
+    expire_at        = nv.expire_at,
+    status           = nv.status;
+
+-- 5.1 回填活动已发放张数：跳过发券触发器后 issued_count 不会自动累加，
+--     故在券发放完成后按 coupon_record 实际张数回填，并用 LEAST 兜底，
+--     确保 issued_count <= issue_total（chk_campaign_quota）。
+UPDATE coupon_campaign AS cp
+   SET issued_count = LEAST(
+           (SELECT COUNT(*) FROM coupon_record AS c WHERE c.campaign_id = cp.campaign_id),
+           cp.issue_total
+       );
+
+-- 6. 优惠券核销记录表（10 条：券 1~10 各核销一次，一券一销、一单一券）
+--    不写死 order_id：从 charge_order 取 status='PAID' 的真实订单，
+--    按 user_id 与持券人对齐（每个车主取最早一张已支付订单），
+--    station_id 取订单场站、order_amount 取订单 total_amount、
+--    抵扣额取 LEAST(券面额, 订单金额)，天然满足 chk_redeem_face（>0 且 <= order_amount）。
+INSERT INTO coupon_redeem_record (
+    coupon_id, order_id, user_id, station_id, face_value, order_amount, redeemed_at
+)
+SELECT c.coupon_id,
+       o.order_id,
+       c.user_id,
+       o.station_id,
+       LEAST(c.face_value, o.total_amount),
+       o.total_amount,
+       TIMESTAMP('2026-11-16 10:30:00')
+FROM (
+    SELECT coupon_id, user_id, face_value,
+           ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY coupon_id) AS user_rn
+    FROM coupon_record
+    WHERE coupon_id BETWEEN 1 AND 10
+      AND status = 'REDEEMED'
+) AS c
+INNER JOIN (
+    SELECT order_id, user_id, station_id, total_amount,
+           ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY order_id) AS user_rn
+    FROM charge_order
+    WHERE status = 'PAID'
+      AND total_amount > 0.00
+) AS o
+    ON o.user_id = c.user_id
+   AND o.user_rn = 1
+WHERE c.user_rn = 1
+ON DUPLICATE KEY UPDATE
+    face_value   = VALUES(face_value),
+    order_amount = VALUES(order_amount),
+    redeemed_at  = VALUES(redeemed_at);
+
+SET @skip_coupon_guard = NULL;
+
+-- 自检：本段各表条数（应为 5 / 32 / 25 / 6 / 24 / 10）
+SELECT 'fleet_account' AS tbl, COUNT(*) AS cnt FROM fleet_account
+UNION ALL SELECT 'user_account', COUNT(*) FROM user_account
+UNION ALL SELECT 'vehicle', COUNT(*) FROM vehicle
+UNION ALL SELECT 'coupon_campaign', COUNT(*) FROM coupon_campaign
+UNION ALL SELECT 'coupon_record', COUNT(*) FROM coupon_record
+UNION ALL SELECT 'coupon_redeem_record', COUNT(*) FROM coupon_redeem_record;
+
+-- ============================================================================
+-- 业务线 4 结束
 -- ============================================================================

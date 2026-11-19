@@ -519,3 +519,198 @@ SELECT d.diff_id,
 FROM reconcile_diff d
 JOIN settlement_bill b ON b.bill_id = d.bill_id
 WHERE d.resolved = 0;
+
+-- ============================================================================
+-- 【业务线 4】用户、车辆与优惠券隔离视图（负责人：成员 4 / 李海波，共 5 个视图）
+-- 公共口径：
+--   1. 全部视图只输出 phone_masked / plate_masked 脱敏列，
+--      密码哈希、手机号密文（phone_cipher）、盲索引（phone_hash）一律不出视图；
+--   2. 行级归属由 DAO 层叠加参数条件实现：
+--      driver -> user_id = 本人；fleet -> fleet_id = 本企业；admin / settlement -> 全量；
+--   3. 券“可用”统一口径：status = 'ISSUED' 且 expire_at >= CURDATE()。
+-- ============================================================================
+
+-- ----------------------------------------------------------------------------
+-- 视图 4.1：v_user_masked_profile（面向 driver / fleet 本人，admin / settlement 全量）
+-- 隔离边界：隐藏登录口令哈希与手机号密文/盲索引，仅保留脱敏手机号与业务统计列。
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_user_masked_profile AS
+SELECT
+    u.user_id,
+    u.username,
+    u.role,
+    u.fleet_id,
+    f.fleet_name,
+    u.phone_masked,
+    u.realname_status,
+    u.member_level,
+    u.balance,
+    u.register_channel,
+    u.status,
+    u.last_login_at,
+    u.created_at,
+    COALESCE(v.vehicle_cnt, 0)            AS vehicle_cnt,
+    COALESCE(c.usable_coupon_cnt, 0)      AS usable_coupon_cnt
+FROM user_account AS u
+LEFT JOIN fleet_account AS f
+    ON f.fleet_id = u.fleet_id
+LEFT JOIN (
+    SELECT vv.user_id, COUNT(*) AS vehicle_cnt
+    FROM vehicle AS vv
+    WHERE vv.bind_status = 'BOUND'
+    GROUP BY vv.user_id
+) AS v
+    ON v.user_id = u.user_id
+LEFT JOIN (
+    SELECT cc.user_id, COUNT(*) AS usable_coupon_cnt
+    FROM coupon_record AS cc
+    WHERE cc.status = 'ISSUED'
+      AND cc.expire_at >= CURDATE()
+    GROUP BY cc.user_id
+) AS c
+    ON c.user_id = u.user_id;
+
+
+-- ----------------------------------------------------------------------------
+-- 视图 4.2：v_vehicle_binding（面向 driver / fleet 本人，admin 全量核对）
+-- 隔离边界：车牌只出脱敏值；输出当前车主与所属车队，便于识别“一车一主”是否被破坏。
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_vehicle_binding AS
+SELECT
+    v.vehicle_id,
+    v.user_id,
+    u.username,
+    v.fleet_id,
+    f.fleet_name,
+    v.plate_masked,
+    v.plate_color,
+    v.vehicle_model,
+    v.battery_capacity_kwh,
+    v.max_charge_power,
+    v.supports_fast_charge,
+    v.bind_status,
+    v.bound_at,
+    v.created_at
+FROM vehicle AS v
+LEFT JOIN user_account AS u
+    ON u.user_id = v.user_id
+LEFT JOIN fleet_account AS f
+    ON f.fleet_id = v.fleet_id;
+
+
+-- ----------------------------------------------------------------------------
+-- 视图 4.3：v_coupon_user_wallet（面向 driver / fleet 本人的券包）
+-- 隔离边界：只输出本人券的券码、面额快照、门槛、到期日与可用标记，隐藏发券操作人。
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_coupon_user_wallet AS
+SELECT
+    c.coupon_id,
+    c.coupon_no,
+    c.user_id,
+    cp.campaign_id,
+    cp.campaign_name,
+    cp.coupon_kind,
+    cp.applicable_station_id,
+    c.face_value,
+    c.threshold_amount,
+    c.issue_channel,
+    c.issued_at,
+    c.expire_at,
+    c.status,
+    cp.redeem_rule,
+    CASE
+        WHEN c.status = 'ISSUED' AND c.expire_at >= CURDATE() THEN 1
+        ELSE 0
+    END                                        AS usable_flag,
+    GREATEST(DATEDIFF(c.expire_at, CURDATE()), 0) AS days_to_expire
+FROM coupon_record AS c
+INNER JOIN coupon_campaign AS cp
+    ON cp.campaign_id = c.campaign_id;
+
+
+-- ----------------------------------------------------------------------------
+-- 视图 4.4：v_coupon_campaign_stat（面向 admin / settlement 的投放与核销看板）
+-- 隔离边界：展示计划量、已发量、已核销量与核销率，供运营跟踪投放效果（driver / fleet 禁查）。
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_coupon_campaign_stat AS
+SELECT
+    cp.campaign_id,
+    cp.campaign_code,
+    cp.campaign_name,
+    cp.coupon_kind,
+    cp.face_value,
+    cp.threshold_amount,
+    cp.applicable_station_id,
+    s.station_name,
+    cp.valid_from,
+    cp.valid_to,
+    cp.issue_total,
+    cp.issued_count,
+    cp.per_user_limit,
+    cp.status,
+    cp.redeem_rule,
+    COALESCE(rd.redeemed_cnt, 0)                                    AS redeemed_cnt,
+    CAST(COALESCE(rd.redeemed_amount, 0.00) AS DECIMAL(12, 2))      AS redeemed_amount,
+    ROUND(COALESCE(rd.redeemed_cnt, 0) / NULLIF(cp.issued_count, 0), 4) AS redeem_rate
+FROM coupon_campaign AS cp
+LEFT JOIN station AS s
+    ON s.station_id = cp.applicable_station_id
+LEFT JOIN (
+    SELECT c.campaign_id,
+           COUNT(*)                    AS redeemed_cnt,
+           SUM(d.face_value)           AS redeemed_amount
+    FROM coupon_redeem_record AS d
+    INNER JOIN coupon_record AS c
+        ON c.coupon_id = d.coupon_id
+    GROUP BY c.campaign_id
+) AS rd
+    ON rd.campaign_id = cp.campaign_id;
+
+
+-- ----------------------------------------------------------------------------
+-- 视图 4.5：v_fleet_credit_usage（面向 fleet 本企业，admin / settlement 全量）
+-- 隔离边界：以车队为主体汇总绑定车辆数、在用账号数与本月充电金额，
+--           便于按 fleet_id 隔离查看授信额度占用（driver / ops 禁查）。
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_fleet_credit_usage AS
+SELECT
+    f.fleet_id,
+    f.fleet_code,
+    f.fleet_name,
+    f.contact_name,
+    f.contact_phone_masked,
+    f.status,
+    f.credit_limit,
+    f.credit_used,
+    (f.credit_limit - f.credit_used)                                AS credit_remaining,
+    COALESCE(v.vehicle_cnt, 0)                                      AS bound_vehicle_cnt,
+    COALESCE(u.user_cnt, 0)                                         AS member_cnt,
+    COALESCE(o.order_cnt, 0)                                        AS month_order_cnt,
+    CAST(COALESCE(o.order_amount, 0.00) AS DECIMAL(12, 2))          AS month_order_amount
+FROM fleet_account AS f
+LEFT JOIN (
+    SELECT fleet_id, COUNT(*) AS vehicle_cnt
+    FROM vehicle
+    WHERE bind_status = 'BOUND'
+    GROUP BY fleet_id
+) AS v
+    ON v.fleet_id = f.fleet_id
+LEFT JOIN (
+    SELECT fleet_id, COUNT(*) AS user_cnt
+    FROM user_account
+    WHERE role = 'fleet'
+    GROUP BY fleet_id
+) AS u
+    ON u.fleet_id = f.fleet_id
+LEFT JOIN (
+    SELECT ua.fleet_id,
+           COUNT(*)              AS order_cnt,
+           SUM(co.total_amount)  AS order_amount
+    FROM charge_order AS co
+    INNER JOIN user_account AS ua
+        ON ua.user_id = co.user_id
+    WHERE ua.fleet_id IS NOT NULL
+      AND DATE_FORMAT(co.start_time, '%Y-%m') = DATE_FORMAT(CURDATE(), '%Y-%m')
+    GROUP BY ua.fleet_id
+) AS o
+    ON o.fleet_id = f.fleet_id;
