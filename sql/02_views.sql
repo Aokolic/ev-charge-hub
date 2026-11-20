@@ -326,6 +326,7 @@ SELECT DATE(o.start_time) AS stat_date,
        SUM(o.service_fee)   AS service_fee,
        SUM(o.total_amount)  AS total_amount
 FROM charge_order o
+WHERE o.status IN ('CHARGING', 'FINISHED', 'PAID')
 GROUP BY DATE(o.start_time), o.station_id, o.gun_id;
 
 -- 分时结构视角：峰平谷各卖了多少电、平均单价多少，用来验证分时规则真的生效了

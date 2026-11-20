@@ -508,9 +508,15 @@ BEGIN
     DECLARE v_sp        DECIMAL(8,4);
     DECLARE v_rstart    TIME;
     DECLARE v_rend      TIME;
+    DECLARE v_rule_id   BIGINT;
+    DECLARE v_seg_kwh   DECIMAL(10,3);
+    DECLARE v_ratio     DECIMAL(12,6) DEFAULT 1;
+    DECLARE v_free_sec  INT DEFAULT 0;
+    DECLARE v_min_charge DECIMAL(8,2) DEFAULT 0;
+    DECLARE v_total     DECIMAL(12,2);
     DECLARE v_done      INT DEFAULT 0;
     DECLARE cur CURSOR FOR
-        SELECT period, start_time, end_time, energy_price, service_price
+        SELECT rule_id, period, start_time, end_time, energy_price, service_price
         FROM pricing_rule
         WHERE station_id = v_station
           AND is_active = 1
@@ -518,10 +524,12 @@ BEGIN
           AND (effective_to IS NULL OR effective_to >= DATE(v_start));
     DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = 1;
 
+    -- 先锁订单，避免两个人同时结束同一单、把明细算两遍
     SELECT station_id, start_time, end_time, kwh, discount_amount, status
       INTO v_station, v_start, v_end, v_kwh, v_discount, v_status
       FROM charge_order
-     WHERE order_id = p_order_id;
+     WHERE order_id = p_order_id
+       FOR UPDATE;
 
     IF v_start IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单不存在';
@@ -529,24 +537,54 @@ BEGIN
     IF v_end IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单还没结束，不能计费';
     END IF;
+    IF v_status NOT IN ('CHARGING', 'FINISHED') THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单已支付或已取消，不能重算';
+    END IF;
 
     SET v_sec = TIMESTAMPDIFF(SECOND, v_start, v_end);
     IF v_sec <= 0 THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单时长不合法';
     END IF;
 
-    -- 重算前先清掉旧明细，保证过程可以重复跑
+    -- 免费时长和最低消费取“订单开始那一刻生效”的规则，没有就按 0
+    SET v_free_sec = COALESCE((
+        SELECT free_minutes * 60 FROM pricing_rule
+         WHERE station_id = v_station AND is_active = 1
+           AND effective_from <= DATE(v_start)
+           AND (effective_to IS NULL OR effective_to >= DATE(v_start))
+           AND ((start_time < end_time
+                 AND TIME(v_start) >= start_time AND TIME(v_start) < end_time)
+             OR (start_time > end_time
+                 AND (TIME(v_start) >= start_time OR TIME(v_start) < end_time)))
+         LIMIT 1), 0);
+    SET v_min_charge = COALESCE((
+        SELECT min_charge FROM pricing_rule
+         WHERE station_id = v_station AND is_active = 1
+           AND effective_from <= DATE(v_start)
+           AND (effective_to IS NULL OR effective_to >= DATE(v_start))
+           AND ((start_time < end_time
+                 AND TIME(v_start) >= start_time AND TIME(v_start) < end_time)
+             OR (start_time > end_time
+                 AND (TIME(v_start) >= start_time OR TIME(v_start) < end_time)))
+         LIMIT 1), 0);
+
+    -- 免掉的那段电量不参与计费，按比例摊到各时段
+    IF v_free_sec > 0 AND v_sec > 0 THEN
+        SET v_ratio = GREATEST(v_sec - v_free_sec, 0) / v_sec;
+    END IF;
+
+    -- 重算前先清旧明细，保证过程可以重复跑
     DELETE FROM order_fee_detail WHERE order_id = p_order_id;
 
     SET v_last_day = DATE(v_end);
     OPEN cur;
     read_loop: LOOP
-        FETCH cur INTO v_period, v_rstart, v_rend, v_ep, v_sp;
+        FETCH cur INTO v_rule_id, v_period, v_rstart, v_rend, v_ep, v_sp;
         IF v_done = 1 THEN
             LEAVE read_loop;
         END IF;
 
-        -- 规则可能跨零点（22:00~06:00），把前一天也算进来
+        -- 规则可能跨零点（22:00~08:00），把前一天也算进来
         SET v_day = DATE(v_start) - INTERVAL 1 DAY;
         WHILE v_day <= v_last_day DO
             SET v_rs = TIMESTAMP(v_day, v_rstart);
@@ -561,16 +599,16 @@ BEGIN
                                      LEAST(v_end, v_re));
 
             IF v_ov > 0 THEN
+                SET v_seg_kwh = ROUND(v_kwh * v_ratio * v_ov / v_sec, 3);
                 INSERT INTO order_fee_detail
-                    (order_id, period, begin_time, end_time, kwh,
+                    (order_id, period, rule_id, begin_time, end_time, kwh,
                      energy_price, service_price, energy_fee, service_fee)
                 VALUES
-                    (p_order_id, v_period,
-                     GREATEST(v_start, v_rs), LEAST(v_end, v_re),
-                     ROUND(v_kwh * v_ov / v_sec, 3),
+                    (p_order_id, v_period, v_rule_id,
+                     GREATEST(v_start, v_rs), LEAST(v_end, v_re), v_seg_kwh,
                      v_ep, v_sp,
-                     ROUND(ROUND(v_kwh * v_ov / v_sec, 3) * v_ep, 2),
-                     ROUND(ROUND(v_kwh * v_ov / v_sec, 3) * v_sp, 2));
+                     ROUND(v_seg_kwh * v_ep, 2),
+                     ROUND(v_seg_kwh * v_sp, 2));
                 SET v_cnt = v_cnt + 1;
             END IF;
 
@@ -588,10 +626,13 @@ BEGIN
       FROM order_fee_detail
      WHERE order_id = p_order_id;
 
+    -- 应付不低于最低消费，也不低于 0
+    SET v_total = GREATEST(v_ef + v_sf - v_discount, v_min_charge, 0);
+
     UPDATE charge_order
        SET energy_fee   = v_ef,
            service_fee  = v_sf,
-           total_amount = GREATEST(v_ef + v_sf - v_discount, 0),
+           total_amount = v_total,
            status       = CASE WHEN status = 'CHARGING' THEN 'FINISHED' ELSE status END
      WHERE order_id = p_order_id;
 END$$
@@ -606,6 +647,7 @@ BEGIN
     DECLARE v_total  DECIMAL(10,2);
     DECLARE v_paid   DECIMAL(10,2);
     DECLARE v_status VARCHAR(20);
+    DECLARE v_new_paid DECIMAL(10,2);
 
     IF NEW.amount = 0 THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '支付金额不能为 0';
@@ -620,22 +662,30 @@ BEGIN
     IF v_status = 'CHARGING' THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单还在充电，不能支付';
     END IF;
+    IF v_status = 'CANCELLED' THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单已取消，不能支付或退款';
+    END IF;
 
     IF NEW.amount > 0 AND v_paid + NEW.amount > v_total THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '支付金额超过订单应付金额';
     END IF;
-
     IF NEW.amount < 0 AND v_paid + NEW.amount < 0 THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '退款金额超过已支付金额';
     END IF;
 
-    IF NEW.status = 'SUCCESS' THEN
+    IF NEW.status <> 'FAILED' THEN
+        -- 先算好新余额再写回。MySQL 单表 UPDATE 的 SET 从左到右求值，
+        -- 写成 paid_amount = paid_amount + NEW.amount, status = CASE ... paid_amount ...
+        -- 第二个表达式读到的是加过之后的值，等于加了两次。
+        SET v_new_paid = v_paid + NEW.amount;
+
         UPDATE charge_order
-           SET paid_amount = paid_amount + NEW.amount,
+           SET paid_amount = v_new_paid,
                status = CASE
-                            WHEN paid_amount + NEW.amount >= total_amount THEN 'PAID'
-                            WHEN paid_amount + NEW.amount <= 0 THEN 'REFUNDED'
-                            ELSE status
+                            WHEN v_new_paid >= total_amount AND NEW.amount > 0 THEN 'PAID'
+                            WHEN v_new_paid <= 0 AND NEW.amount < 0 THEN 'REFUNDED'
+                            WHEN NEW.amount < 0 THEN 'PAID'
+                            ELSE 'FINISHED'
                         END
          WHERE order_id = NEW.order_id;
     END IF;
@@ -650,7 +700,7 @@ DROP PROCEDURE IF EXISTS sp_settle_generate;
 DELIMITER $$
 CREATE PROCEDURE sp_settle_generate(
     IN p_operator_id BIGINT,
-    IN p_month       CHAR(7),
+    IN p_month       CHAR(7) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
     IN p_platform_rate DECIMAL(5,4)
 )
 BEGIN
@@ -658,31 +708,44 @@ BEGIN
 
     SET v_rate = COALESCE(p_platform_rate, 0.0500);
 
-    -- 按站点汇总当月的已支付订单，一个站一张结算单
+    -- 只汇总本运营商的场站，一个站一张单。本月没有已付订单的站也建一张 0 元单，
+    -- 否则这些站的欠费差异没有账单可挂。
     INSERT INTO settlement_bill
         (operator_id, station_id, bill_month, order_count, total_kwh,
          total_amount, platform_fee, payable_amount, status)
     SELECT p_operator_id,
-           o.station_id,
+           s.station_id,
            p_month,
-           COUNT(*),
-           SUM(o.kwh),
-           SUM(o.total_amount),
-           ROUND(SUM(o.total_amount) * v_rate, 2),
-           SUM(o.total_amount) - ROUND(SUM(o.total_amount) * v_rate, 2),
+           COALESCE(agg.cnt, 0),
+           COALESCE(agg.kwh, 0),
+           COALESCE(agg.amt, 0),
+           ROUND(COALESCE(agg.amt, 0) * v_rate, 2),
+           COALESCE(agg.amt, 0) - ROUND(COALESCE(agg.amt, 0) * v_rate, 2),
            'DRAFT'
-      FROM charge_order o
-     WHERE DATE_FORMAT(o.start_time, '%Y-%m') = p_month
-       AND o.status = 'PAID'
-     GROUP BY o.station_id
+      FROM station s
+      LEFT JOIN (
+            SELECT o.station_id,
+                   COUNT(*)            AS cnt,
+                   SUM(o.kwh)          AS kwh,
+                   SUM(o.total_amount) AS amt
+              FROM charge_order o
+             WHERE DATE_FORMAT(o.start_time, '%Y-%m') = p_month
+               AND o.status = 'PAID'
+             GROUP BY o.station_id
+      ) agg ON agg.station_id = s.station_id
+     WHERE s.operator_id = p_operator_id
+       AND (agg.station_id IS NOT NULL
+            OR EXISTS (SELECT 1 FROM charge_order o2
+                        WHERE o2.station_id = s.station_id
+                          AND DATE_FORMAT(o2.start_time, '%Y-%m') = p_month))
     ON DUPLICATE KEY UPDATE
-        order_count    = VALUES(order_count),
-        total_kwh      = VALUES(total_kwh),
-        total_amount   = VALUES(total_amount),
-        platform_fee   = VALUES(platform_fee),
-        payable_amount = VALUES(payable_amount);
+        order_count    = IF(status = 'DRAFT', VALUES(order_count), order_count),
+        total_kwh      = IF(status = 'DRAFT', VALUES(total_kwh), total_kwh),
+        total_amount   = IF(status = 'DRAFT', VALUES(total_amount), total_amount),
+        platform_fee   = IF(status = 'DRAFT', VALUES(platform_fee), platform_fee),
+        payable_amount = IF(status = 'DRAFT', VALUES(payable_amount), payable_amount);
 
-    -- 当月有订单但没结清的钱，记成一条待处理差异，和对账单对不上时能查到原因
+    -- 当月没结清的钱记成待处理差异：actual - expect 为负，表示还差多少
     INSERT INTO reconcile_diff
         (bill_id, order_id, diff_type, expect_amount, actual_amount, diff_amount, remark)
     SELECT b.bill_id,
@@ -690,17 +753,22 @@ BEGIN
            'UNPAID',
            o.total_amount,
            o.paid_amount,
-           o.total_amount - o.paid_amount,
+           o.paid_amount - o.total_amount,
            '订单未结清'
       FROM charge_order o
+      JOIN station s
+        ON s.station_id = o.station_id
+       AND s.operator_id = p_operator_id
       JOIN settlement_bill b
-        ON b.station_id = o.station_id
+        ON b.operator_id = p_operator_id
+       AND b.station_key = o.station_id
        AND b.bill_month = p_month
-       AND b.operator_id = p_operator_id
      WHERE DATE_FORMAT(o.start_time, '%Y-%m') = p_month
+       AND o.status IN ('FINISHED', 'PAID')
        AND o.total_amount > o.paid_amount
        AND NOT EXISTS (SELECT 1 FROM reconcile_diff d
-                        WHERE d.bill_id = b.bill_id AND d.order_id = o.order_id
+                        WHERE d.bill_id = b.bill_id
+                          AND d.order_id = o.order_id
                           AND d.diff_type = 'UNPAID');
 END$$
 DELIMITER ;
@@ -711,19 +779,26 @@ CREATE TRIGGER trg_invoice_guard
 BEFORE INSERT ON invoice_record
 FOR EACH ROW
 BEGIN
-    DECLARE v_payable  DECIMAL(10,2);
-    DECLARE v_invoiced DECIMAL(10,2);
-    DECLARE v_orig_amt DECIMAL(10,2);
+    DECLARE v_payable  DECIMAL(12,2);
+    DECLARE v_bill_st  VARCHAR(20);
+    DECLARE v_invoiced DECIMAL(12,2);
+    DECLARE v_orig_amt DECIMAL(12,2);
     DECLARE v_orig_st  VARCHAR(20);
+    DECLARE v_orig_bill BIGINT;
+    DECLARE v_orig_flush BIGINT;
 
     IF NEW.amount = 0 THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '开票金额不能为 0';
     END IF;
 
-    SELECT payable_amount INTO v_payable
+    SELECT payable_amount, status INTO v_payable, v_bill_st
       FROM settlement_bill
      WHERE bill_id = NEW.bill_id
        FOR UPDATE;
+
+    IF v_payable IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '账单不存在';
+    END IF;
 
     -- 红冲票是负数，和原票相加正好抵消，所以这里不按状态过滤
     SELECT COALESCE(SUM(amount), 0) INTO v_invoiced
@@ -738,12 +813,22 @@ BEGIN
             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '开票金额超过账单应付金额';
         END IF;
     ELSE
-        SELECT amount, status INTO v_orig_amt, v_orig_st
+        -- 锁住原票：两笔并发红冲都读到 ISSUED 的话，已开票额会被冲成负数
+        -- 这里不能加 FOR UPDATE：触发器里锁自己这张表会报 1442，
+        -- 并发保护由 DAO 的 SELECT ... FOR UPDATE 负责。
+        SELECT amount, status, bill_id, red_flush_of
+          INTO v_orig_amt, v_orig_st, v_orig_bill, v_orig_flush
           FROM invoice_record
          WHERE invoice_id = NEW.red_flush_of;
 
         IF v_orig_amt IS NULL THEN
             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '被红冲的发票不存在';
+        END IF;
+        IF v_orig_bill <> NEW.bill_id THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '红冲票必须开在原票所属的账单上';
+        END IF;
+        IF v_orig_flush IS NOT NULL THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '红冲票本身不能再被红冲';
         END IF;
         IF v_orig_st <> 'ISSUED' THEN
             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '只有已开具的发票才能红冲';
@@ -752,11 +837,10 @@ BEGIN
             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '红冲金额必须为负且不超过原票金额';
         END IF;
         -- 注意：MySQL 不允许在 invoice_record 的触发器里再改 invoice_record，
-        -- 所以原票状态由调用方（DAO）在插入红冲票之后补一条 UPDATE 置为 RED_FLUSHED。
+        -- 所以原票状态由调用方（DAO）插入红冲票后补一条 UPDATE 置为 RED_FLUSHED。
     END IF;
 END$$
 DELIMITER ;
-
 
 -- ============================================================================
 -- 【业务线 3】设备监控与工单 —— 触发器与存储过程（负责人：成员 3 / 代润森）
@@ -1140,3 +1224,24 @@ DELIMITER ;
 -- 业务线 4 结束
 -- ============================================================================
 
+
+-- 账单与发票不允许删除，只能红冲或作废，防止绕过对账留痕
+DROP TRIGGER IF EXISTS trg_bill_no_delete;
+DELIMITER $$
+CREATE TRIGGER trg_bill_no_delete
+BEFORE DELETE ON settlement_bill
+FOR EACH ROW
+BEGIN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '结算账单不允许物理删除';
+END$$
+DELIMITER ;
+
+DROP TRIGGER IF EXISTS trg_invoice_no_delete;
+DELIMITER $$
+CREATE TRIGGER trg_invoice_no_delete
+BEFORE DELETE ON invoice_record
+FOR EACH ROW
+BEGIN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '发票记录不允许物理删除，请用红冲';
+END$$
+DELIMITER ;

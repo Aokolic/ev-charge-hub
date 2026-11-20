@@ -443,7 +443,7 @@ CREATE TABLE order_fee_detail (
     energy_fee    DECIMAL(10,2) NOT NULL,
     service_fee   DECIMAL(10,2) NOT NULL,
     PRIMARY KEY (detail_id),
-    UNIQUE KEY uk_detail_seg (order_id, begin_time),
+    UNIQUE KEY uk_detail_seg (order_id, rule_id, begin_time),
     KEY idx_detail_order (order_id),
     CONSTRAINT fk_detail_order FOREIGN KEY (order_id) REFERENCES charge_order (order_id) ON DELETE CASCADE,
     CONSTRAINT ck_detail_time CHECK (end_time > begin_time),
@@ -582,6 +582,7 @@ CREATE TABLE settlement_bill (
     bill_id        BIGINT       NOT NULL AUTO_INCREMENT,
     operator_id    BIGINT UNSIGNED       NOT NULL COMMENT '运营商（线1 若有表则挂外键）',
     station_id     BIGINT UNSIGNED       NULL COMMENT '按站结算时填，按运营商结算留空',
+    station_key    BIGINT UNSIGNED       AS (COALESCE(station_id, 0)) STORED COMMENT '站号占位，NULL 视为 0 参与唯一键',
     bill_month     CHAR(7)      NOT NULL COMMENT 'YYYY-MM',
     order_count    INT          NOT NULL DEFAULT 0,
     total_kwh      DECIMAL(12,3) NOT NULL DEFAULT 0.000,
@@ -592,7 +593,7 @@ CREATE TABLE settlement_bill (
     created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (bill_id),
-    UNIQUE KEY uk_bill_month (operator_id, station_id, bill_month),
+    UNIQUE KEY uk_bill_month (operator_id, station_key, bill_month),
     CONSTRAINT ck_bill_money CHECK (total_amount >= 0 AND platform_fee >= 0 AND payable_amount >= 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='月度结算单（业务线5）';
 
@@ -631,11 +632,11 @@ CREATE TABLE invoice_record (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='开票记录（业务线5）';
 
 -- ============================================================
--- 跨线外键：等线1（station / charging_gun）、线4（user_account / vehicle）建完表再执行
+-- 跨线外键：线1（station / charging_gun）、线4（user_account / vehicle）的表都在本文件前面
 -- 类型必须都是 BIGINT UNSIGNED，名字不一致就改这里
 -- ============================================================
--- ALTER TABLE charge_order
---     ADD CONSTRAINT fk_order_station FOREIGN KEY (station_id) REFERENCES station (station_id),
---     ADD CONSTRAINT fk_order_gun     FOREIGN KEY (gun_id)     REFERENCES charging_gun (gun_id),
---     ADD CONSTRAINT fk_order_user    FOREIGN KEY (user_id)    REFERENCES user_account (user_id),
---     ADD CONSTRAINT fk_order_vehicle FOREIGN KEY (vehicle_id) REFERENCES vehicle (vehicle_id);
+ALTER TABLE charge_order
+    ADD CONSTRAINT fk_order_station FOREIGN KEY (station_id) REFERENCES station (station_id),
+    ADD CONSTRAINT fk_order_gun     FOREIGN KEY (gun_id)     REFERENCES charging_gun (gun_id),
+    ADD CONSTRAINT fk_order_user    FOREIGN KEY (user_id)    REFERENCES user_account (user_id),
+    ADD CONSTRAINT fk_order_vehicle FOREIGN KEY (vehicle_id) REFERENCES vehicle (vehicle_id);
