@@ -43,10 +43,18 @@ class StationCreateIn(BaseModel):
     station_name: str = Field(min_length=2, max_length=120, description="场站名称（2~120位）")
     address: str = Field(min_length=2, max_length=255, description="场站详细地址")
     longitude: Decimal = Field(
-        ge=Decimal("-180"), le=Decimal("180"), description="经度（-180.000000 ~ 180.000000）"
+        ge=Decimal("-180"),
+        le=Decimal("180"),
+        max_digits=9,
+        decimal_places=6,
+        description="经度（-180.000000 ~ 180.000000）",
     )
     latitude: Decimal = Field(
-        ge=Decimal("-90"), le=Decimal("90"), description="纬度（-90.000000 ~ 90.000000）"
+        ge=Decimal("-90"),
+        le=Decimal("90"),
+        max_digits=9,
+        decimal_places=6,
+        description="纬度（-90.000000 ~ 90.000000）",
     )
     total_spaces: int = Field(gt=0, description="车位总数（须大于 0）")
     available_spaces: int = Field(ge=0, description="当前空闲车位数")
@@ -54,7 +62,11 @@ class StationCreateIn(BaseModel):
         default="00:00-24:00", min_length=1, max_length=64, description="营业时间描述"
     )
     parking_fee_rate: Decimal = Field(
-        default=Decimal("0.00"), ge=Decimal("0.00"), description="停车费标准（元/小时）"
+        default=Decimal("0.00"),
+        ge=Decimal("0.00"),
+        max_digits=8,
+        decimal_places=2,
+        description="停车费标准（元/小时）",
     )
     station_status: Literal["OPEN", "MAINTENANCE", "CLOSED"] = Field(
         default="OPEN", description="场站状态"
@@ -72,7 +84,11 @@ class StationUpdateIn(BaseModel):
         default=None, min_length=1, max_length=64, description="营业时间描述"
     )
     parking_fee_rate: Decimal | None = Field(
-        default=None, ge=Decimal("0.00"), description="停车费标准（元/小时）"
+        default=None,
+        ge=Decimal("0.00"),
+        max_digits=8,
+        decimal_places=2,
+        description="停车费标准（元/小时）",
     )
     station_status: Literal["OPEN", "MAINTENANCE", "CLOSED"] | None = Field(
         default=None, description="场站状态"
@@ -85,7 +101,9 @@ class PileCreateIn(BaseModel):
     station_id: int = Field(gt=0, description="所属场站 ID")
     pile_code: str = Field(min_length=3, max_length=32, description="充电桩唯一编号（3~32位）")
     device_model: str = Field(min_length=1, max_length=64, description="设备型号（现场铭牌核对项）")
-    rated_power: Decimal = Field(gt=Decimal("0"), description="额定总功率（kW）")
+    rated_power: Decimal = Field(
+        gt=Decimal("0"), max_digits=8, decimal_places=2, description="额定总功率（kW）"
+    )
     gun_count: int = Field(ge=1, le=8, description="设计配备充电枪数量（1~8）")
     protocol_type: str = Field(
         default="OCPP1.6", min_length=1, max_length=32, description="通信协议（如 OCPP1.6）"
@@ -108,12 +126,14 @@ class GunCreateIn(BaseModel):
 
     pile_id: int = Field(gt=0, description="所属充电桩 ID")
     gun_code: str = Field(min_length=3, max_length=32, description="充电枪唯一编号（3~32位）")
-    gun_seq: int = Field(ge=1, description="桩内枪序号（从 1 开始）")
+    gun_seq: int = Field(ge=1, le=8, description="桩内枪序号（1~8，从 1 开始）")
     gun_type: Literal["DC_FAST", "AC_SLOW"] = Field(description="枪型（直流快充/交流慢充）")
     connector_standard: str = Field(
         min_length=1, max_length=32, description="接口标准（如 GB/T 20234.3）"
     )
-    max_power: Decimal = Field(gt=Decimal("0"), description="单枪最大输出功率（kW）")
+    max_power: Decimal = Field(
+        gt=Decimal("0"), max_digits=8, decimal_places=2, description="单枪最大输出功率（kW）"
+    )
     current_status: Literal["IDLE", "OCCUPIED", "FAULT", "OFFLINE"] = Field(
         default="OFFLINE", description="当前状态"
     )

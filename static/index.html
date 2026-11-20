@@ -14,9 +14,7 @@
         })();
     </script>
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%2318181b'/%3E%3Cpath d='M17 6 8.5 17.5H15L14 26l8.5-11.5H16L17 6z' fill='none' stroke='%23fafafa' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link rel="stylesheet" href="/static/styles.css?v=20261119b">
+    <link rel="stylesheet" href="/static/styles.css?v=20261120a">
 </head>
 <body>
     <a class="skip-link visually-hidden" href="#workspace-main">跳至主工作区</a>
@@ -114,6 +112,8 @@
                                 spellcheck="false"
                                 minlength="2"
                                 maxlength="50"
+                                pattern="[a-zA-Z0-9_\u4e00-\u9fa5]+"
+                                title="2~50 位字母、数字、下划线或中文"
                                 placeholder="设置登录用户名"
                                 required
                             >
@@ -150,18 +150,12 @@
                             </div>
                         </div>
 
-                        <div class="field-row">
-                            <div class="field">
-                                <label for="regRole">注册角色</label>
-                                <select id="regRole" name="role">
-                                    <option value="driver">普通车主</option>
-                                    <option value="fleet">企业车队</option>
-                                </select>
-                            </div>
-                            <div class="field" id="regFleetWrap" hidden>
-                                <label for="regFleetId">所属车队 ID</label>
-                                <input id="regFleetId" name="fleet_id" type="number" min="1" inputmode="numeric" placeholder="车队角色必填">
-                            </div>
+                        <div class="field">
+                            <label for="regRole">注册角色</label>
+                            <select id="regRole" name="role">
+                                <option value="driver" selected>普通车主</option>
+                            </select>
+                            <p class="hint">仅开放普通车主自助注册；企业车队及运维、结算等内部账号请联系平台管理员开通。</p>
                         </div>
 
                         <button id="registerSubmitBtn" class="btn btn-primary btn-block" type="submit">注册账号</button>
@@ -242,27 +236,27 @@
                 <p class="nav-group">车主服务</p>
                 <a class="nav-link" href="#/stations" data-panel="panel-driver">
                     <svg class="icon" aria-hidden="true"><use href="#i-bolt"/></svg><span class="nav-text">找站与开单</span>
-                    <svg class="icon nav-lock" aria-label="当前身份无权限"><use href="#i-lock"/></svg>
+                    <svg class="icon nav-lock" role="img" aria-label="当前身份无权限"><use href="#i-lock"/></svg>
                 </a>
                 <a class="nav-link" href="#/orders" data-panel="panel-orders">
                     <svg class="icon" aria-hidden="true"><use href="#i-receipt"/></svg><span class="nav-text">订单与分时计费</span>
-                    <svg class="icon nav-lock" aria-label="当前身份无权限"><use href="#i-lock"/></svg>
+                    <svg class="icon nav-lock" role="img" aria-label="当前身份无权限"><use href="#i-lock"/></svg>
                 </a>
 
                 <p class="nav-group">运营运维</p>
                 <a class="nav-link" href="#/ops" data-panel="panel-ops">
                     <svg class="icon" aria-hidden="true"><use href="#i-wrench"/></svg><span class="nav-text">运维排障与巡检</span>
-                    <svg class="icon nav-lock" aria-label="当前身份无权限"><use href="#i-lock"/></svg>
+                    <svg class="icon nav-lock" role="img" aria-label="当前身份无权限"><use href="#i-lock"/></svg>
                 </a>
                 <a class="nav-link" href="#/assets" data-panel="panel-admin">
                     <svg class="icon" aria-hidden="true"><use href="#i-building"/></svg><span class="nav-text">资产看板与建档</span>
-                    <svg class="icon nav-lock" aria-label="当前身份无权限"><use href="#i-lock"/></svg>
+                    <svg class="icon nav-lock" role="img" aria-label="当前身份无权限"><use href="#i-lock"/></svg>
                 </a>
 
                 <p class="nav-group">财务结算</p>
                 <a class="nav-link" href="#/settle" data-panel="panel-settle">
                     <svg class="icon" aria-hidden="true"><use href="#i-wallet"/></svg><span class="nav-text">结算对账与开票</span>
-                    <svg class="icon nav-lock" aria-label="当前身份无权限"><use href="#i-lock"/></svg>
+                    <svg class="icon nav-lock" role="img" aria-label="当前身份无权限"><use href="#i-lock"/></svg>
                 </a>
 
                 <p class="nav-group">系统校验</p>
@@ -380,7 +374,7 @@
                         <div id="homeStats" class="home-kpi-grid">
                             <article class="home-kpi-card">
                                 <div class="home-kpi-top">
-                                    <span class="home-kpi-label">营业场站</span>
+                                    <span id="statStationsLabel" class="home-kpi-label">营业场站</span>
                                     <span class="badge badge-ok">实时在线</span>
                                 </div>
                                 <div id="statStations" class="home-kpi-value">—</div>
@@ -601,7 +595,7 @@
                             </search>
 
                             <div id="periodStatBox" class="table-wrap" tabindex="0" role="region" aria-label="峰平谷统计结果">
-                                <div class="empty-hint">请切换至“运维”或“管理员”身份后查询分时电价统计。</div>
+                                <div class="empty-hint">请点击“查询峰平谷统计”（限运维或管理员角色）。</div>
                             </div>
                         </article>
                     </div>
@@ -797,7 +791,7 @@
                         </article>
 
                         <div class="split-2">
-                            <article class="surface-card">
+                            <article id="operatorsCard" class="surface-card">
                                 <div class="section-head">
                                     <div>
                                         <h2>运营商档案</h2>
@@ -831,7 +825,7 @@
                                 </div>
                             </article>
 
-                            <article class="surface-card">
+                            <article id="drillCard" class="surface-card">
                                 <div class="section-head">
                                     <div>
                                         <h2>场站 → 桩 → 枪 钻取</h2>
@@ -855,7 +849,7 @@
                             </article>
                         </div>
 
-                        <details class="surface-card disclosure-card">
+                        <details id="assetCreateDisclosure" class="surface-card disclosure-card">
                             <summary class="disclosure-summary">
                                 <span class="disclosure-title">
                                     <svg class="icon disclosure-chevron" aria-hidden="true"><use href="#i-chevron"/></svg>
@@ -902,7 +896,7 @@
                                         <div class="form-grid">
                                             <div class="field"><label for="cg-pile-id">所属桩编号</label><input id="cg-pile-id" name="pile_id" type="number" min="1" value="1" required></div>
                                             <div class="field"><label for="cg-code">枪编码</label><input id="cg-code" name="gun_code" type="text" value="GN-DEMO-101-A" autocorrect="off" autocapitalize="none" spellcheck="false" required></div>
-                                            <div class="field"><label for="cg-seq">枪序号</label><input id="cg-seq" name="gun_seq" type="number" min="1" value="2" required></div>
+                                            <div class="field"><label for="cg-seq">枪序号</label><input id="cg-seq" name="gun_seq" type="number" min="1" max="8" value="2" required></div>
                                             <div class="field"><label for="cg-type">枪型</label>
                                                 <select id="cg-type" name="gun_type">
                                                     <option value="DC_FAST">直流快充</option>
@@ -1038,7 +1032,7 @@
                                         </div>
                                         <div class="field">
                                             <label for="rfInvoiceNo">新红冲发票号</label>
-                                            <input id="rfInvoiceNo" name="invoice_no" type="text" placeholder="如：INV-RED-001" autocorrect="off" autocapitalize="none" spellcheck="false" required>
+                                            <input id="rfInvoiceNo" name="invoice_no" type="text" minlength="4" maxlength="32" placeholder="如：INV-RED-001" autocorrect="off" autocapitalize="none" spellcheck="false" required>
                                         </div>
                                         <div class="field field-span2">
                                             <label for="rfAmount">红冲金额（负数，留空则按原票全额红冲）</label>
@@ -1127,13 +1121,13 @@
                                     <div class="module-head"><strong>月度结算与发票管理</strong><span class="badge badge-ok">已上线</span></div>
                                     <p class="meta">按运营商与账期自动生成月结单、对账差异核销、额度控制开票与红冲</p>
                                 </li>
-                                <li class="module-item module-pending">
-                                    <div class="module-head"><strong>设备遥测与维修工单</strong><span class="badge badge-muted">规划中</span></div>
-                                    <p class="meta">设备分钟级遥测监控、故障告警分级升级与运维维修工单闭环</p>
+                                <li class="module-item module-ready">
+                                    <div class="module-head"><strong>设备遥测与维修工单</strong><span class="badge badge-info">后端接口已就绪</span></div>
+                                    <p class="meta">设备分钟级遥测监控、故障告警分级升级与运维维修工单闭环（<code>/api/monitor/*</code>）</p>
                                 </li>
-                                <li class="module-item module-pending">
-                                    <div class="module-head"><strong>车主车辆与优惠活动</strong><span class="badge badge-muted">规划中</span></div>
-                                    <p class="meta">车主车辆档案管理、企业车队账户、会员优惠券发放与核销</p>
+                                <li class="module-item module-ready">
+                                    <div class="module-head"><strong>车主车辆与优惠活动</strong><span class="badge badge-info">后端接口已就绪</span></div>
+                                    <p class="meta">车主车辆档案管理、企业车队账户、会员优惠券发放与核销（<code>/api/users/*</code>）</p>
                                 </li>
                             </ul>
                         </article>
@@ -1287,8 +1281,9 @@
 
     <!-- 5. 无障碍播报与可堆叠 Toast 容器 -->
     <div id="liveAnnouncer" class="visually-hidden" aria-live="polite" aria-atomic="true"></div>
+    <div id="assertiveAnnouncer" class="visually-hidden" aria-live="assertive" aria-atomic="true"></div>
     <div id="toastStack" class="toast-stack" role="region" aria-label="系统操作通知"></div>
 
-    <script src="/static/app.js?v=20261119b"></script>
+    <script src="/static/app.js?v=20261120a"></script>
 </body>
 </html>

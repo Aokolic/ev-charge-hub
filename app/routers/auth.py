@@ -2,13 +2,13 @@
 
 职责：
 1. 提供账号密码登录（含失败次数累计、防暴破临时锁定与成功解锁重置）；
-2. 提供普通车主与企业车队自助注册（高权限角色禁止自助注册）；
+2. 提供普通车主自助注册（企业车队及平台高权限角色禁止自助注册）；
 3. 提供当前登录用户上下文回显、系统 5 类 RBAC 角色字典查询以及开发联调 Token 签发。
 
 约束：本路由层严格遵循分层解耦规范，仅通过 app.dao.common 访问持久化层，禁止直接操作底层会话查询。
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -143,15 +143,16 @@ def login(
         )
 
     if not verify_password(payload.password, account.password_hash):
-        new_fails = (account.failed_login_count or 0) + 1
-        lock_until: datetime | None = (
-            now + timedelta(minutes=settings.LOGIN_LOCK_MINUTES)
-            if new_fails >= settings.LOGIN_MAX_FAILS
-            else None
+        # 在数据库侧原子累加失败次数：若前一次锁定已过期则重置为 1（避免解锁后一次误输立即复锁）
+        new_fails, new_locked_until = common_dao.record_login_failure(
+            db=db,
+            user_id=account.user_id,
+            now=now,
+            max_fails=settings.LOGIN_MAX_FAILS,
+            lock_minutes=settings.LOGIN_LOCK_MINUTES,
         )
-        common_dao.record_login_failure(db, account.user_id, new_fails, lock_until)
 
-        if lock_until is not None:
+        if new_locked_until is not None and new_locked_until > now:
             raise HTTPException(
                 status_code=status.HTTP_423_LOCKED,
                 detail=(
@@ -159,9 +160,10 @@ def login(
                     f"账号已锁定 {settings.LOGIN_LOCK_MINUTES} 分钟"
                 ),
             )
+        remain_tries = max(0, settings.LOGIN_MAX_FAILS - new_fails)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"用户名或密码错误，还可尝试 {settings.LOGIN_MAX_FAILS - new_fails} 次",
+            detail=f"用户名或密码错误，还可尝试 {remain_tries} 次",
         )
 
     common_dao.reset_login_success(db, account.user_id, now)
@@ -173,17 +175,17 @@ def login(
     "/register",
     response_model=UserProfileOut,
     status_code=status.HTTP_201_CREATED,
-    summary="普通车主/企业车队自助注册",
+    summary="普通车主自助注册",
 )
 def register(
     payload: RegisterIn,
     db: Session = Depends(get_db),
 ) -> UserProfileOut:
-    """开放普通车主与企业车队自助注册，平台运维/结算/管理员账号禁止自助开通。"""
-    if payload.role not in (RoleEnum.DRIVER, RoleEnum.FLEET):
+    """仅开放普通车主自助注册，企业车队及平台运维/结算/管理员账号禁止自助开通。"""
+    if payload.role != RoleEnum.DRIVER:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="自助注册仅支持普通车主或企业车队角色",
+            detail="自助注册仅支持普通车主，企业车队及平台内部账号请联系管理员开通",
         )
 
     password_hash = hash_password(payload.password)
@@ -191,9 +193,9 @@ def register(
         db=db,
         username=payload.username,
         password_hash=password_hash,
-        role=payload.role.value,
+        role=RoleEnum.DRIVER.value,
         phone_plain=payload.phone,
-        fleet_id=payload.fleet_id,
+        fleet_id=None,
     )
     return _profile_from_user(
         _account_to_current_user(account),
@@ -206,8 +208,19 @@ def register(
     response_model=UserProfileOut,
     summary="获取当前登录用户信息",
 )
-def get_me(user: CurrentUser = Depends(get_current_user)) -> UserProfileOut:
-    """解析 Bearer 令牌并返回当前已认证用户的脱敏上下文信息。"""
+def get_me(
+    user: CurrentUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> UserProfileOut:
+    """解析 Bearer 令牌并核验库内账号状态，返回当前用户的脱敏上下文信息。"""
+    account = common_dao.get_account_by_id(db, user.user_id)
+    if account is not None:
+        if account.status != "ACTIVE":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="账号已被禁用，请联系平台管理员",
+            )
+        return _profile_from_user(user, phone_masked=account.phone_masked)
     return _profile_from_user(user)
 
 
@@ -234,7 +247,17 @@ def list_roles() -> list[RoleInfoOut]:
     summary="开发联调/答辩快捷签发测试 Token",
 )
 def issue_dev_token(payload: DevTokenIn) -> TokenOut:
-    """按指定角色快捷签发测试令牌；仅企业车队角色保留 fleet_id 隔离键。"""
+    """按指定角色快捷签发测试令牌；生产环境关闭开关后禁止签发，车队角色必须提供 fleet_id。"""
+    if not settings.ENABLE_DEV_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="当前环境已关闭开发快捷 Token 签发",
+        )
+    if payload.role == RoleEnum.FLEET and payload.fleet_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="企业车队角色必须指定有效的 fleet_id",
+        )
     fleet_id = payload.fleet_id if payload.role == RoleEnum.FLEET else None
     current_user = CurrentUser(
         user_id=payload.user_id,

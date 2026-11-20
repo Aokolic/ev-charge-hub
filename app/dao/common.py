@@ -8,10 +8,13 @@
 """
 
 import base64
+import functools
 import hashlib
 import hmac
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from cryptography.fernet import Fernet
@@ -20,6 +23,13 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.schemas.common import PageParams
+
+# 受控排序子句校验正则：仅允许字母/下划线开头的字段名（可选表前缀）及 ASC/DESC 排序方向
+_ORDER_BY_PATTERN = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_.]*(\s+(ASC|DESC))?(\s*,\s*[A-Za-z_][A-Za-z0-9_.]*(\s+(ASC|DESC))?)*$",
+    re.IGNORECASE,
+)
+_SIMPLE_IDENT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def mask_phone(phone: str | None) -> str | None:
@@ -56,12 +66,18 @@ def hash_sensitive_lookup(plain: str) -> str:
     ).hexdigest()
 
 
-def _get_fernet() -> Fernet:
-    """基于全局 SECRET_KEY 的 SHA-256 摘要派生 32 字节 URL 安全 Fernet 密钥实例。"""
+@functools.lru_cache(maxsize=4)
+def _build_fernet(secret_key: str) -> Fernet:
+    """按 secret_key 缓存派生出的 Fernet 实例，避免每次加解密重复执行密钥派生。"""
     key = base64.urlsafe_b64encode(
-        hashlib.sha256(settings.SECRET_KEY.encode("utf-8")).digest()
+        hashlib.sha256(secret_key.encode("utf-8")).digest()
     )
     return Fernet(key)
+
+
+def _get_fernet() -> Fernet:
+    """基于全局 SECRET_KEY 获取缓存的 Fernet 实例（保持无参签名兼容既有调用）。"""
+    return _build_fernet(settings.SECRET_KEY)
 
 
 def encrypt_sensitive(plain: str) -> str:
@@ -88,8 +104,30 @@ def fetch_view_page(
     clean_sql = base_sql.strip().rstrip(";").strip()
     if not clean_sql:
         raise ValueError("base_sql 不能为空")
+    if ";" in clean_sql:
+        raise ValueError("base_sql 不允许包含分号")
 
     bound_params: dict[str, Any] = dict(params or {})
+    if "_page_limit" in bound_params or "_page_offset" in bound_params:
+        raise ValueError("params 不允许包含保留分页参数 _page_limit 或 _page_offset")
+
+    order_clause = ""
+    if order_by and order_by.strip():
+        cleaned_order = order_by.strip()
+        if not _ORDER_BY_PATTERN.fullmatch(cleaned_order):
+            raise ValueError(f"非法排序子句: {order_by!r}")
+        # 外层包裹派生表 _v_page 后，内层表别名（如 d.redeemed_at）在外部不可见，
+        # 因此在通过正则白名单校验后仅保留输出列名，确保联表分页与单表视图分页均可正常执行
+        normalized_terms: list[str] = []
+        for term in cleaned_order.split(","):
+            parts = term.strip().split()
+            col_name = parts[0].rsplit(".", 1)[-1]
+            if not _SIMPLE_IDENT_PATTERN.fullmatch(col_name):
+                raise ValueError(f"非法排序字段: {order_by!r}")
+            normalized_terms.append(
+                f"{col_name} {parts[1].upper()}" if len(parts) == 2 else col_name
+            )
+        order_clause = f" ORDER BY {', '.join(normalized_terms)}"
 
     # 第一步：包裹子查询统计符合条件的总行数；总数为 0 时直接短路，省去第二次分页查询
     count_sql = f"SELECT COUNT(1) AS cnt FROM ({clean_sql}) AS _v_count"
@@ -102,9 +140,8 @@ def fetch_view_page(
             "items": [],
         }
 
-    # 第二步：追加受控排序子句与参数化 LIMIT/OFFSET 拉取当前页字典列表
-    order_clause = f" ORDER BY {order_by.strip()}" if order_by and order_by.strip() else ""
-    page_sql = f"{clean_sql}{order_clause} LIMIT :_page_limit OFFSET :_page_offset"
+    # 第二步：将原始查询包裹为派生表 _v_page 后追加受控排序与参数化 LIMIT/OFFSET
+    page_sql = f"SELECT * FROM ({clean_sql}) AS _v_page{order_clause} LIMIT :_page_limit OFFSET :_page_offset"
     bound_params["_page_limit"] = page_params.limit
     bound_params["_page_offset"] = page_params.offset
 
@@ -142,19 +179,15 @@ def _parse_datetime(value: Any) -> datetime | None:
     return value
 
 
-def get_account_by_username(db: Session, username: str) -> AccountRecord | None:
-    """按用户名精确查询登录账号信息，未找到返回 None。"""
-    sql = text(
-        "SELECT user_id, username, password_hash, role, fleet_id, "
-        "phone_masked, status, failed_login_count, locked_until "
-        "FROM user_account "
-        "WHERE username = :username "
-        "LIMIT 1"
-    )
-    row = db.execute(sql, {"username": username}).mappings().first()
-    if row is None:
-        return None
+def _to_utc_naive(dt: datetime) -> datetime:
+    """将时间统一规范为 UTC 无时区 datetime，确保登录锁定与审计时间戳时钟口径一致。"""
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
+
+def _row_to_account_record(row: Mapping[str, Any]) -> AccountRecord:
+    """将 user_account 查询行映射为只读 AccountRecord 数据载体。"""
     return AccountRecord(
         user_id=int(row["user_id"]),
         username=str(row["username"]),
@@ -166,6 +199,32 @@ def get_account_by_username(db: Session, username: str) -> AccountRecord | None:
         failed_login_count=int(row["failed_login_count"] or 0),
         locked_until=_parse_datetime(row["locked_until"]),
     )
+
+
+def get_account_by_username(db: Session, username: str) -> AccountRecord | None:
+    """按用户名精确查询登录账号信息，未找到返回 None。"""
+    sql = text(
+        "SELECT user_id, username, password_hash, role, fleet_id, "
+        "phone_masked, status, failed_login_count, locked_until "
+        "FROM user_account "
+        "WHERE username = :username "
+        "LIMIT 1"
+    )
+    row = db.execute(sql, {"username": username}).mappings().first()
+    return _row_to_account_record(row) if row is not None else None
+
+
+def get_account_by_id(db: Session, user_id: int) -> AccountRecord | None:
+    """按用户主键 ID 精确查询账号信息，未找到返回 None。"""
+    sql = text(
+        "SELECT user_id, username, password_hash, role, fleet_id, "
+        "phone_masked, status, failed_login_count, locked_until "
+        "FROM user_account "
+        "WHERE user_id = :user_id "
+        "LIMIT 1"
+    )
+    row = db.execute(sql, {"user_id": user_id}).mappings().first()
+    return _row_to_account_record(row) if row is not None else None
 
 
 def _execute_write_and_commit(
@@ -187,37 +246,86 @@ def _execute_write_and_commit(
 def record_login_failure(
     db: Session,
     user_id: int,
-    failed_count: int,
-    locked_until: datetime | None,
-) -> None:
-    """累计账号连续登录失败次数，并在达到阈值时写入锁定截止时间。"""
-    _execute_write_and_commit(
-        db,
+    now: datetime,
+    max_fails: int,
+    lock_minutes: int,
+) -> tuple[int, datetime | None]:
+    """在数据库单条语句内原子累计登录失败次数，锁定过期后首次失败重置为 1。
+
+    注意：MySQL 单表 UPDATE 的 SET 子句按从左到右顺序求值，因此先赋值 failed_login_count，
+    再直接基于更新后的 failed_login_count 判断是否达到 max_fails 并设置 locked_until；
+    SQLite 等标准 SQL 方言则在更新前求值右侧表达式，此处按方言适配以消除跨库偏差。
+    """
+    utc_now = _to_utc_naive(now)
+    lock_until_val = utc_now + timedelta(minutes=lock_minutes)
+    bind = db.get_bind()
+    dialect_name = bind.dialect.name if bind is not None else "mysql"
+
+    if dialect_name == "sqlite":
+        lock_condition = (
+            "(CASE "
+            "WHEN locked_until IS NOT NULL AND locked_until <= :now THEN 1 "
+            "ELSE COALESCE(failed_login_count, 0) + 1 "
+            "END) >= :max_fails"
+        )
+    else:
+        lock_condition = "failed_login_count >= :max_fails"
+
+    update_sql = text(
         "UPDATE user_account "
-        "SET failed_login_count = :failed_count, "
-        "locked_until = :locked_until, "
-        "updated_at = CURRENT_TIMESTAMP "
-        "WHERE user_id = :user_id",
-        {
-            "failed_count": failed_count,
-            "locked_until": locked_until,
-            "user_id": user_id,
-        },
+        "SET failed_login_count = CASE "
+        "    WHEN locked_until IS NOT NULL AND locked_until <= :now THEN 1 "
+        "    ELSE COALESCE(failed_login_count, 0) + 1 "
+        "END, "
+        "locked_until = CASE "
+        f"    WHEN {lock_condition} THEN :lock_until_val "
+        "    ELSE NULL "
+        "END, "
+        "updated_at = :now "
+        "WHERE user_id = :user_id"
     )
+    select_sql = text(
+        "SELECT failed_login_count, locked_until "
+        "FROM user_account "
+        "WHERE user_id = :user_id "
+        "LIMIT 1"
+    )
+
+    try:
+        db.execute(
+            update_sql,
+            {
+                "now": utc_now,
+                "max_fails": max_fails,
+                "lock_until_val": lock_until_val,
+                "user_id": user_id,
+            },
+        )
+        # 在同一事务提交前立即回读最新计数与锁定时间，保证并发下返回精确状态
+        row = db.execute(select_sql, {"user_id": user_id}).mappings().first()
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    if row is None:
+        return 0, None
+    return int(row["failed_login_count"] or 0), _parse_datetime(row["locked_until"])
 
 
 def reset_login_success(db: Session, user_id: int, login_time: datetime) -> None:
     """登录校验通过后清零失败计数、解除锁定状态并记录最近登录时间。"""
+    utc_login_time = _to_utc_naive(login_time)
     _execute_write_and_commit(
         db,
         "UPDATE user_account "
         "SET failed_login_count = 0, "
         "locked_until = NULL, "
         "last_login_at = :login_time, "
-        "updated_at = CURRENT_TIMESTAMP "
+        "updated_at = :login_time "
         "WHERE user_id = :user_id",
         {
-            "login_time": login_time,
+            "login_time": utc_login_time,
             "user_id": user_id,
         },
     )
@@ -278,6 +386,7 @@ __all__ = [
     "decrypt_sensitive",
     "encrypt_sensitive",
     "fetch_view_page",
+    "get_account_by_id",
     "get_account_by_username",
     "hash_sensitive_lookup",
     "mask_phone",

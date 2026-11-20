@@ -4,10 +4,11 @@
 1. 列表与看板查询一律走 5 个 RBAC 隔离视图（调用 app.dao.common.fetch_view_page），禁止将原始表直出前端；
 2. 所有 SQL 与排序子句均采用受控白名单字符串拼接与参数绑定，严禁 f-string 拼接用户输入；
 3. 存储过程与状态更新在同事务内完成，任何异常均先 db.rollback() 再原样向上抛出，交由 app/main.py 统一翻译；
-4. 心跳离线巡检的 check_time 默认值为 None，严禁用 Python datetime.now() 替代数据库 UTC NOW()。
+4. 心跳离线巡检的 check_time 默认值为 None，严禁用 Python datetime.now() 替代数据库会话 NOW()。
 """
 
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from typing import Any, TypeVar
 
 from sqlalchemy import TextClause, select, text
@@ -84,37 +85,44 @@ def _commit_and_refresh(db: Session, instance: ModelT) -> ModelT:
     return instance
 
 
-def _execute_device_status_update(
+def _clean_remark(remark: str | None) -> str | None:
+    """规范化状态变更备注，空白字符串统一转为 None。"""
+    if remark is None:
+        return None
+    cleaned = remark.strip()
+    return cleaned if cleaned else None
+
+
+def _set_vars_and_update_status(
     db: Session,
     update_stmt: TextClause,
     target_id: int,
-    payload: DeviceStatusUpdateIn,
+    new_status: str,
+    change_source: str,
+    todo_status: str | None,
+    remark: str | None,
 ) -> None:
-    """在单事务内通过 MySQL 会话变量向触发器透传上下文并更新设备状态。
-
-    注意：触发器仅在状态实际发生变化时清空会话变量；若新旧状态相同或中途抛出异常，
-    必须通过 try/finally 在当前连接释放前手动将 3 个会话变量重置为 NULL。
-    """
-    remark = (
-        payload.remark.strip()
-        if payload.remark is not None and payload.remark.strip()
-        else None
+    """写入触发器上下文会话变量并执行单设备状态更新（每次触发器消费后会自动置空变量）。"""
+    db.execute(
+        _SQL_SET_STATUS_VARS,
+        {
+            "src": change_source,
+            "todo": todo_status,
+            "rmk": remark,
+        },
     )
+    db.execute(
+        update_stmt,
+        {"st": new_status, "target_id": target_id},
+    )
+
+
+def _run_with_status_vars_cleared(db: Session, work: Callable[[], None]) -> None:
+    """在单事务内执行状态变更操作，无论成功、同态或异常均确保释放连接前清空会话变量。"""
     has_error = False
     try:
         try:
-            db.execute(
-                _SQL_SET_STATUS_VARS,
-                {
-                    "src": payload.change_source,
-                    "todo": payload.todo_status,
-                    "rmk": remark,
-                },
-            )
-            db.execute(
-                update_stmt,
-                {"st": payload.new_status, "target_id": target_id},
-            )
+            work()
         except Exception:
             has_error = True
             raise
@@ -129,6 +137,28 @@ def _execute_device_status_update(
     except Exception:
         db.rollback()
         raise
+
+
+def _execute_device_status_update(
+    db: Session,
+    update_stmt: TextClause,
+    target_id: int,
+    payload: DeviceStatusUpdateIn,
+) -> None:
+    """在单事务内通过 MySQL 会话变量向触发器透传上下文并更新单台设备状态。"""
+    remark = _clean_remark(payload.remark)
+    _run_with_status_vars_cleared(
+        db,
+        lambda: _set_vars_and_update_status(
+            db,
+            update_stmt,
+            target_id,
+            payload.new_status,
+            payload.change_source,
+            payload.todo_status,
+            remark,
+        ),
+    )
 
 
 # ============================================================================
@@ -315,14 +345,20 @@ def check_heartbeat_offline(
 ) -> dict[str, int]:
     """调用存储过程 proc_check_pile_heartbeat_offline 巡检心跳超时桩并联动置为离线。
 
-    时区规范：check_time 默认 None，交由数据库内部 COALESCE(p_check_time, NOW()) 取 UTC 时间；
-    若显式传入带时区的 datetime，则先换算为 UTC 无时区 datetime 再入参。
+    时区规范：check_time 默认 None，交由数据库内部 COALESCE(p_check_time, NOW()) 取数据库会话当前时间；
+    若显式传入带时区的 datetime，则按数据库会话相对 UTC 的实际偏移（TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW())）
+    换算为与 MySQL NOW() 一致的无时区时间，同时兼容 UTC 与 +08:00 等不同服务端时区部署。
     """
-    normalized_time = (
-        check_time.astimezone(timezone.utc).replace(tzinfo=None)
-        if check_time is not None and check_time.tzinfo is not None
-        else check_time
-    )
+    if check_time is not None and check_time.tzinfo is not None:
+        db_offset_sec = int(
+            db.execute(text("SELECT TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW())")).scalar_one()
+            or 0
+        )
+        normalized_time = check_time.astimezone(timezone.utc).replace(tzinfo=None) + timedelta(
+            seconds=db_offset_sec
+        )
+    else:
+        normalized_time = check_time
     try:
         db.execute(
             text(
@@ -488,10 +524,53 @@ def update_pile_status(
     pile_id: int,
     payload: DeviceStatusUpdateIn,
 ) -> ChargingPile | None:
-    """更新充电桩当前状态并记录变更来源/待办/备注，不存在返回 None。"""
+    """更新充电桩当前状态并在单事务内级联同步受影响的下属充电枪，不存在返回 None。
+
+    当充电桩置为 FAULT 或 OFFLINE 时，将名下处于 IDLE / OCCUPIED 状态的充电枪逐把同步
+    更新为相同状态；因 trg_gun_after_update_status_log 每次触发后即清空会话变量，
+    故每次更新充电枪前均需重新设置会话变量。
+    """
     if db.get(ChargingPile, pile_id) is None:
         return None
-    _execute_device_status_update(db, _SQL_UPDATE_PILE_STATUS, pile_id, payload)
+
+    remark = _clean_remark(payload.remark)
+    cascade_remark = (
+        f"所属桩联动：{remark}"
+        if remark
+        else f"所属充电桩状态变更为 {payload.new_status}，联动更新"
+    )[:255]
+
+    def _apply() -> None:
+        _set_vars_and_update_status(
+            db,
+            _SQL_UPDATE_PILE_STATUS,
+            pile_id,
+            payload.new_status,
+            payload.change_source,
+            payload.todo_status,
+            remark,
+        )
+        if payload.new_status in ("FAULT", "OFFLINE"):
+            child_gun_ids = db.execute(
+                text(
+                    "SELECT gun_id FROM charging_gun "
+                    "WHERE pile_id = :pid AND current_status IN ('IDLE', 'OCCUPIED') "
+                    "ORDER BY gun_id ASC FOR UPDATE"
+                ),
+                {"pid": pile_id},
+            ).scalars().all()
+            for child_gun_id in child_gun_ids:
+                _set_vars_and_update_status(
+                    db,
+                    _SQL_UPDATE_GUN_STATUS,
+                    int(child_gun_id),
+                    payload.new_status,
+                    payload.change_source,
+                    payload.todo_status,
+                    cascade_remark,
+                )
+
+    _run_with_status_vars_cleared(db, _apply)
     db.expire_all()
     return db.get(ChargingPile, pile_id)
 

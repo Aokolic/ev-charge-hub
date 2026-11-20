@@ -2,9 +2,8 @@
    EV Charge Hub 前端样式 · shadcn/ui (Zinc) 极简规范（方案 A）
    设计准则：纯白主界面 (#ffffff) + 灰白微对比 (#fafafa / #f4f4f5) + 1px 细边框 (#e4e4e7)
    圆角体系：严格限定 4px / 6px / 8px，取消一切渐变光晕与胶囊圆角
-   结构：WebFonts @import → reset → base → layout → components → pages → utilities
+   结构：reset → base → layout → components → pages → utilities
    ========================================================================== */
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;600;700&display=swap");
 
 @layer reset, base, layout, components, pages, utilities;
 
@@ -24,6 +23,12 @@
     ul, ol {
         padding: 0;
         list-style: none;
+    }
+
+    search {
+        display: block;
+        min-inline-size: 0;
+        max-inline-size: 100%;
     }
 
     img, svg {
@@ -179,6 +184,7 @@
         line-height: 1.5;
         color: var(--ink);
         background: var(--canvas);
+        overflow-x: clip;
         -webkit-font-smoothing: antialiased;
         text-rendering: optimizeLegibility;
     }
@@ -186,6 +192,7 @@
     body {
         min-block-size: 100dvh;
         background: var(--canvas);
+        overflow-x: clip;
     }
 
     code, pre {
@@ -287,7 +294,10 @@
     .app-shell {
         display: grid;
         grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+        inline-size: 100%;
+        max-inline-size: 100%;
         min-block-size: 100dvh;
+        overflow-x: clip;
     }
 
     .app-shell[hidden],
@@ -489,6 +499,7 @@
     /* ---------- 主列与顶栏 ---------- */
     .main-col {
         min-inline-size: 0;
+        max-inline-size: 100%;
         display: flex;
         flex-direction: column;
         background: var(--surface);
@@ -504,6 +515,8 @@
         justify-content: space-between;
         gap: 12px 20px;
         min-block-size: 64px;
+        min-inline-size: 0;
+        max-inline-size: 100%;
         padding: 10px 32px;
         background: color-mix(in srgb, var(--surface) 94%, transparent);
         backdrop-filter: blur(8px);
@@ -533,11 +546,14 @@
         flex-wrap: wrap;
         align-items: center;
         gap: 8px;
+        min-inline-size: 0;
+        max-inline-size: 100%;
     }
 
     .workspace {
         inline-size: 100%;
-        max-inline-size: 1480px;
+        max-inline-size: min(1480px, 100%);
+        min-inline-size: 0;
         padding: 20px 32px 48px;
         outline: none;
     }
@@ -566,6 +582,8 @@
         flex-wrap: wrap;
         gap: 2px;
         padding: 3px;
+        max-inline-size: 100%;
+        min-inline-size: 0;
         border-radius: var(--radius-md);
         background: var(--secondary);
         border: 1px solid var(--border);
@@ -813,7 +831,7 @@
         inline-size: min(440px, calc(100vw - 24px));
         margin: 0;
         position-area: bottom span-left;
-        position-try-fallbacks: flip-block;
+        position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
         inset: auto;
         margin-block-start: 8px;
         padding: 16px;
@@ -981,6 +999,8 @@
 
     .panel-stack {
         display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        min-inline-size: 0;
         gap: 16px;
     }
 
@@ -991,6 +1011,7 @@
         padding: 18px 20px;
         box-shadow: var(--shadow-1);
         min-inline-size: 0;
+        max-inline-size: 100%;
     }
 
     .section-head {
@@ -1028,6 +1049,8 @@
         flex-wrap: wrap;
         align-items: flex-end;
         gap: 12px;
+        min-inline-size: 0;
+        max-inline-size: 100%;
         margin-block-end: 14px;
         padding: 12px 14px;
         border-radius: var(--radius-md);
@@ -1036,11 +1059,12 @@
     }
 
     .filter-bar .field {
-        min-inline-size: 150px;
+        min-inline-size: min(150px, 100%);
     }
 
     .filter-bar .field-grow {
-        flex: 1 1 260px;
+        flex: 1 1 min(260px, 100%);
+        min-inline-size: 0;
     }
 
     .filter-bar .field-check {
@@ -1084,6 +1108,8 @@
         flex-wrap: wrap;
         align-items: flex-end;
         gap: 12px;
+        min-inline-size: 0;
+        max-inline-size: 100%;
         padding: 12px 14px;
         border-radius: var(--radius-md);
         background: var(--muted);
@@ -1091,7 +1117,7 @@
     }
 
     .inline-form .field {
-        flex: 1 1 140px;
+        flex: 1 1 min(140px, 100%);
     }
 
     .preset-row {
@@ -1198,7 +1224,9 @@
     /* ---------- shadcn/ui Data Table（8px 圆角 + #fafafa 表头） ---------- */
     .table-wrap {
         overflow: auto;
+        inline-size: 100%;
         max-inline-size: 100%;
+        min-inline-size: 0;
         max-block-size: min(540px, 72dvh);
         scrollbar-gutter: stable;
         scrollbar-width: thin;
@@ -1206,7 +1234,6 @@
         border: 1px solid var(--border);
         border-radius: var(--radius-lg);
         background: var(--surface);
-        container-type: inline-size;
     }
 
     .table-scroll-sm {
@@ -1277,7 +1304,7 @@
         gap: 6px;
     }
 
-    @container (width < 640px) {
+    @media (max-width: 640px) {
         table, thead, tbody, tr, th, td {
             display: block;
         }
@@ -1299,6 +1326,12 @@
             background: var(--surface);
         }
 
+        tbody tr:has(> td[colspan]) {
+            border: 0;
+            padding: 0;
+            background: transparent;
+        }
+
         td {
             display: flex;
             justify-content: space-between;
@@ -1307,6 +1340,22 @@
             padding: 6px 0;
             white-space: normal;
             text-align: end;
+        }
+
+        tbody tr td:last-child {
+            border-block-end: 0;
+        }
+
+        td[colspan] {
+            display: block;
+            padding: 0;
+            text-align: center;
+            border: 0;
+        }
+
+        td[colspan] .empty-hint {
+            margin: 0;
+            inline-size: 100%;
         }
 
         td[data-label]::before {
@@ -1420,12 +1469,14 @@
         margin-block-start: 16px;
         padding-block-start: 16px;
         border-block-start: 1px solid var(--border);
+        min-inline-size: 0;
     }
 
     .sub-form {
         display: grid;
         gap: 12px;
         align-content: start;
+        min-inline-size: 0;
         padding: 14px;
         border-radius: var(--radius-md);
         background: var(--muted);
@@ -1802,9 +1853,10 @@
 
     .matrix-row {
         display: grid;
-        grid-template-columns: minmax(170px, 240px) 1fr auto;
+        grid-template-columns: minmax(150px, 220px) minmax(0, 1fr) auto;
         align-items: center;
         gap: 14px;
+        min-inline-size: 0;
         padding: 10px 14px;
         border-radius: var(--radius-md);
         background: var(--muted);
@@ -1838,6 +1890,7 @@
         display: flex;
         flex-wrap: wrap;
         gap: 5px;
+        min-inline-size: 0;
     }
 
     .gun-cell {
@@ -1845,17 +1898,26 @@
         place-items: center;
         inline-size: 28px;
         block-size: 28px;
+        padding: 0;
         border-radius: var(--radius-sm);
         border: 1px solid transparent;
+        background: transparent;
         font-family: var(--font-num);
         font-size: 0.68rem;
         font-weight: 600;
+        line-height: 1;
         cursor: default;
         font-variant-numeric: tabular-nums;
     }
 
     .gun-cell[data-gun-id] {
         cursor: pointer;
+        transition: transform 0.12s ease, filter 0.12s ease;
+    }
+
+    .gun-cell[data-gun-id]:hover {
+        filter: brightness(0.95);
+        transform: translateY(-1px);
     }
 
     .gun-cell.s-idle {
@@ -2126,7 +2188,7 @@
     /* ---------- 运维双卡指令区与结算表单卡 ---------- */
     .ops-command-grid {
         display: grid;
-        grid-template-columns: minmax(280px, 1fr) minmax(0, 1.55fr);
+        grid-template-columns: minmax(min(260px, 100%), 1fr) minmax(0, 1.55fr);
         gap: 16px;
     }
 
@@ -2144,6 +2206,8 @@
         display: grid;
         align-content: start;
         justify-items: start;
+        min-inline-size: 0;
+        inline-size: 100%;
         gap: 8px;
     }
 
@@ -2212,7 +2276,7 @@
 
     .lab-layout {
         display: grid;
-        grid-template-columns: minmax(280px, 420px) 1fr;
+        grid-template-columns: minmax(260px, 380px) minmax(0, 1fr);
         gap: 18px;
         align-items: start;
     }
@@ -2220,6 +2284,7 @@
     .probe-groups {
         display: grid;
         gap: 14px;
+        min-inline-size: 0;
     }
 
     .probe-group {
@@ -2270,6 +2335,8 @@
     /* shadcn/ui 深色终端控制台 */
     .console-figure {
         display: grid;
+        min-inline-size: 0;
+        max-inline-size: 100%;
         border-radius: var(--radius-lg);
         overflow: hidden;
         border: 1px solid #27272a;
@@ -2361,12 +2428,24 @@
    ========================================================================== */
 @layer pages {
     @media (max-width: 1180px) {
+        .topbar {
+            padding: 10px 20px;
+        }
+
+        .workspace {
+            padding: 18px 20px 44px;
+        }
+
         .home-kpi-grid {
             grid-template-columns: repeat(2, minmax(0, 1fr));
         }
 
+        .ops-command-grid {
+            grid-template-columns: minmax(0, 1fr);
+        }
+
         .lab-layout {
-            grid-template-columns: 1fr;
+            grid-template-columns: minmax(0, 1fr);
         }
 
         .probe-group {
@@ -2382,12 +2461,16 @@
 
     @media (max-width: 960px) {
         .app-shell {
-            grid-template-columns: 1fr;
+            grid-template-columns: minmax(0, 1fr);
         }
 
         .sidebar {
             position: sticky;
+            inset-block-start: 0;
             z-index: 40;
+            inline-size: 100%;
+            max-inline-size: 100%;
+            min-inline-size: 0;
             block-size: auto;
             flex-direction: row;
             align-items: center;
@@ -2395,7 +2478,8 @@
             padding: 10px 14px;
             border-inline-end: 0;
             border-block-end: 1px solid var(--sidebar-line);
-            overflow: visible;
+            overflow-x: clip;
+            overflow-y: visible;
         }
 
         .brand {
@@ -2410,7 +2494,9 @@
 
         .side-nav {
             display: flex;
-            flex: 1;
+            flex: 1 1 0%;
+            min-inline-size: 0;
+            max-inline-size: 100%;
             gap: 4px;
             overflow-x: auto;
             scrollbar-width: none;
@@ -2437,17 +2523,17 @@
         }
 
         .ops-command-grid {
-            grid-template-columns: 1fr;
+            grid-template-columns: minmax(0, 1fr);
         }
     }
 
     @media (max-width: 720px) {
         .home-kpi-grid {
-            grid-template-columns: 1fr;
+            grid-template-columns: minmax(0, 1fr);
         }
 
         .matrix-row {
-            grid-template-columns: 1fr auto;
+            grid-template-columns: minmax(0, 1fr) auto;
         }
 
         .matrix-cells {
@@ -2456,7 +2542,7 @@
         }
 
         .form-grid {
-            grid-template-columns: 1fr;
+            grid-template-columns: minmax(0, 1fr);
         }
 
         .field-span2 {
@@ -2511,6 +2597,7 @@
     }
 
     .auth-form-pane {
+        min-inline-size: 0;
         padding: 36px 36px 32px;
         display: flex;
         flex-direction: column;
@@ -2616,6 +2703,7 @@
     }
 
     .auth-visual-pane {
+        min-inline-size: 0;
         display: flex;
         flex-direction: column;
         justify-content: space-between;

@@ -68,7 +68,7 @@ class LoginIn(BaseModel):
 
 
 class RegisterIn(BaseModel):
-    """普通车主/企业车队自助注册请求体。"""
+    """普通车主自助注册请求体（保留 role 字段以对越权角色返回明确 403）。"""
 
     username: str = Field(
         min_length=2,
@@ -78,16 +78,13 @@ class RegisterIn(BaseModel):
     )
     password: str = Field(min_length=6, max_length=128, description="登录密码（6~128位）")
     phone: str = Field(pattern=r"^1[3-9]\d{9}$", description="11位中国大陆手机号")
-    role: RoleEnum = Field(default=RoleEnum.DRIVER, description="注册角色（默认普通车主）")
-    fleet_id: int | None = Field(default=None, ge=1, description="所属企业车队 ID（仅企业车队角色必填）")
+    role: RoleEnum = Field(default=RoleEnum.DRIVER, description="注册角色（自助注册仅支持普通车主）")
+    fleet_id: int | None = Field(default=None, ge=1, description="所属企业车队 ID（自助注册忽略该字段）")
 
     @model_validator(mode="after")
     def _validate_fleet_binding(self) -> Self:
-        """校验企业车队角色的 fleet_id 归属必填性，非车队角色强制清空防越权绑定。"""
-        if self.role == RoleEnum.FLEET and self.fleet_id is None:
-            raise ValueError("企业车队角色注册时必须提供 fleet_id")
-        if self.role != RoleEnum.FLEET:
-            self.fleet_id = None
+        """自助注册不再允许绑定企业车队，统一清空 fleet_id；非 driver 角色交由路由层返回 403。"""
+        self.fleet_id = None
         return self
 
 

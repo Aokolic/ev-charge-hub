@@ -7,6 +7,7 @@
 4. 挂载 static/ 静态前端目录，并作为各业务线 Router 的统一装配点。
 """
 
+import logging
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
@@ -14,11 +15,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import DataError, IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import get_db
+
+# 模块级日志记录器：捕获未映射的底层数据库 500 异常现场
+logger = logging.getLogger(__name__)
 
 # 1. 创建 FastAPI 应用实例
 app = FastAPI(title=settings.APP_TITLE)
@@ -69,8 +73,18 @@ async def integrity_error_handler(request: Request, exc: IntegrityError) -> JSON
             content={"detail": "提交数据不满足数据库校验约束", "code": 3819},
         )
 
+    status_code = 400 if errno in (1048, 1406) else 500
+    if status_code == 500:
+        logger.exception(
+            "未预期 IntegrityError (method=%s path=%s errno=%s): %s",
+            request.method,
+            request.scope.get("path", ""),
+            errno,
+            msg,
+            exc_info=exc,
+        )
     return JSONResponse(
-        status_code=400 if errno in (1048, 1406) else 500,
+        status_code=status_code,
         content={"detail": "数据库约束校验异常", "code": errno or 500},
     )
 
@@ -94,9 +108,36 @@ async def operational_error_handler(request: Request, exc: OperationalError) -> 
             content={"detail": "提交数据不满足数据库校验约束", "code": 3819},
         )
 
+    logger.exception(
+        "未预期 OperationalError (method=%s path=%s errno=%s): %s",
+        request.method,
+        request.scope.get("path", ""),
+        errno,
+        msg,
+        exc_info=exc,
+    )
     return JSONResponse(
         status_code=500,
         content={"detail": "数据库服务异常，请稍后重试", "code": errno or 500},
+    )
+
+
+@app.exception_handler(DataError)
+async def data_error_handler(request: Request, exc: DataError) -> JSONResponse:
+    """拦截字段长度超限、数值溢出或格式错误（MySQL 1264/1292/1366/1406 等 DataError）。"""
+    errno, msg = _extract_mysql_error(exc)
+    if errno is not None and errno not in (1264, 1265, 1292, 1366, 1406, 1441):
+        logger.exception(
+            "未预期 DataError (method=%s path=%s errno=%s): %s",
+            request.method,
+            request.scope.get("path", ""),
+            errno,
+            msg,
+            exc_info=exc,
+        )
+    return JSONResponse(
+        status_code=400,
+        content={"detail": "提交数据超出字段长度或数值范围", "code": errno or 400},
     )
 
 
@@ -124,10 +165,10 @@ def serve_frontend_index() -> FileResponse:
     return FileResponse(str(_STATIC_DIR / "index.html"))
 
 
-# 5. 各业务线路由挂载区（后续由组长在此统一引入 auth 及 5 条业务线路由）
+# 5. 各业务线路由挂载区（前缀与 tags 已在各 router 内部声明，此处直接挂载勿重复传 prefix）
 # 示例：
-# from app.routers import auth, station, order, user, monitor, settle
-# app.include_router(auth.router, prefix="/api/auth", tags=["认证鉴权"])
+# from app.routers import auth as auth_routes
+# app.include_router(auth_routes.router)
 
 # 业务线 2 / 5（孙墨涵）：前缀已写在 router 内部，这里只做挂载
 from app.routers import auth as auth_routes  # noqa: E402
