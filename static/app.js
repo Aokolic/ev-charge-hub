@@ -1263,20 +1263,23 @@
                     )
                     .join("");
                 return `
-                    <li>
-                        <a class="module-card ${allowed ? "" : "is-locked"}" href="${escapeHtml(m.href)}">
-                            <div class="module-head-row">
-                                <div class="module-title">
-                                    <svg class="icon" aria-hidden="true"><use href="#${escapeHtml(m.icon)}"/></svg>
-                                    <span>${escapeHtml(m.title)}</span>
-                                </div>
-                                ${lockBadge}
-                            </div>
-                            <p class="module-desc">${escapeHtml(m.desc)}</p>
-                            <div class="module-foot">
-                                <div class="module-roles">${chipsHtml}</div>
-                                <span class="module-enter">进入模块 →</span>
-                            </div>
+                    <li class="module-card-item">
+                        <a class="module-card-link" href="${escapeHtml(m.href)}">
+                            <article class="module-card ${allowed ? "" : "is-locked"}">
+                                <header class="module-head-row">
+                                    <h3 class="module-title">
+                                        <svg class="icon" aria-hidden="true"><use href="#${escapeHtml(m.icon)}"/></svg>
+                                        <span>${escapeHtml(m.title)}</span>
+                                    </h3>
+                                    ${lockBadge}
+                                </header>
+                                <p class="module-desc">${escapeHtml(m.desc)}</p>
+                                <div class="module-roles" aria-label="适用角色">${chipsHtml}</div>
+                                <footer class="module-foot">
+                                    <span class="module-meta">${m.roles.length >= 5 ? "全角色开放" : `支持 ${m.roles.length} 类角色`}</span>
+                                    <span class="module-enter">进入模块 <span class="module-arrow" aria-hidden="true">→</span></span>
+                                </footer>
+                            </article>
                         </a>
                     </li>`;
             }).join("");
