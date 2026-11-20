@@ -198,7 +198,7 @@
             panel: "panel-orders",
             icon: "i-receipt",
             title: "订单与分时计费",
-            desc: "充电中结束拆账、峰平谷统计与支付/退款流水",
+            desc: "充电中结束拆账、峰平谷统计与支付流水（退款在结算面板发起）",
             roles: ["driver", "fleet", "ops", "settlement", "admin"],
         },
         {
@@ -593,7 +593,17 @@
             headers.set("Content-Type", "application/json");
         }
         const started = performance.now();
-        const resp = await fetch(url, { ...fetchOptions, headers, signal });
+        let resp;
+        try {
+            resp = await fetch(url, { ...fetchOptions, headers, signal });
+        } catch (err) {
+            if (isAbortError(err)) throw err;
+            // 断网 / DNS 失败 / 连接被拒：统一转成可读中文，避免把 "Failed to fetch" 原样抛给用户
+            const netErr = new Error("网络连接失败，请检查网络连接后重试");
+            netErr.status = "网络异常";
+            netErr.network = true;
+            throw netErr;
+        }
         const elapsedMs = Math.round(performance.now() - started);
         const text = await resp.text();
         let data = text;
@@ -784,6 +794,12 @@
         if (rfBtn) rfBtn.disabled = !canSettle;
         if (refreshDiffsBtn) refreshDiffsBtn.disabled = !canSettle;
 
+        // 订单退款：后端 /api/orders/{id}/refund 仅结算专员与管理员可发起
+        const refundCard = $("orderRefundCard");
+        const refundSubmitBtn = $("refundOrderForm")?.querySelector('button[type="submit"]');
+        if (refundCard) refundCard.hidden = !canSettle;
+        if (refundSubmitBtn) refundSubmitBtn.disabled = !canSettle;
+
         const statStationsLabel = $("statStationsLabel");
         if (statStationsLabel) {
             statStationsLabel.textContent = role === "settlement" ? "接入场站" : "营业场站";
@@ -805,6 +821,10 @@
             drillBox.className = "empty-hint";
             drillBox.textContent = "输入场站 ID 或桩 ID，逐级查看下属设备。";
         }
+        // 切换角色 / 切换账号时清掉上一次操作留下的行内错误
+        setInlineAlert($("refundOrderError"), "");
+        setInlineAlert($("payOrderError"), "");
+        setInlineAlert($("finishOrderError"), "");
         resetPeriodStatPlaceholder({ force: true });
     }
 
@@ -1053,6 +1073,24 @@
         showToast("已退出登录");
     }
 
+    // 进入登录 / 注册页前清空身份，避免"点了切换账号、顶栏还显示上一个账号"
+    function resetSessionForAuthView() {
+        sessionExpiring = false;
+        closeAllDialogs();
+        closeIdentityPopover();
+        state.authEpoch += 1;
+        abortRequestsByPrefix("panel:");
+        abortRequestsByPrefix("modal:");
+        abortRequestsByPrefix("auth:");
+        state.token = "";
+        state.user = null;
+        state.authMode = "";
+        localStorage.removeItem("ev_hub_token");
+        localStorage.removeItem("ev_hub_auth_mode");
+        resetWorkspacePaginationAndSession();
+        renderUserContext();
+    }
+
     async function switchDevRole(role, { fetchData = true } = {}) {
         const rawUid = Number($("devUserId").value);
         const userId = Number.isFinite(rawUid) && rawUid >= 1 ? Math.trunc(rawUid) : 9001;
@@ -1288,7 +1326,7 @@
 
         const statusMap = {
             IDLE: { cls: "s-idle", text: "空闲" },
-            OCCUPIED: { cls: "s-occupied", text: "充电中" },
+            OCCUPIED: { cls: "s-occupied", text: "占用" },
             FAULT: { cls: "s-fault", text: "故障" },
             OFFLINE: { cls: "s-offline", text: "离线" },
         };
@@ -1686,7 +1724,7 @@
                                     }
                                     ${
                                         canPay && canPayRole
-                                            ? `<button class="btn btn-outline btn-xs pay-order-btn" data-order-id="${escapeHtml(o.order_id)}" data-order-no="${escapeHtml(o.order_no)}" data-unpaid="${escapeHtml(o.unpaid_amount)}" data-total="${escapeHtml(o.total_amount)}" type="button">支付/退款</button>`
+                                            ? `<button class="btn btn-outline btn-xs pay-order-btn" data-order-id="${escapeHtml(o.order_id)}" data-order-no="${escapeHtml(o.order_no)}" data-unpaid="${escapeHtml(o.unpaid_amount)}" data-total="${escapeHtml(o.total_amount)}" type="button">支付</button>`
                                             : ""
                                     }
                                 </div>
@@ -1974,6 +2012,12 @@
     async function runHeartbeatCheck() {
         const btn = $("heartbeatCheckBtn");
         const epoch = state.authEpoch;
+        // 巡检按离线阈值批量判定，演示数据的心跳时间通常早已过期，一点就会把大量桩/枪置为离线
+        const proceed = window.confirm(
+            "执行心跳离线巡检会按各桩的离线阈值判定在线状态：心跳时间早于阈值的桩/枪将被统一标记为离线。\n\n" +
+                "这会让「找站与开单」暂时没有空闲枪，需重跑 sql/04_seed.sql 才能恢复演示数据。\n\n确认执行？"
+        );
+        if (!proceed) return;
         if (btn) btn.disabled = true;
         try {
             const { data } = await apiFetch("/api/stations/piles/heartbeat-check", {
@@ -2362,7 +2406,11 @@
                             <td data-label="操作" class="actions-cell">
                                 <div class="row-actions">
                                     <button class="btn btn-outline btn-xs view-bill-detail-btn" data-bill-id="${escapeHtml(b.bill_id)}" type="button">详情</button>
-                                    <button class="btn btn-primary btn-xs issue-invoice-btn" data-bill-id="${escapeHtml(b.bill_id)}" data-uninvoiced="${escapeHtml(b.uninvoiced_amount)}" data-payable="${escapeHtml(b.payable_amount)}" type="button">开票</button>
+                                    ${
+                                        Number(b.uninvoiced_amount) > 0
+                                            ? `<button class="btn btn-primary btn-xs issue-invoice-btn" data-bill-id="${escapeHtml(b.bill_id)}" data-uninvoiced="${escapeHtml(b.uninvoiced_amount)}" data-payable="${escapeHtml(b.payable_amount)}" type="button">开票</button>`
+                                            : `<button class="btn btn-outline btn-xs" type="button" disabled title="该结算单已全额开票，无需再开">已开满</button>`
+                                    }
                                 </div>
                             </td>
                         </tr>`;
@@ -2779,10 +2827,12 @@
             closeIdentityPopover();
         });
         $("topbarLoginBtn").addEventListener("click", () => {
+            resetSessionForAuthView();
             showAuthView("login", { updateHash: true });
         });
         $("switchAccountBtn").addEventListener("click", () => {
             closeIdentityPopover();
+            resetSessionForAuthView();
             showAuthView("login", { updateHash: true });
         });
         $("logoutBtn").addEventListener("click", () => {
@@ -2988,6 +3038,10 @@
             $("gunStatusFilter").value = "";
             loadDriverGuns(1);
         });
+        // 下拉筛选改动即刷新，避免"选了没反应、还要再点查询"的困惑
+        ["gunTypeFilter", "gunStatusFilter", "gunStationFilter"].forEach((id) => {
+            $(id).addEventListener("change", () => loadDriverGuns(1));
+        });
         $("driverStationGrid").addEventListener("click", (e) => {
             const btn = e.target.closest(".view-station-guns");
             if (!btn) return;
@@ -3107,10 +3161,6 @@
         $("genTxnBtn").addEventListener("click", () => {
             $("poTxnNo").value = genTxnNo("PAY");
         });
-        $("presetRefundBtn").addEventListener("click", () => {
-            $("poAmount").value = "-1.00";
-            $("poTxnNo").value = genTxnNo("REF");
-        });
         $("presetOverpayBtn").addEventListener("click", () => {
             $("poAmount").value = "9999.00";
             $("poTxnNo").value = genTxnNo("OVR");
@@ -3124,10 +3174,19 @@
             const epoch = state.authEpoch;
             try {
                 const orderId = $("poOrderId").value;
+                // 支付只收正数（后端 PaymentIn.amount>0）；退款走结算端独立接口，前端先拦一层
+                const amountRaw = $("poAmount").value.trim();
+                if (!/^\d+(\.\d{1,2})?$/.test(amountRaw) || Number(amountRaw) <= 0) {
+                    setInlineAlert(
+                        $("payOrderError"),
+                        "支付金额需为大于 0 的金额（最多两位小数）；退款请由结算专员在「结算对账与开票 → 订单退款」中发起。"
+                    );
+                    return;
+                }
                 const { data } = await apiFetch(`/api/orders/${orderId}/pay`, {
                     method: "POST",
                     body: JSON.stringify({
-                        amount: $("poAmount").value.trim(),
+                        amount: amountRaw,
                         method: $("poMethod").value,
                         txn_no: $("poTxnNo").value.trim(),
                     }),
@@ -3138,7 +3197,7 @@
                 loadOrders();
             } catch (err) {
                 if (epoch !== state.authEpoch) return;
-                setInlineAlert($("payOrderError"), `支付/退款被拦截 (${err.status || "-"})：${err.message}`);
+                setInlineAlert($("payOrderError"), `支付被拦截 (${err.status || "-"})：${err.message}`);
             } finally {
                 submitBtn.disabled = false;
             }
@@ -3502,6 +3561,52 @@
         });
         $("refreshDiffsBtn").addEventListener("click", () => loadDiffs(1));
 
+        // 订单退款：调用独立的 /refund 接口（后端生成负数流水），金额在这里校验后取负
+        $("roTxnNo").value = genTxnNo("REF");
+        $("genRefundTxnBtn").addEventListener("click", () => {
+            $("roTxnNo").value = genTxnNo("REF");
+        });
+        $("refundOrderForm").addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const submitBtn = $("refundOrderForm").querySelector('button[type="submit"]');
+            if (submitBtn) submitBtn.disabled = true;
+            setInlineAlert($("refundOrderError"), "");
+            const epoch = state.authEpoch;
+            const orderId = Number($("roOrderId").value);
+            const amtRaw = $("roAmount").value.trim();
+            const txnNo = $("roTxnNo").value.trim();
+            try {
+                if (!Number.isInteger(orderId) || orderId < 1) {
+                    setInlineAlert($("refundOrderError"), "请填写有效的订单 ID（正整数）。");
+                    return;
+                }
+                // 金额全程按字符串处理，避免浮点误差（项目规范：金额保持 Decimal 语义）
+                if (!/^\d+(\.\d{1,2})?$/.test(amtRaw) || Number(amtRaw) <= 0) {
+                    setInlineAlert($("refundOrderError"), "退款金额需为大于 0 的金额（最多两位小数）。");
+                    return;
+                }
+                const { data } = await apiFetch(`/api/orders/${orderId}/refund`, {
+                    method: "POST",
+                    body: JSON.stringify({
+                        amount: `-${amtRaw}`,
+                        method: $("roMethod").value,
+                        txn_no: txnNo,
+                    }),
+                });
+                if (epoch !== state.authEpoch) return;
+                showToast(`退款已记账：${data.txn_no}（¥${data.amount} · ${data.status}）`);
+                $("roAmount").value = "";
+                $("roTxnNo").value = genTxnNo("REF");
+                loadBills();
+                if (state.activePanel === "panel-orders") loadOrders();
+            } catch (err) {
+                if (epoch !== state.authEpoch) return;
+                setInlineAlert($("refundOrderError"), `退款被拦截 (${err.status || "-"})：${err.message}`);
+            } finally {
+                if (submitBtn) syncRoleActionVisibility();
+            }
+        });
+
         $("billsBody").addEventListener("click", (e) => {
             const detailBtn = e.target.closest(".view-bill-detail-btn");
             const invBtn = e.target.closest(".issue-invoice-btn");
@@ -3510,13 +3615,17 @@
             } else if (invBtn) {
                 const billId = invBtn.dataset.billId;
                 const uninvoiced = invBtn.dataset.uninvoiced;
+                if (!(Number(uninvoiced) > 0)) {
+                    showToast("该结算单已全额开票，无需重复开票", true);
+                    return;
+                }
                 openActionDialog({
                     title: `为结算单 #${billId} 开具发票`,
                     desc: `账单应付 ¥${invBtn.dataset.payable}，当前剩余未开票 ¥${uninvoiced}。开票金额不可超出剩余未开票额度。`,
                     submitText: "确认开票",
                     fields: [
                         { name: "invoice_no", label: "发票号码", value: genTxnNo("INV").slice(0, 18), minlength: 4, maxlength: 32, required: true },
-                        { name: "amount", label: "开票金额 (¥)", value: Number(uninvoiced) > 0 ? uninvoiced : "100.00", inputmode: "decimal", required: true },
+                        { name: "amount", label: "开票金额 (¥)", value: uninvoiced, inputmode: "decimal", required: true },
                         {
                             name: "invoice_type",
                             label: "发票类型",
@@ -3649,6 +3758,11 @@
             probeEndpoint("POST", "/api/stations/piles/1/commission", { remark: "重复验收已投运充电桩" })
         );
         $("probeOverpayBtn").addEventListener("click", async () => {
+            const role = state.user?.role;
+            if (role !== "driver" && role !== "fleet") {
+                showToast("超额支付拦截由 /api/orders/{id}/pay 触发，该接口只对车主与车队开放，请先在顶栏切换角色后再测", true);
+                return;
+            }
             let targetOrderId = 6;
             if (state.user && (state.user.role === "driver" || state.user.role === "fleet")) {
                 try {
@@ -3824,7 +3938,9 @@
         } else {
             renderUserContext();
             showAuthView(initialAuthMode || "login", { updateHash: true });
-            if (restored.reason === "transient") {
+            if (restored.reason === "invalid") {
+                setInlineAlert($("authError"), "登录状态已失效，请重新登录或选择演示角色进入。");
+            } else if (restored.reason === "transient") {
                 setInlineAlert(
                     $("authError"),
                     `恢复登录会话失败 (${restored.err?.status || "网络异常"})，已保留本地凭证，可刷新重试或重新登录。`
