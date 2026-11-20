@@ -160,22 +160,54 @@ class UserModuleTestCase(unittest.TestCase):
         )
         return campaign.campaign_id
 
-    def _free_paid_order(self) -> tuple[int, int, Decimal]:
-        """取第一张“已支付且尚未核销过任何券”的订单（连同车主与金额）。
+    _order_seq = 0
 
-        种子数据已经为 10 张订单各核销过一张券（一单一券），若测试复用这些订单，
-        第二张券必然撞 uk_redeem_order，所以这里只挑没有核销记录的空闲订单。
+    @classmethod
+    def _next_order_seq(cls) -> int:
+        cls._order_seq += 1
+        return cls._order_seq
+
+    def _finished_unpaid_order(self, user_id: int, amount: Decimal = Decimal("20.00")) -> tuple[int, Decimal]:
+        """造一笔“已结束且未支付”的订单，用于核销正向用例。
+
+        Issue #19 整改后核销只允许 FINISHED + paid_amount = 0 的订单
+        （已支付/已取消/已退款一律拒绝），而种子里的已支付订单不能再被抵扣，
+        因此测试自行插入一笔待支付订单。
         """
-        row = self.db.execute(
+        gun = self.db.execute(
             text(
-                "SELECT o.order_id, o.user_id, o.total_amount "
-                "FROM charge_order AS o "
-                "LEFT JOIN coupon_redeem_record AS d ON d.order_id = o.order_id "
-                "WHERE o.status = 'PAID' AND o.total_amount > 0.00 AND d.order_id IS NULL "
-                "ORDER BY o.order_id LIMIT 1"
+                "SELECT g.gun_id, p.station_id FROM charging_gun AS g "
+                "JOIN charging_pile AS p ON p.pile_id = g.pile_id ORDER BY g.gun_id LIMIT 1"
             )
         ).one()
-        return int(row[0]), int(row[1]), Decimal(str(row[2]))
+        order_no = f"UNITTEST{user_id}_{self._next_order_seq()}"
+        self.db.execute(
+            text(
+                "INSERT INTO charge_order "
+                "(order_no, user_id, gun_id, station_id, start_time, end_time, kwh, "
+                " total_amount, paid_amount, status) "
+                "VALUES (:no, :uid, :gid, :sid, NOW() - INTERVAL 1 HOUR, NOW(), 20.000, "
+                "        :amt, 0.00, 'FINISHED')"
+            ),
+            {
+                "no": order_no,
+                "uid": user_id,
+                "gid": gun[0],
+                "sid": gun[1],
+                "amt": amount,
+            },
+        )
+        self.db.commit()
+        order_id = int(
+            self.db.execute(
+                text(
+                    "SELECT order_id FROM charge_order WHERE user_id = :uid "
+                    "AND order_no = :no ORDER BY order_id DESC LIMIT 1"
+                ),
+                {"uid": user_id, "no": order_no},
+            ).scalar_one()
+        )
+        return order_id, amount
 
     # ---------- 1. 契约 ----------
     def test_routes_registered(self) -> None:
@@ -255,25 +287,18 @@ class UserModuleTestCase(unittest.TestCase):
 
     # ---------- 5. 核销闭环 ----------
     def test_redeem_updates_coupon_and_order(self) -> None:
-        order_id, owner_id, total_before = self._free_paid_order()
+        order_id, total_before = self._finished_unpaid_order(9016)
         campaign_id = self._new_campaign()
         issued = user_dao.issue_coupons(
-            self.db, campaign_id, CouponIssueIn(user_id=owner_id, count=1, channel="ACTIVITY")
+            self.db, campaign_id, CouponIssueIn(user_id=9016, count=1, channel="ACTIVITY")
         )
         coupon_no = issued["coupon_nos"][0]
-        discount_before = Decimal(
-            str(
-                self.db.execute(
-                    text("SELECT discount_amount FROM charge_order WHERE order_id = :o"),
-                    {"o": order_id},
-                ).scalar_one()
-            )
-        )
 
         out = user_dao.redeem_coupon(
-            self.db, owner_id, CouponRedeemIn(coupon_no=coupon_no, order_id=order_id)
+            self.db, 9016, CouponRedeemIn(coupon_no=coupon_no, order_id=order_id)
         )
         self.assertEqual(out.face_value, Decimal("5.00"))
+        self.assertEqual(out.order_amount, total_before)
         self.assertEqual(out.payable_amount, total_before - Decimal("5.00"))
 
         coupon_status = self.db.execute(
@@ -283,12 +308,13 @@ class UserModuleTestCase(unittest.TestCase):
 
         row = self.db.execute(
             text(
-                "SELECT discount_amount, total_amount FROM charge_order WHERE order_id = :o"
+                "SELECT discount_amount, total_amount, status FROM charge_order WHERE order_id = :o"
             ),
             {"o": order_id},
         ).one()
-        self.assertEqual(Decimal(str(row[0])), discount_before + Decimal("5.00"))
+        self.assertEqual(Decimal(str(row[0])), Decimal("5.00"))
         self.assertEqual(Decimal(str(row[1])), total_before - Decimal("5.00"))
+        self.assertEqual(row[2], "FINISHED", "未结清时订单应保持待支付")
 
         redeem_cnt = self.db.execute(
             text("SELECT COUNT(*) FROM coupon_redeem_record WHERE coupon_id = ("
@@ -297,39 +323,93 @@ class UserModuleTestCase(unittest.TestCase):
         ).scalar_one()
         self.assertEqual(int(redeem_cnt), 1)
 
-    # ---------- 6. 一单一券 / 重复核销 ----------
-    def test_second_coupon_on_same_order_raises_1062(self) -> None:
-        order_id, owner_id, _ = self._free_paid_order()
-        campaign_id = self._new_campaign(per_user_limit=2)
-        issued = user_dao.issue_coupons(
-            self.db, campaign_id, CouponIssueIn(user_id=owner_id, count=2, channel="ACTIVITY")
+    def test_redeem_on_paid_order_rejected(self) -> None:
+        """Issue #19 Critical-1：已支付订单不允许用券，否则会算出负数待付金额。"""
+        paid = self.db.execute(
+            text("SELECT order_id, total_amount FROM charge_order "
+                 "WHERE status = 'PAID' AND paid_amount > 0 ORDER BY order_id LIMIT 1")
+        ).one()
+        order_id = int(paid[0])
+        owner_id = int(
+            self.db.execute(
+                text("SELECT user_id FROM charge_order WHERE order_id = :o"), {"o": order_id}
+            ).scalar_one()
         )
-        first, second = issued["coupon_nos"]
-
-        user_dao.redeem_coupon(
-            self.db, owner_id, CouponRedeemIn(coupon_no=first, order_id=order_id)
-        )
-        with self.assertRaises(IntegrityError) as ctx:
-            user_dao.redeem_coupon(
-                self.db, owner_id, CouponRedeemIn(coupon_no=second, order_id=order_id)
-            )
-        self.assertIn("1062", str(ctx.exception.orig))
-        self.db.rollback()
-
-    def test_double_redeem_same_coupon_raises_1644(self) -> None:
-        order_id, owner_id, _ = self._free_paid_order()
         campaign_id = self._new_campaign()
         issued = user_dao.issue_coupons(
             self.db, campaign_id, CouponIssueIn(user_id=owner_id, count=1, channel="ACTIVITY")
         )
         coupon_no = issued["coupon_nos"][0]
 
-        user_dao.redeem_coupon(
-            self.db, owner_id, CouponRedeemIn(coupon_no=coupon_no, order_id=order_id)
-        )
+        before = self.db.execute(
+            text("SELECT total_amount, paid_amount, discount_amount FROM charge_order WHERE order_id = :o"),
+            {"o": order_id},
+        ).one()
         with self.assertRaises(OperationalError) as ctx:
             user_dao.redeem_coupon(
                 self.db, owner_id, CouponRedeemIn(coupon_no=coupon_no, order_id=order_id)
+            )
+        self.assertIn("1644", str(ctx.exception.orig))
+        self.assertIn("仅已结束且未支付", str(ctx.exception.orig))
+        self.db.rollback()
+
+        after = self.db.execute(
+            text("SELECT total_amount, paid_amount, discount_amount FROM charge_order WHERE order_id = :o"),
+            {"o": order_id},
+        ).one()
+        self.assertEqual([str(v) for v in after], [str(v) for v in before], "失败的核销不得改动订单金额")
+
+    def test_redeem_zero_payable_marks_order_paid(self) -> None:
+        """折扣后应付为 0 时应自动置 PAID，避免留下 0 元待支付僵尸单。"""
+        order_id, _ = self._finished_unpaid_order(9017, amount=Decimal("5.00"))
+        campaign_id = self._new_campaign(face="5.00")
+        issued = user_dao.issue_coupons(
+            self.db, campaign_id, CouponIssueIn(user_id=9017, count=1, channel="ACTIVITY")
+        )
+        coupon_no = issued["coupon_nos"][0]
+
+        out = user_dao.redeem_coupon(
+            self.db, 9017, CouponRedeemIn(coupon_no=coupon_no, order_id=order_id)
+        )
+        self.assertEqual(out.payable_amount, Decimal("0.00"))
+        status = self.db.execute(
+            text("SELECT status FROM charge_order WHERE order_id = :o"), {"o": order_id}
+        ).scalar_one()
+        self.assertEqual(status, "PAID")
+
+    # ---------- 6. 一单一券 / 重复核销 ----------
+    def test_second_coupon_on_same_order_raises_1062(self) -> None:
+        order_id, _ = self._finished_unpaid_order(9018)
+        campaign_id = self._new_campaign(per_user_limit=2)
+        issued = user_dao.issue_coupons(
+            self.db, campaign_id, CouponIssueIn(user_id=9018, count=2, channel="ACTIVITY")
+        )
+        first, second = issued["coupon_nos"]
+
+        user_dao.redeem_coupon(
+            self.db, 9018, CouponRedeemIn(coupon_no=first, order_id=order_id)
+        )
+        with self.assertRaises(IntegrityError) as ctx:
+            user_dao.redeem_coupon(
+                self.db, 9018, CouponRedeemIn(coupon_no=second, order_id=order_id)
+            )
+        self.assertIn("1062", str(ctx.exception.orig))
+        self.db.rollback()
+
+    def test_double_redeem_same_coupon_raises_1644(self) -> None:
+        order_id, _ = self._finished_unpaid_order(9019)
+        campaign_id = self._new_campaign()
+        issued = user_dao.issue_coupons(
+            self.db, campaign_id, CouponIssueIn(user_id=9019, count=1, channel="ACTIVITY")
+        )
+        coupon_no = issued["coupon_nos"][0]
+
+        user_dao.redeem_coupon(
+            self.db, 9019, CouponRedeemIn(coupon_no=coupon_no, order_id=order_id)
+        )
+        with self.assertRaises(OperationalError) as ctx:
+            user_dao.redeem_coupon(
+                self.db, 9019, CouponRedeemIn(coupon_no=coupon_no, order_id=order_id)
             )
         self.assertIn("1644", str(ctx.exception.orig))
         self.assertIn("重复核销", str(ctx.exception.orig))

@@ -16,11 +16,12 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+from uuid import uuid4
+
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.dao.common import (
-    create_account,
     encrypt_sensitive,
     fetch_view_page,
     hash_sensitive_lookup,
@@ -45,13 +46,15 @@ SQL_USER_ONE = "SELECT * FROM v_user_masked_profile WHERE user_id = :uid"
 SQL_VEHICLE_LIST = "SELECT * FROM v_vehicle_binding WHERE 1 = 1"
 SQL_COUPON_WALLET = "SELECT * FROM v_coupon_user_wallet WHERE 1 = 1"
 SQL_CAMPAIGN_STAT = "SELECT * FROM v_coupon_campaign_stat WHERE 1 = 1"
+SQL_PUBLIC_CAMPAIGN = "SELECT * FROM v_coupon_public_campaign WHERE 1 = 1"
 SQL_FLEET_CREDIT = "SELECT * FROM v_fleet_credit_usage WHERE 1 = 1"
+SQL_REDEEM_LEDGER = "SELECT * FROM v_coupon_redeem_ledger WHERE 1 = 1"
 
 # 动态过滤片段白名单：键 -> 参数化 SQL 片段（值永远走 :param 绑定）
 _USER_FILTERS = {
     "role": " AND role = :role",
     "status": " AND status = :status",
-    "keyword": " AND (username LIKE :keyword OR phone_masked LIKE :keyword)",
+    "keyword": " AND (username LIKE :keyword ESCAPE '\\\\' OR phone_masked LIKE :keyword ESCAPE '\\\\')",
 }
 _VEHICLE_FILTERS = {
     "user_id": " AND user_id = :user_id",
@@ -91,8 +94,15 @@ def list_users(
         sql += _USER_FILTERS["status"]
         params["status"] = status
     if keyword and keyword.strip():
+        # 转义 LIKE 通配符：否则用户输入 "%" / "_" 会变成通配查询（可探测全表）
+        escaped = (
+            keyword.strip()
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
         sql += _USER_FILTERS["keyword"]
-        params["keyword"] = f"%{keyword.strip()}%"
+        params["keyword"] = f"%{escaped}%"
     return fetch_view_page(db, sql, params, page, "created_at DESC, user_id ASC")
 
 
@@ -120,36 +130,52 @@ def create_staff_account(
     payload: UserRegisterIn,
     password_hash: str,
 ) -> UserAccount:
-    """管理员代开运维/结算/管理员/车队账号：复用公共底座写入加密手机号，再补业务档案列。"""
-    account = create_account(
-        db=db,
-        username=payload.username,
-        password_hash=password_hash,
-        role=payload.role.value,
-        phone_plain=payload.phone,
-        fleet_id=payload.fleet_id,
-    )
-    # 公共底座只写认证必需列，实名状态/会员等级/注册渠道属于业务线4 的档案列，这里补齐
-    db.execute(
-        text(
-            "UPDATE user_account "
-            "SET realname_status = :realname, "
-            "    realname_verified_at = CASE WHEN :realname = 'VERIFIED' THEN NOW() ELSE NULL END, "
-            "    member_level = :level, "
-            "    register_channel = :channel "
-            "WHERE user_id = :uid"
-        ),
-        {
-            "realname": payload.realname_status,
-            "level": payload.member_level,
-            "channel": payload.register_channel,
-            "uid": account.user_id,
-        },
-    )
-    db.commit()
+    """管理员代开运维/结算/管理员/车队账号：一次 INSERT、一条事务。
 
-    entity = db.get(UserAccount, account.user_id)
-    if entity is None:  # pragma: no cover - 理论上提交成功后必然存在
+    公共底座的 create_account 内部自带 commit，若复用它再补档案列就会变成两次提交，
+    中途失败会留下"只有认证列、没有档案列"的半成品账号（违反 AGENTS.md 单事务原则）。
+    因此这里用一条 INSERT 写全所有列，密码哈希由调用方传入。
+    """
+    phone_cipher = encrypt_sensitive(payload.phone)
+    phone_hash = hash_sensitive_lookup(payload.phone)
+    phone_masked = mask_phone(payload.phone)
+
+    try:
+        result = db.execute(
+            text(
+                "INSERT INTO user_account ("
+                "username, password_hash, role, fleet_id, "
+                "phone_cipher, phone_hash, phone_masked, "
+                "realname_status, realname_verified_at, register_channel, member_level, "
+                "balance, status, failed_login_count"
+                ") VALUES ("
+                ":username, :password_hash, :role, :fleet_id, "
+                ":phone_cipher, :phone_hash, :phone_masked, "
+                ":realname, CASE WHEN :realname = 'VERIFIED' THEN NOW() ELSE NULL END, "
+                ":channel, :level, 0.00, 'ACTIVE', 0"
+                ")"
+            ),
+            {
+                "username": payload.username,
+                "password_hash": password_hash,
+                "role": payload.role.value,
+                "fleet_id": payload.fleet_id,
+                "phone_cipher": phone_cipher,
+                "phone_hash": phone_hash,
+                "phone_masked": phone_masked,
+                "realname": payload.realname_status,
+                "channel": payload.register_channel,
+                "level": payload.member_level,
+            },
+        )
+        user_id = int(result.lastrowid or 0)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    entity = db.get(UserAccount, user_id)
+    if entity is None:  # pragma: no cover - 提交成功后必然存在
         raise RuntimeError("账号写入后回读失败")
     return entity
 
@@ -159,8 +185,12 @@ def set_user_status(db: Session, user_id: int, status: str) -> UserAccount | Non
     entity = db.get(UserAccount, user_id)
     if entity is None:
         return None
-    entity.status = status
-    db.commit()
+    try:
+        entity.status = status
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(entity)
     return entity
 
@@ -203,25 +233,50 @@ def bind_vehicle(
 ) -> Vehicle:
     """绑定车辆：车牌经 Fernet 加密 + HMAC 盲索引 + 脱敏后落库。
 
-    车牌盲索引全局唯一：同一车牌第二次绑定会触发 uk_vehicle_plate_hash 的 1062，
-    由全局异常处理器翻译为 409，从结构上保证“同刻一车一主”。
+    一车同刻一主由生成列 active_plate_hash 上的唯一索引 uk_vehicle_active_plate 保证：
+    - 若该车牌存在**已解绑**的历史行，直接复用该行改回 BOUND（不新增行，保留档案与主键）；
+    - 若该车牌正被他人绑定，本次 INSERT 会撞唯一索引抛 1062，由全局处理器翻译为 409。
+    因此“解绑后车牌永久锁死”的问题不再存在。
     """
-    vehicle = Vehicle(
-        user_id=user_id,
-        fleet_id=fleet_id,
-        plate_cipher=encrypt_sensitive(payload.plate_no),
-        plate_hash=hash_sensitive_lookup(payload.plate_no),
-        plate_masked=mask_plate(payload.plate_no),
-        plate_color=payload.plate_color,
-        vehicle_model=payload.vehicle_model,
-        battery_capacity_kwh=payload.battery_capacity_kwh,
-        max_charge_power=payload.max_charge_power,
-        supports_fast_charge=payload.supports_fast_charge,
-        bind_status="BOUND",
-        bound_at=datetime.now(),
-    )
-    db.add(vehicle)
+    plate_hash = hash_sensitive_lookup(payload.plate_no)
+
     try:
+        reuse = db.execute(
+            select(Vehicle)
+            .where(Vehicle.plate_hash == plate_hash, Vehicle.bind_status == "UNBOUND")
+            .with_for_update()
+        ).scalars().first()
+
+        if reuse is not None:
+            vehicle = reuse
+            vehicle.user_id = user_id
+            vehicle.fleet_id = fleet_id
+            vehicle.bind_status = "BOUND"
+            vehicle.bound_at = datetime.now()
+            vehicle.plate_cipher = encrypt_sensitive(payload.plate_no)
+            vehicle.plate_masked = mask_plate(payload.plate_no)
+            vehicle.plate_color = payload.plate_color
+            vehicle.vehicle_model = payload.vehicle_model
+            vehicle.battery_capacity_kwh = payload.battery_capacity_kwh
+            vehicle.max_charge_power = payload.max_charge_power
+            vehicle.supports_fast_charge = payload.supports_fast_charge
+        else:
+            vehicle = Vehicle(
+                user_id=user_id,
+                fleet_id=fleet_id,
+                plate_cipher=encrypt_sensitive(payload.plate_no),
+                plate_hash=plate_hash,
+                plate_masked=mask_plate(payload.plate_no),
+                plate_color=payload.plate_color,
+                vehicle_model=payload.vehicle_model,
+                battery_capacity_kwh=payload.battery_capacity_kwh,
+                max_charge_power=payload.max_charge_power,
+                supports_fast_charge=payload.supports_fast_charge,
+                bind_status="BOUND",
+                bound_at=datetime.now(),
+            )
+            db.add(vehicle)
+
         db.commit()
     except Exception:
         db.rollback()
@@ -230,16 +285,33 @@ def bind_vehicle(
     return vehicle
 
 
-def unbind_vehicle(db: Session, vehicle_id: int, user_id: int | None = None) -> Vehicle | None:
-    """解绑车辆（置 UNBOUND 并清空车主）；非本人车辆返回 None，避免越权解绑。"""
+def unbind_vehicle(
+    db: Session,
+    vehicle_id: int,
+    user_id: int | None = None,
+    fleet_id: int | None = None,
+) -> Vehicle | None:
+    """解绑车辆：置 UNBOUND 并清空车主与车队，使该车牌可被任何人重新绑定。
+
+    归属校验：driver 传 user_id（只能解绑本人车），fleet 传 fleet_id（只能解绑本企业车），
+    不匹配一律返回 None，避免越权解绑并防止通过返回差异探测他人车辆。
+    """
     vehicle = db.get(Vehicle, vehicle_id)
     if vehicle is None:
         return None
     if user_id is not None and vehicle.user_id != user_id:
         return None
-    vehicle.bind_status = "UNBOUND"
-    vehicle.user_id = None
-    db.commit()
+    if fleet_id is not None and vehicle.fleet_id != fleet_id:
+        return None
+
+    try:
+        vehicle.bind_status = "UNBOUND"
+        vehicle.user_id = None
+        vehicle.fleet_id = None
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(vehicle)
     return vehicle
 
@@ -351,39 +423,85 @@ def list_campaigns(
 # ---------------------------------------------------------------------------
 # 五、优惠券发放与核销
 # ---------------------------------------------------------------------------
-def issue_coupons(db: Session, campaign_id: int, payload: CouponIssueIn) -> dict[str, Any]:
+def list_public_campaigns(
+    db: Session,
+    page: PageParams,
+    applicable_station_id: int | None = None,
+) -> dict[str, Any]:
+    """车主/车队可见的活动（视图已限定 ACTIVE 且当前在有效期内），不含运营内部指标。"""
+    sql = SQL_PUBLIC_CAMPAIGN
+    params: dict[str, Any] = {}
+    if applicable_station_id:
+        sql += " AND applicable_station_id = :station_id"
+        params["station_id"] = applicable_station_id
+    return fetch_view_page(db, sql, params, page, "face_value DESC, campaign_id DESC")
+
+
+def update_campaign_status(db: Session, campaign_id: int, status: str) -> CouponCampaign | None:
+    """活动状态流转（激活/暂停/结束）；活动不存在返回 None。"""
+    campaign = db.get(CouponCampaign, campaign_id)
+    if campaign is None:
+        return None
+    try:
+        campaign.status = status
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(campaign)
+    return campaign
+
+
+# ---------------------------------------------------------------------------
+# 五、优惠券发放与核销
+# ---------------------------------------------------------------------------
+def issue_coupons(
+    db: Session,
+    campaign_id: int,
+    payload: CouponIssueIn,
+    issued_by: int | None = None,
+) -> dict[str, Any]:
     """调用存储过程批量发券；活动状态、券量上限与每人限领均由发券触发器校验。
 
-    返回本次生成的券码，便于前端/客服把券码告知持券人。
+    返回本次生成的券码：过程按 8 位批次前缀生成券码，本事务内按前缀回查，
+    不再使用 “commit 后按 ORDER BY ... LIMIT” 的写法（并发发券时会取到别人的券）。
     """
-    db.execute(
-        text("CALL sp_issue_coupon_pack(:uid, :cid, :cnt, :channel, @issued)"),
-        {
-            "uid": payload.user_id,
-            "cid": campaign_id,
-            "cnt": payload.count,
-            "channel": payload.channel,
-        },
-    )
-    issued = int(db.execute(text("SELECT @issued")).scalar_one() or 0)
-    db.commit()
+    batch = uuid4().hex[:8].upper()
 
-    coupon_nos = [
-        str(row[0])
-        for row in db.execute(
-            text(
-                "SELECT coupon_no FROM coupon_record "
-                "WHERE user_id = :uid AND campaign_id = :cid "
-                "ORDER BY coupon_id DESC LIMIT :cnt"
-            ),
-            {"uid": payload.user_id, "cid": campaign_id, "cnt": max(issued, 1)},
-        ).all()
-    ]
+    try:
+        db.execute(
+            text("CALL sp_issue_coupon_pack(:uid, :cid, :cnt, :channel, :by, :batch, @issued)"),
+            {
+                "uid": payload.user_id,
+                "cid": campaign_id,
+                "cnt": payload.count,
+                "channel": payload.channel,
+                "by": issued_by,
+                "batch": batch,
+            },
+        )
+        issued = int(db.execute(text("SELECT @issued")).scalar_one() or 0)
+        coupon_nos = [
+            str(row[0])
+            for row in db.execute(
+                text(
+                    "SELECT coupon_no FROM coupon_record "
+                    "WHERE coupon_no LIKE CONCAT(:batch, '%') "
+                    "ORDER BY coupon_id ASC"
+                ),
+                {"batch": batch},
+            ).all()
+        ]
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
     return {
         "campaign_id": campaign_id,
         "user_id": payload.user_id,
         "issued_count": issued,
-        "coupon_nos": list(reversed(coupon_nos)) if issued else [],
+        "coupon_nos": coupon_nos,
     }
 
 
@@ -409,33 +527,30 @@ def list_my_coupons(
 def redeem_coupon(db: Session, user_id: int, payload: CouponRedeemIn) -> CouponRedeemOut:
     """调用存储过程核销优惠券。
 
-    过程内部：写 coupon_redeem_record -> 触发器回写券状态为 REDEEMED
-    -> 抵扣 charge_order.discount_amount / total_amount，全程一条事务；
+    过程内部：对券行与订单行加 FOR UPDATE 行锁 -> 校验归属/状态/场站/金额
+    -> 写 coupon_redeem_record（触发器回写券状态）-> 抵扣订单金额，
+    并通过 OUT 参数回传折前/折后应付，调用方无需在 commit 后再回查（避免脏读与竞态）。
     任一步失败（触发器 SIGNAL、uk_redeem_order 一单一券冲突）整体回滚。
     """
-    db.execute(
-        text("CALL sp_coupon_redeem(:cno, :oid, @discount)"),
-        {"cno": payload.coupon_no, "oid": payload.order_id},
-    )
-    discount = Decimal(str(db.execute(text("SELECT @discount")).scalar_one() or "0.00"))
-    db.commit()
+    try:
+        db.execute(
+            text("CALL sp_coupon_redeem(:cno, :oid, :uid, @discount, @before, @after)"),
+            {"cno": payload.coupon_no, "oid": payload.order_id, "uid": user_id},
+        )
+        discount = Decimal(str(db.execute(text("SELECT @discount")).scalar_one() or "0.00"))
+        before = Decimal(str(db.execute(text("SELECT @before")).scalar_one() or "0.00"))
+        after = Decimal(str(db.execute(text("SELECT @after")).scalar_one() or "0.00"))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
-    order = db.execute(
-        text(
-            "SELECT total_amount, discount_amount FROM charge_order WHERE order_id = :oid"
-        ),
-        {"oid": payload.order_id},
-    ).mappings().first()
-    if order is None:  # pragma: no cover - 过程内已校验订单存在
-        raise ValueError("充电订单不存在")
-
-    payable = Decimal(str(order["total_amount"]))
     return CouponRedeemOut(
         coupon_no=payload.coupon_no,
         order_id=payload.order_id,
         face_value=discount,
-        order_amount=payable + discount,
-        payable_amount=payable,
+        order_amount=before,
+        payable_amount=after,
     )
 
 
@@ -456,22 +571,16 @@ def list_redeem_records(
     user_id: int | None = None,
     station_id: int | None = None,
 ) -> dict[str, Any]:
-    """核销台账分页查询（admin / settlement 对账用）：券码 + 订单 + 抵扣金额。"""
-    sql = (
-        "SELECT d.redeem_id, d.coupon_id, c.coupon_no, d.order_id, d.user_id, "
-        "       d.station_id, d.face_value, d.order_amount, d.redeemed_at "
-        "FROM coupon_redeem_record AS d "
-        "INNER JOIN coupon_record AS c ON c.coupon_id = d.coupon_id "
-        "WHERE 1 = 1"
-    )
+    """核销台账分页查询（admin / settlement 对账用）：走视图 v_coupon_redeem_ledger。"""
+    sql = SQL_REDEEM_LEDGER
     params: dict[str, Any] = {}
     if user_id:
-        sql += " AND d.user_id = :user_id"
+        sql += " AND user_id = :user_id"
         params["user_id"] = user_id
     if station_id:
-        sql += " AND d.station_id = :station_id"
+        sql += " AND station_id = :station_id"
         params["station_id"] = station_id
-    return fetch_view_page(db, sql, params, page, "d.redeemed_at DESC, d.redeem_id DESC")
+    return fetch_view_page(db, sql, params, page, "redeemed_at DESC, redeem_id DESC")
 
 
 __all__ = [
@@ -486,8 +595,10 @@ __all__ = [
     "get_user_masked",
     "get_vehicle",
     "get_vehicle_masked",
+    "update_campaign_status",
     "issue_coupons",
     "list_campaigns",
+    "list_public_campaigns",
     "list_fleet_credit",
     "list_my_coupons",
     "list_redeem_records",

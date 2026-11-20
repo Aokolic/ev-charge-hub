@@ -171,15 +171,17 @@ def main() -> int:
     show("同一活动重复发券（应 400 触发限领）", status, again)
     assert status == 400, "超过每人限领应被触发器拒绝"
 
-    # ---------- 3. 车主核销：券 -> 订单抵扣 ----------
-    status, redeemed = call(
+    # ---------- 3. 车主核销：已支付订单必须被拒绝（Issue #19 Critical-1 的整改点） ----------
+    status, rejected = call(
         "POST",
         "/api/users/coupons/redeem",
         token=driver,
         body={"coupon_no": coupon_no, "order_id": order["order_id"]},
     )
-    show("车主核销优惠券", status, redeemed, ("coupon_no", "face_value", "payable_amount"))
-    assert status == 200, f"核销失败: {redeemed}"
+    show("对已支付订单核销（应 400 拦截）", status, rejected)
+    assert status == 400, f"已支付订单不应允许核销: {status} {rejected}"
+    assert "仅已结束且未支付" in str(rejected.get("detail", "")), "拦截原因应为订单状态不合法"
+    print("    说明：核销只允许 FINISHED 且 paid_amount = 0 的订单，正向用例见 tests/test_user.py")
 
     status, wallet = call("GET", "/api/users/coupons/mine?page_size=5", token=driver)
     show("车主券包（含可用标记）", status, wallet, ("total",))
