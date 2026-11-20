@@ -240,19 +240,24 @@ CREATE TABLE vehicle (
     user_id              BIGINT UNSIGNED                             NULL                    COMMENT '当前归属车主ID（未绑定为 NULL）',
     fleet_id             BIGINT UNSIGNED                             NULL                    COMMENT '所属企业车队ID（企业用车非空）',
     plate_cipher         VARCHAR(255)                                NOT NULL                COMMENT '车牌号密文（Fernet）',
-    plate_hash           CHAR(64)                                    NOT NULL                COMMENT '车牌号盲索引（HMAC-SHA256，全局唯一 = 一车一主）',
-    plate_masked         VARCHAR(20)                                 NOT NULL                COMMENT '车牌号脱敏展示（如 京A***15）',
+    plate_hash           CHAR(64)                                    NOT NULL                COMMENT '车牌号盲索引（HMAC-SHA256，全表检索用）',
+    plate_masked         VARCHAR(20)                                 NOT NULL                COMMENT '车牌号脱敏展示（如 京AD****01）',
     plate_color          ENUM('GREEN', 'BLUE', 'YELLOW', 'WHITE', 'BLACK') NOT NULL DEFAULT 'GREEN' COMMENT '号牌颜色（新能源多为 GREEN）',
     vehicle_model        VARCHAR(64)                                 NOT NULL                COMMENT '车型（如 比亚迪 汉 EV）',
     battery_capacity_kwh DECIMAL(8, 2)                               NOT NULL                COMMENT '电池容量（kWh）',
     max_charge_power     DECIMAL(8, 2)                               NOT NULL                COMMENT '车辆最大充电功率（kW）',
     supports_fast_charge TINYINT(1)                                  NOT NULL DEFAULT 1      COMMENT '是否支持直流快充：1-是, 0-否',
     bind_status          ENUM('BOUND', 'UNBOUND', 'DISABLED')        NOT NULL DEFAULT 'BOUND' COMMENT '绑定状态：BOUND-已绑定, UNBOUND-已解绑, DISABLED-停用',
+    -- “一车同刻一主”只约束在绑行：解绑后该生成列为 NULL，车牌可被重新绑定（否则车牌会被永久锁死）
+    active_plate_hash    CHAR(64) GENERATED ALWAYS AS (
+                             CASE WHEN bind_status = 'BOUND' THEN plate_hash END
+                         ) STORED                                         COMMENT '在绑状态下的车牌盲索引（解绑后为 NULL，供唯一索引使用）',
     bound_at             DATETIME                                    NULL                    COMMENT '最近一次绑定时间',
     created_at           DATETIME                                    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '记录创建时间',
     updated_at           DATETIME                                    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '记录更新时间',
     PRIMARY KEY (vehicle_id),
-    UNIQUE KEY uk_vehicle_plate_hash (plate_hash),
+    UNIQUE KEY uk_vehicle_active_plate (active_plate_hash),
+    KEY idx_vehicle_plate_hash (plate_hash),
     KEY idx_vehicle_user_status (user_id, bind_status),
     KEY idx_vehicle_fleet (fleet_id),
     CONSTRAINT fk_vehicle_user

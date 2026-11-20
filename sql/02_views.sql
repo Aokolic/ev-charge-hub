@@ -566,8 +566,13 @@ LEFT JOIN (
 LEFT JOIN (
     SELECT cc.user_id, COUNT(*) AS usable_coupon_cnt
     FROM coupon_record AS cc
+    INNER JOIN coupon_campaign AS cp
+        ON cp.campaign_id = cc.campaign_id
+    -- 与核销触发器口径一致：券未用、未过期，且活动仍在投放、在有效期内
     WHERE cc.status = 'ISSUED'
       AND cc.expire_at >= CURDATE()
+      AND cp.status = 'ACTIVE'
+      AND CURDATE() BETWEEN cp.valid_from AND cp.valid_to
     GROUP BY cc.user_id
 ) AS c
     ON c.user_id = u.user_id;
@@ -620,8 +625,12 @@ SELECT
     c.expire_at,
     c.status,
     cp.redeem_rule,
+    -- 可用口径与核销触发器保持一致：券未用、未过期，且所属活动仍在投放且处于有效期
     CASE
-        WHEN c.status = 'ISSUED' AND c.expire_at >= CURDATE() THEN 1
+        WHEN c.status = 'ISSUED'
+         AND c.expire_at >= CURDATE()
+         AND cp.status = 'ACTIVE'
+         AND CURDATE() BETWEEN cp.valid_from AND cp.valid_to THEN 1
         ELSE 0
     END                                        AS usable_flag,
     GREATEST(DATEDIFF(c.expire_at, CURDATE()), 0) AS days_to_expire
@@ -712,7 +721,72 @@ LEFT JOIN (
     INNER JOIN user_account AS ua
         ON ua.user_id = co.user_id
     WHERE ua.fleet_id IS NOT NULL
-      AND DATE_FORMAT(co.start_time, '%Y-%m') = DATE_FORMAT(CURDATE(), '%Y-%m')
+      -- 半开区间写法命中 idx_order_user(user_id, start_time)，避免 DATE_FORMAT 破坏索引；
+      -- 同时排除已取消/已退款订单，避免把无效订单算进“本月消费”
+      AND co.start_time >= DATE_FORMAT(CURDATE(), '%Y-%m-01')
+      AND co.start_time <  DATE_FORMAT(CURDATE() + INTERVAL 1 MONTH, '%Y-%m-01')
+      AND co.status NOT IN ('CANCELLED', 'REFUNDED')
     GROUP BY ua.fleet_id
 ) AS o
     ON o.fleet_id = f.fleet_id;
+
+
+-- ----------------------------------------------------------------------------
+-- 视图 4.6：v_coupon_public_campaign（面向 driver / fleet 的活动公开信息）
+-- 隔离边界：只暴露“能领什么券、门槛多少、什么时候到期、哪个站能用”，
+--           预算（issue_total）、已发量、核销量与核销率等内部运营指标一律不出，
+--           且只放行“投放中 + 当前在有效期内”的活动（driver / fleet 专用）。
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_coupon_public_campaign AS
+SELECT
+    cp.campaign_id,
+    cp.campaign_code,
+    cp.campaign_name,
+    cp.coupon_kind,
+    cp.face_value,
+    cp.threshold_amount,
+    cp.applicable_station_id,
+    s.station_name,
+    cp.valid_from,
+    cp.valid_to,
+    cp.per_user_limit,
+    cp.redeem_rule
+FROM coupon_campaign AS cp
+LEFT JOIN station AS s
+    ON s.station_id = cp.applicable_station_id
+WHERE cp.status = 'ACTIVE'
+  AND CURDATE() BETWEEN cp.valid_from AND cp.valid_to;
+
+
+-- ----------------------------------------------------------------------------
+-- 视图 4.7：v_coupon_redeem_ledger（面向 admin / settlement 的核销台账）
+-- 隔离边界：券码 + 订单 + 场站 + 抵扣额 + 核销人脱敏手机号，
+--           供对账与客诉追溯；不含券密文与订单内部字段。
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW v_coupon_redeem_ledger AS
+SELECT
+    d.redeem_id,
+    d.coupon_id,
+    c.coupon_no,
+    c.campaign_id,
+    cp.campaign_name,
+    cp.coupon_kind,
+    d.order_id,
+    d.user_id,
+    u.username,
+    u.phone_masked,
+    d.station_id,
+    s.station_code,
+    s.station_name,
+    d.face_value,
+    d.order_amount,
+    d.redeemed_at
+FROM coupon_redeem_record AS d
+INNER JOIN coupon_record AS c
+    ON c.coupon_id = d.coupon_id
+INNER JOIN coupon_campaign AS cp
+    ON cp.campaign_id = c.campaign_id
+LEFT JOIN user_account AS u
+    ON u.user_id = d.user_id
+LEFT JOIN station AS s
+    ON s.station_id = d.station_id;

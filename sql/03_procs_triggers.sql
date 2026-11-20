@@ -977,12 +977,14 @@ BEGIN
     DECLARE v_issued INT DEFAULT 0;
     DECLARE v_limit  TINYINT UNSIGNED;
     DECLARE v_face   DECIMAL(8,2);
+    DECLARE v_thresh DECIMAL(8,2);
     DECLARE v_got    INT DEFAULT 0;
 
     IF COALESCE(@skip_coupon_guard, 0) = 0 THEN
         -- 锁住活动行：并发发券时串行化，防止 issued_count 超发
-        SELECT status, valid_from, valid_to, issue_total, issued_count, per_user_limit, face_value
-          INTO v_status, v_from, v_to, v_total, v_issued, v_limit, v_face
+        SELECT status, valid_from, valid_to, issue_total, issued_count, per_user_limit,
+               face_value, threshold_amount
+          INTO v_status, v_from, v_to, v_total, v_issued, v_limit, v_face, v_thresh
           FROM coupon_campaign
          WHERE campaign_id = NEW.campaign_id
            FOR UPDATE;
@@ -1004,6 +1006,12 @@ BEGIN
         END IF;
         IF NEW.face_value <> v_face THEN
             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '券面额与活动配置不一致';
+        END IF;
+        IF NEW.threshold_amount <> v_thresh THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '券使用门槛与活动配置不一致';
+        END IF;
+        IF NEW.expire_at < CURDATE() THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '券到期日不得早于今天，否则发放即失效';
         END IF;
 
         SELECT COUNT(*) INTO v_got
@@ -1051,6 +1059,9 @@ BEGIN
     DECLARE v_c_station BIGINT UNSIGNED;
     DECLARE v_o_owner  BIGINT UNSIGNED;
     DECLARE v_o_status VARCHAR(20);
+    DECLARE v_o_paid   DECIMAL(12,2);
+    DECLARE v_o_station BIGINT UNSIGNED;
+    DECLARE v_o_total  DECIMAL(10,2);
 
     IF COALESCE(@skip_coupon_guard, 0) = 0 THEN
         SELECT user_id, status, expire_at, face_value, threshold_amount, campaign_id
@@ -1086,18 +1097,32 @@ BEGIN
             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '该券仅限指定场站使用';
         END IF;
 
-        SELECT user_id, status
-          INTO v_o_owner, v_o_status
+        -- 锁住订单行，避免与支付/退款并发把金额改乱
+        SELECT user_id, status, paid_amount, station_id, total_amount
+          INTO v_o_owner, v_o_status, v_o_paid, v_o_station, v_o_total
           FROM charge_order
-         WHERE order_id = NEW.order_id;
+         WHERE order_id = NEW.order_id
+           FOR UPDATE;
         IF v_o_owner IS NULL THEN
             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '核销关联的充电订单不存在';
         END IF;
         IF v_o_owner <> NEW.user_id THEN
             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单不属于当前用户，禁止核销';
         END IF;
-        IF v_o_status = 'CHARGING' THEN
-            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单仍在充电中，结束后才能核销优惠券';
+        -- 只允许“已结束且未支付”的订单用券：已支付/已取消/已退款订单一律拒绝，
+        -- 否则会把已付订单的应付金额改成负数，形成“平台倒欠用户”的账并污染月结
+        IF v_o_status <> 'FINISHED' THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '仅已结束且未支付的订单可用券抵扣，当前订单状态不可核销';
+        END IF;
+        IF v_o_paid <> 0.00 THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单已支付或已部分支付，不能再用券抵扣';
+        END IF;
+        -- 不信任调用方传入的场站与金额，必须与订单实际值一致，防止伪造抵扣
+        IF NEW.station_id <> v_o_station THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '核销场站与订单所属场站不一致';
+        END IF;
+        IF NEW.order_amount <> v_o_total THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '核销时订单金额与订单实际金额不一致';
         END IF;
 
         IF NEW.order_amount < v_thresh THEN
@@ -1142,7 +1167,12 @@ END$$
 
 -- ----------------------------------------------------------------------------
 -- 存储过程 4.1：批量发券（新人券包 / 运营定向投放），逐张过 4.1 触发器校验
--- 调用方式：CALL sp_issue_coupon_pack(9001, 1, 2, 'NEW_USER_PACK', @issued);
+-- 说明：
+--   1. p_issued_by 记录发券管理员，便于审计“哪张券是谁发的”；
+--   2. p_batch 是本次发券的批次前缀，券码 = 批次(8) + UUID 片段(24)，
+--      DAO 用它在本事务内按前缀回查本次生成的券码，避免 “commit 后按 LIMIT 回查”
+--      在并发发券时取到别人的券（竞态）。
+-- 调用方式：CALL sp_issue_coupon_pack(9001, 1, 2, 'NEW_USER_PACK', 1, 'B7C1A2D3', @issued);
 -- ----------------------------------------------------------------------------
 CREATE PROCEDURE sp_issue_coupon_pack(
     IN  p_user_id     BIGINT UNSIGNED,
@@ -1151,6 +1181,8 @@ CREATE PROCEDURE sp_issue_coupon_pack(
     -- 显式声明表列的字符集与排序规则：过程参数默认继承“建库时的库默认排序规则”，
     -- 若测试库用 utf8mb4_0900_ai_ci 而表是 utf8mb4_unicode_ci，字符串比对会报 1267
     IN  p_channel     VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
+    IN  p_issued_by   BIGINT UNSIGNED,
+    IN  p_batch       CHAR(8)     CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
     OUT p_issued      INT
 )
 BEGIN
@@ -1162,6 +1194,9 @@ BEGIN
 
     IF p_count IS NULL OR p_count < 1 THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '发券张数必须大于 0';
+    END IF;
+    IF p_batch IS NULL OR CHAR_LENGTH(p_batch) <> 8 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '发券批次号必须为 8 位字符';
     END IF;
 
     SELECT valid_to, face_value, threshold_amount
@@ -1176,14 +1211,14 @@ BEGIN
     SET p_issued  = 0;
 
     WHILE v_i < p_count DO
-        -- 券码：CP + 30 位无连字符 UUID，满足 VARCHAR(32) 与唯一索引约束
+        -- 券码：批次前缀(8) + 24 位无连字符 UUID，共 32 位，满足 VARCHAR(32) 与唯一索引
         INSERT INTO coupon_record
             (coupon_no, campaign_id, user_id, face_value, threshold_amount,
              issue_channel, issued_by, expire_at, status)
         VALUES
-            (CONCAT('CP', SUBSTRING(REPLACE(UUID(), '-', ''), 1, 30)),
+            (CONCAT(p_batch, SUBSTRING(REPLACE(UUID(), '-', ''), 1, 24)),
              p_campaign_id, p_user_id, v_face, v_thresh,
-             v_channel, NULL, v_valid_to, 'ISSUED');
+             v_channel, p_issued_by, v_valid_to, 'ISSUED');
         SET v_i      = v_i + 1;
         SET p_issued = p_issued + 1;
     END WHILE;
@@ -1191,16 +1226,22 @@ END$$
 
 -- ----------------------------------------------------------------------------
 -- 存储过程 4.2：优惠券核销（写核销记录 -> 触发器回写券状态 -> 抵扣订单金额）
--- 说明：抵扣额取 LEAST(券面额, 订单金额)，因此 chk_redeem_face 与门槛校验仍成立；
---       整个过程一条事务：任一步失败（触发器 SIGNAL / 唯一索引冲突）整体回滚，
---       订单不会被脏扣，券也不会变成“已核销”。
--- 调用方式：CALL sp_coupon_redeem('CPxxxx', 10001, @discount);
+-- 说明：
+--   1. 全程对 charge_order 加 FOR UPDATE 行锁，抵扣基于锁内读到的真实金额，
+--      并在同一事务内把“折前/折后应付”通过 OUT 参数交回调用方，避免 commit 后再回查；
+--   2. 只允许“已结束且未支付”的订单（触发器会二次校验），抵扣后若应付变为 0
+--      则直接置为 PAID，避免留下“金额为 0 却待支付”的僵尸订单；
+--   3. p_user_id 用于校验“当前登录人就是订单车主”，防止拿着别人的券码核销他人订单。
+-- 调用方式：CALL sp_coupon_redeem('CPxxxx', 10001, 9001, @discount, @before, @after);
 -- ----------------------------------------------------------------------------
 CREATE PROCEDURE sp_coupon_redeem(
     -- 券码参数显式指定表列的排序规则，避免与 coupon_record.coupon_no 比对时报 1267
     IN  p_coupon_no VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
     IN  p_order_id  BIGINT,
-    OUT p_discount  DECIMAL(10,2)
+    IN  p_user_id   BIGINT UNSIGNED,
+    OUT p_discount     DECIMAL(10,2),
+    OUT p_total_before DECIMAL(10,2),
+    OUT p_total_after  DECIMAL(10,2)
 )
 BEGIN
     DECLARE v_coupon_id  BIGINT UNSIGNED;
@@ -1208,22 +1249,33 @@ BEGIN
     DECLARE v_order_user BIGINT UNSIGNED;
     DECLARE v_station    BIGINT UNSIGNED;
     DECLARE v_amount     DECIMAL(10,2);
+    DECLARE v_paid       DECIMAL(10,2);
+    DECLARE v_status     VARCHAR(20);
     DECLARE v_discount   DECIMAL(10,2);
 
     SELECT coupon_id, face_value
       INTO v_coupon_id, v_face
       FROM coupon_record
-     WHERE coupon_no = p_coupon_no;
+     WHERE coupon_no = p_coupon_no
+       FOR UPDATE;
     IF v_coupon_id IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '券码不存在';
     END IF;
 
-    SELECT user_id, station_id, COALESCE(total_amount, 0.00)
-      INTO v_order_user, v_station, v_amount
+    SELECT user_id, station_id, COALESCE(total_amount, 0.00),
+           COALESCE(paid_amount, 0.00), status
+      INTO v_order_user, v_station, v_amount, v_paid, v_status
       FROM charge_order
-     WHERE order_id = p_order_id;
+     WHERE order_id = p_order_id
+       FOR UPDATE;
     IF v_order_user IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '充电订单不存在';
+    END IF;
+    IF p_user_id IS NOT NULL AND v_order_user <> p_user_id THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '只能核销本人订单上的优惠券';
+    END IF;
+    IF v_status <> 'FINISHED' OR v_paid <> 0.00 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '仅已结束且未支付的订单可用券抵扣';
     END IF;
     IF v_amount <= 0.00 THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单金额为 0，无法使用优惠券';
@@ -1236,9 +1288,13 @@ BEGIN
     VALUES
         (v_coupon_id, p_order_id, v_order_user, v_station, v_discount, v_amount);
 
+    SET p_total_before = v_amount;
+    SET p_total_after  = GREATEST(v_amount - v_discount, 0.00);
+
     UPDATE charge_order
        SET discount_amount = discount_amount + v_discount,
-           total_amount    = GREATEST(total_amount - v_discount, 0.00)
+           total_amount    = p_total_after,
+           status          = CASE WHEN p_total_after = 0.00 THEN 'PAID' ELSE status END
      WHERE order_id = p_order_id;
 
     SET p_discount = v_discount;

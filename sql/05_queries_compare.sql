@@ -871,8 +871,9 @@ WHERE f.status = 'ACTIVE'
   AND LOWER(u.role) = 'fleet'
 ORDER BY f.fleet_code ASC, u.user_id ASC;
 
--- [实现 B - 优化]：派生表单次预聚合后连接，并直接复用视图 v_user_masked_profile
---                 （视图内已算好 vehicle_cnt / usable_coupon_cnt，且只出脱敏手机号）
+-- [实现 B - 优化]：直接复用视图 v_user_masked_profile（视图内已把 vehicle_cnt /
+--                 usable_coupon_cnt 一次预聚合好，且只出脱敏手机号），
+--                 此处不再重复 join vehicle 做二次聚合
 EXPLAIN ANALYZE
 SELECT
     f.fleet_code,
@@ -880,26 +881,19 @@ SELECT
     p.user_id,
     p.username,
     p.phone_masked,
-    COALESCE(v.vehicle_cnt, 0)                                          AS vehicle_cnt,
+    p.vehicle_cnt                                                       AS vehicle_cnt,
     p.usable_coupon_cnt                                                 AS usable_coupon_cnt
 FROM fleet_account AS f
 INNER JOIN v_user_masked_profile AS p
     ON p.fleet_id = f.fleet_id
-LEFT JOIN (
-    SELECT user_id, COUNT(*) AS vehicle_cnt
-    FROM vehicle
-    WHERE bind_status = 'BOUND'
-    GROUP BY user_id
-) AS v
-    ON v.user_id = p.user_id
 WHERE f.status = 'ACTIVE'
   AND p.role = 'fleet'
 ORDER BY f.fleet_code ASC, p.user_id ASC;
 
 -- 结论：A 每个输出行要分别回表统计车辆与券（相关子查询按行数线性放大），
---       且 LOWER(role) 让 idx_user_role_status 无法命中；
---       B 的券统计在视图内一次性预聚合，车辆统计走 idx_vehicle_user_status，
---       扫描行数由“行数 × 2 次回表”降为“每个派生表各扫一遍”。
+--       且 LOWER(role) 让 idx_user_role_status 无法命中（前导列 role 被函数包裹）；
+--       B 的车辆与券统计都在视图内一次性预聚合，fleet_id / role 前缀可命中
+--       idx_user_fleet 与 idx_user_role_status，扫描行数由“行数 × 2 次回表”降为“视图内各扫一遍”。
 
 
 -- ----------------------------------------------------------------------------
@@ -956,6 +950,9 @@ ORDER BY campaign_id ASC;
 -- 结论：A 的 4 个标量子查询把券表扫了 4 遍，代价随活动数线性增长；
 --       B 只扫一次 coupon_record + 一次 coupon_redeem_record 派生聚合，
 --       核销率在视图内用 NULLIF 兜零除，避免应用层再补一次除法判断。
+-- 索引提示：idx_campaign_status_valid 的首列是 status，本组只按 valid_from 过滤时
+--       用不到该索引，实际是 idx_primary 顺序扫活动表（活动量小，代价可忽略）；
+--       若看板固定只看“投放中”的活动，建议在 WHERE 上补 status = 'ACTIVE' 以命中该复合索引。
 
 
 -- ----------------------------------------------------------------------------
@@ -1016,7 +1013,8 @@ WHERE u.role IN ('driver', 'fleet')
 ORDER BY total_amount DESC;
 
 -- 结论：A 因为 DATE_FORMAT 与 OR 双重破坏索引，只能全表扫 charge_order 再逐行过滤；
---       B 的 start_time 半开区间走 idx_order_user(user_id, start_time)，
---       角色 IN 走 idx_user_role_status，券抵扣按订单分组后只保留 1:1 的一行，
---       聚合行数从“订单数 × 券数”降到“订单数”，在券量上来后差距最明显。
+--       B 的时间半开区间未以 user_id 为前缀，无法直接点查 idx_order_user，
+--       但仍是索引覆盖扫描（不回表），而 A 连覆盖扫描都用不上；
+--       角色 IN 命中 idx_user_role_status，券抵扣先按订单分组，聚合行数从
+--       “订单数 × 券数”降为“订单数”，券量越大差距越明显。
 

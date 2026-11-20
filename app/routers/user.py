@@ -8,7 +8,9 @@
 5. 场站运维 ops：不开放本业务线接口（工单相关在 /api/monitor）。
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from sqlalchemy.orm import Session
 
 from app.auth import CurrentUser, RoleEnum, get_current_user, hash_password, require_roles
@@ -18,11 +20,14 @@ from app.schemas.common import ActionResult, PageParams, PageResult
 from app.schemas.user import (
     CampaignIn,
     CampaignOut,
+    CampaignPublicOut,
+    CampaignStatusIn,
     CouponIssueIn,
     CouponIssueOut,
     CouponOut,
     CouponRedeemIn,
     CouponRedeemOut,
+    CouponRedeemRecordOut,
     FleetCardIn,
     FleetCreditOut,
     UserMaskedOut,
@@ -39,6 +44,14 @@ _ONLY_ADMIN = require_roles(RoleEnum.ADMIN)
 _ADMIN_OR_SETTLE = require_roles(RoleEnum.ADMIN, RoleEnum.SETTLEMENT)
 _DRIVER_OR_FLEET = require_roles(RoleEnum.DRIVER, RoleEnum.FLEET)
 
+# 查询参数用 Literal 收敛取值范围（非法值直接 422，而不是悄悄查不到数据）
+BIND_STATUS_LITERAL = Literal["BOUND", "UNBOUND", "DISABLED"]
+CAMPAIGN_STATUS_LITERAL = Literal["DRAFT", "ACTIVE", "PAUSED", "ENDED"]
+COUPON_STATUS_LITERAL = Literal["ISSUED", "REDEEMED", "EXPIRED", "VOID"]
+USER_ROLE_LITERAL = Literal["driver", "ops", "settlement", "fleet", "admin"]
+USER_STATUS_LITERAL = Literal["ACTIVE", "FROZEN", "DISABLED"]
+FLEET_STATUS_LITERAL = Literal["ACTIVE", "SUSPENDED", "CLOSED"]
+
 
 # ---------------------------------------------------------------------------
 # 一、用户档案与账号
@@ -46,8 +59,8 @@ _DRIVER_OR_FLEET = require_roles(RoleEnum.DRIVER, RoleEnum.FLEET)
 @router.get("", response_model=PageResult[UserMaskedOut], summary="分页查询脱敏用户档案")
 def list_users(
     page: PageParams = Depends(),
-    role: str | None = Query(default=None, description="按角色过滤：driver/ops/settlement/fleet/admin"),
-    user_status: str | None = Query(
+    role: USER_ROLE_LITERAL | None = Query(default=None, description="按角色过滤：driver/ops/settlement/fleet/admin"),
+    user_status: USER_STATUS_LITERAL | None = Query(
         default=None, alias="status", description="按账号状态过滤：ACTIVE/FROZEN/DISABLED"
     ),
     keyword: str | None = Query(default=None, max_length=50, description="用户名或脱敏手机号模糊匹配"),
@@ -97,14 +110,19 @@ def create_account(
 def list_vehicles(
     page: PageParams = Depends(),
     user_id: int | None = Query(default=None, gt=0, description="仅管理员可指定他人ID"),
-    bind_status: str | None = Query(default=None, description="BOUND/UNBOUND/DISABLED"),
+    bind_status: BIND_STATUS_LITERAL | None = Query(default=None, description="BOUND/UNBOUND/DISABLED"),
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(get_current_user),
 ) -> PageResult[VehicleOut]:
-    """车主/车队固定只看自己或本企业的车；管理员可查全量并按车主过滤。"""
-    if user.role in (RoleEnum.DRIVER, RoleEnum.FLEET):
-        target_user_id = user.user_id
-        result = user_dao.list_vehicles(db, page, user_id=target_user_id, bind_status=bind_status)
+    """driver 只看本人车；fleet 看**本企业**全部车辆（同车队多账号可协同管理）；admin 可查全量。"""
+    if user.role == RoleEnum.DRIVER:
+        result = user_dao.list_vehicles(db, page, user_id=user.user_id, bind_status=bind_status)
+        return PageResult[VehicleOut](**result)
+
+    if user.role == RoleEnum.FLEET:
+        if user.fleet_id is None:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "当前车队账号未绑定企业档案")
+        result = user_dao.list_vehicles(db, page, fleet_id=user.fleet_id, bind_status=bind_status)
         return PageResult[VehicleOut](**result)
 
     if user.role != RoleEnum.ADMIN:
@@ -125,8 +143,16 @@ def bind_vehicle(
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(_DRIVER_OR_FLEET),
 ) -> VehicleOut:
-    """车牌明文只在此处出现；同一车牌重复绑定由唯一索引拦截并返回 409。"""
-    fleet_id = user.fleet_id if user.role == RoleEnum.FLEET else None
+    """车牌明文只在此处出现；该车牌正被他人绑定时由唯一索引拦截并返回 409。
+
+    解绑后的车牌可被重新绑定（一车一主只约束在绑状态，不再永久锁死车牌）。
+    """
+    fleet_id: int | None = None
+    if user.role == RoleEnum.FLEET:
+        if user.fleet_id is None:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "当前车队账号未绑定企业档案，无法绑车")
+        fleet_id = user.fleet_id
+
     vehicle = user_dao.bind_vehicle(db, user.user_id, payload, fleet_id=fleet_id)
     row = user_dao.get_vehicle_masked(db, vehicle.vehicle_id)
     if row is None:  # pragma: no cover - 刚写入必然可查
@@ -134,17 +160,23 @@ def bind_vehicle(
     return VehicleOut.model_validate(row)
 
 
-@router.delete("/vehicles/{vehicle_id}", response_model=ActionResult, summary="解绑本人车辆")
+@router.delete("/vehicles/{vehicle_id}", response_model=ActionResult, summary="解绑本人/本企业车辆")
 def unbind_vehicle(
-    vehicle_id: int,
+    vehicle_id: int = Path(ge=1, description="车辆ID"),
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(_DRIVER_OR_FLEET),
 ) -> ActionResult:
-    """只能解绑本人（或本企业）车辆；非本人车辆按不存在处理，避免探测他人车辆ID。"""
-    vehicle = user_dao.unbind_vehicle(db, vehicle_id, user_id=user.user_id)
+    """driver 只能解绑本人车，fleet 只能解绑本企业车；不匹配按不存在处理，避免探测他人车辆ID。"""
+    if user.role == RoleEnum.FLEET:
+        if user.fleet_id is None:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "当前车队账号未绑定企业档案")
+        vehicle = user_dao.unbind_vehicle(db, vehicle_id, fleet_id=user.fleet_id)
+    else:
+        vehicle = user_dao.unbind_vehicle(db, vehicle_id, user_id=user.user_id)
+
     if vehicle is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "车辆不存在或不属于当前用户")
-    return ActionResult(message=f"车辆 {vehicle_id} 已解绑", id=vehicle_id)
+    return ActionResult(message=f"车辆 {vehicle_id} 已解绑，车牌可重新绑定", id=vehicle_id)
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +205,9 @@ def create_fleet(
 def list_fleet_credit(
     page: PageParams = Depends(),
     fleet_id: int | None = Query(default=None, gt=0, description="仅管理员/结算可指定"),
-    fleet_status: str | None = Query(default=None, alias="status", description="ACTIVE/SUSPENDED/CLOSED"),
+    fleet_status: FLEET_STATUS_LITERAL | None = Query(
+        default=None, alias="status", description="ACTIVE/SUSPENDED/CLOSED"
+    ),
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(get_current_user),
 ) -> PageResult[FleetCreditOut]:
@@ -194,28 +228,46 @@ def list_fleet_credit(
 # ---------------------------------------------------------------------------
 # 四、优惠活动与发券
 # ---------------------------------------------------------------------------
-@router.get("/campaigns", response_model=PageResult[CampaignOut], summary="分页查询优惠活动与核销率")
+@router.get(
+    "/campaigns",
+    response_model=PageResult[CampaignOut],
+    summary="活动投放与核销看板（仅管理员/结算专员）",
+)
 def list_campaigns(
     page: PageParams = Depends(),
-    campaign_status: str | None = Query(default=None, alias="status", description="DRAFT/ACTIVE/PAUSED/ENDED"),
+    campaign_status: CAMPAIGN_STATUS_LITERAL | None = Query(
+        default=None, alias="status", description="DRAFT/ACTIVE/PAUSED/ENDED"
+    ),
     applicable_station_id: int | None = Query(default=None, gt=0, description="按适用场站过滤"),
     db: Session = Depends(get_db),
-    user: CurrentUser = Depends(get_current_user),
+    user: CurrentUser = Depends(_ADMIN_OR_SETTLE),
 ) -> PageResult[CampaignOut]:
-    """车主/车队只能看到投放中的活动；管理员与结算专员可看全量（含核销率）。"""
-    if user.role in (RoleEnum.DRIVER, RoleEnum.FLEET):
-        result = user_dao.list_campaigns(
-            db, page, status="ACTIVE", applicable_station_id=applicable_station_id
-        )
-        return PageResult[CampaignOut](**result)
+    """含预算、已发量、核销量与核销率等**运营内部指标**，仅 admin / settlement 可见。
 
-    if user.role not in (RoleEnum.ADMIN, RoleEnum.SETTLEMENT):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "当前角色无权查看活动投放数据")
-
+    车主与车队请改用 GET /api/users/campaigns/available（脱敏公开视图）。
+    """
     result = user_dao.list_campaigns(
         db, page, status=campaign_status, applicable_station_id=applicable_station_id
     )
     return PageResult[CampaignOut](**result)
+
+
+@router.get(
+    "/campaigns/available",
+    response_model=PageResult[CampaignPublicOut],
+    summary="车主/车队可领的活动（脱敏，仅投放中且在有效期内）",
+)
+def list_available_campaigns(
+    page: PageParams = Depends(),
+    applicable_station_id: int | None = Query(default=None, gt=0, description="按适用场站过滤"),
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(_DRIVER_OR_FLEET),
+) -> PageResult[CampaignPublicOut]:
+    """只返回活动名称、券面额、门槛、有效期与适用场站，不含预算与核销统计。"""
+    result = user_dao.list_public_campaigns(
+        db, page, applicable_station_id=applicable_station_id
+    )
+    return PageResult[CampaignPublicOut](**result)
 
 
 @router.post(
@@ -237,6 +289,27 @@ def create_campaign(
     )
 
 
+@router.patch(
+    "/campaigns/{campaign_id}/status",
+    response_model=ActionResult,
+    summary="活动状态流转（上线/暂停/结束）",
+)
+def change_campaign_status(
+    payload: CampaignStatusIn,
+    campaign_id: int = Path(ge=1, description="活动ID"),
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(_ONLY_ADMIN),
+) -> ActionResult:
+    """ACTIVE 上线后才能发券与核销；PAUSED/ENDED 后触发器会拒绝继续发券与核销。"""
+    campaign = user_dao.update_campaign_status(db, campaign_id, payload.status)
+    if campaign is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "优惠活动不存在")
+    return ActionResult(
+        message=f"活动 {campaign.campaign_code} 状态已更新为 {payload.status}",
+        id=campaign_id,
+    )
+
+
 @router.post(
     "/campaigns/{campaign_id}/issue",
     response_model=CouponIssueOut,
@@ -244,15 +317,18 @@ def create_campaign(
     summary="运营定向发券",
 )
 def issue_coupons(
-    campaign_id: int,
     payload: CouponIssueIn,
+    campaign_id: int = Path(ge=1, description="活动ID"),
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(_ONLY_ADMIN),
 ) -> CouponIssueOut:
-    """逐张发券；活动未投放、券量发完、超出每人限领都会被触发器拒绝（400）。"""
+    """逐张发券；活动未投放、券量发完、超出每人限领都会被触发器拒绝（400）。
+
+    发券人（当前管理员）写入 coupon_record.issued_by，便于审计。
+    """
     if user_dao.get_campaign(db, campaign_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "优惠活动不存在")
-    result = user_dao.issue_coupons(db, campaign_id, payload)
+    result = user_dao.issue_coupons(db, campaign_id, payload, issued_by=user.user_id)
     return CouponIssueOut(**result)
 
 
@@ -263,7 +339,9 @@ def issue_coupons(
 def list_my_coupons(
     page: PageParams = Depends(),
     usable_only: bool = Query(default=False, description="仅返回未核销且未过期的券"),
-    coupon_status: str | None = Query(default=None, alias="status", description="ISSUED/REDEEMED/EXPIRED/VOID"),
+    coupon_status: COUPON_STATUS_LITERAL | None = Query(
+        default=None, alias="status", description="ISSUED/REDEEMED/EXPIRED/VOID"
+    ),
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(_DRIVER_OR_FLEET),
 ) -> PageResult[CouponOut]:
@@ -286,17 +364,17 @@ def redeem_coupon(
     return user_dao.redeem_coupon(db, user.user_id, payload)
 
 
-@router.get("/redeems", response_model=PageResult[dict], summary="核销台账（对账用）")
+@router.get("/redeems", response_model=PageResult[CouponRedeemRecordOut], summary="核销台账（对账用）")
 def list_redeem_records(
     page: PageParams = Depends(),
     user_id: int | None = Query(default=None, gt=0, description="按持券人过滤"),
     station_id: int | None = Query(default=None, gt=0, description="按核销场站过滤"),
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(_ADMIN_OR_SETTLE),
-) -> PageResult[dict]:
-    """管理员与结算专员按券码/订单/场站核对核销与抵扣金额。"""
+) -> PageResult[CouponRedeemRecordOut]:
+    """管理员与结算专员按券码/订单/场站核对核销与抵扣金额（走 v_coupon_redeem_ledger）。"""
     result = user_dao.list_redeem_records(db, page, user_id=user_id, station_id=station_id)
-    return PageResult[dict](**result)
+    return PageResult[CouponRedeemRecordOut](**result)
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +384,7 @@ def list_redeem_records(
 # ---------------------------------------------------------------------------
 @router.get("/{user_id}", response_model=UserMaskedOut, summary="按用户ID查询脱敏档案")
 def get_user_detail(
-    user_id: int,
+    user_id: int = Path(ge=1, description="用户ID"),
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(_ADMIN_OR_SETTLE),
 ) -> UserMaskedOut:
@@ -319,8 +397,8 @@ def get_user_detail(
 
 @router.patch("/{user_id}/status", response_model=ActionResult, summary="冻结/解冻/禁用账号")
 def change_user_status(
-    user_id: int,
     payload: UserStatusIn,
+    user_id: int = Path(ge=1, description="用户ID"),
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(_ONLY_ADMIN),
 ) -> ActionResult:

@@ -19,6 +19,7 @@ from sqlalchemy import (
     CHAR,
     BigInteger,
     Boolean,
+    Computed,
     Date,
     DateTime,
     Enum,
@@ -117,6 +118,12 @@ class Vehicle(Base):
     max_charge_power: Mapped[Decimal] = mapped_column(Numeric(8, 2))
     supports_fast_charge: Mapped[bool] = mapped_column(Boolean, default=True)
     bind_status: Mapped[str] = mapped_column(BIND_STATUS_ENUM, default="BOUND")
+    # 生成列：仅在 BOUND 时暴露车牌盲索引，解绑后为 NULL，使车牌可被重新绑定
+    # （写入时不要赋值，由数据库按 bind_status 自动计算）
+    active_plate_hash: Mapped[str | None] = mapped_column(
+        CHAR(64),
+        Computed("CASE WHEN bind_status = 'BOUND' THEN plate_hash END", persisted=True),
+    )
     bound_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=FetchedValue())
     updated_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=FetchedValue())

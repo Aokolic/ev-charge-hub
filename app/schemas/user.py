@@ -207,12 +207,14 @@ class CampaignIn(BaseModel):
 
     @model_validator(mode="after")
     def _check_window(self) -> "CampaignIn":
-        """有效期必须先后有序；折扣/减免券面额不得高于使用门槛（否则等于白送）。"""
+        """有效期必须先后有序；有门槛的券面额不得高于门槛（否则等于白送）。
+
+        无门槛券（threshold_amount = 0，如新人立减）不受此限。
+        """
         if self.valid_to < self.valid_from:
             raise ValueError("活动失效日期不得早于生效日期")
-        if self.coupon_kind in ("DISCOUNT", "SERVICE_FEE_FREE") and self.threshold_amount > 0:
-            if self.face_value > self.threshold_amount:
-                raise ValueError("折扣/减免类券面额不得高于使用门槛")
+        if self.threshold_amount > 0 and self.face_value > self.threshold_amount:
+            raise ValueError("券面额不得高于使用门槛，否则用户可零元抵扣")
         return self
 
 
@@ -239,6 +241,35 @@ class CampaignOut(BaseModel):
     redeemed_cnt: int = 0
     redeemed_amount: Decimal = Decimal("0.00")
     redeem_rate: Decimal | None = None
+
+
+class CampaignStatusIn(BaseModel):
+    """活动状态流转（管理员）：ACTIVE 上线、PAUSED 暂停、ENDED 结束。"""
+
+    status: Literal["ACTIVE", "PAUSED", "ENDED"] = Field(description="目标状态")
+
+
+class CampaignPublicOut(BaseModel):
+    """车主/车队可见的活动公开信息（对应视图 v_coupon_public_campaign）。
+
+    与 CampaignOut 的差别：不含 issue_total / issued_count / redeemed_cnt /
+    redeemed_amount / redeem_rate 等运营内部指标，避免向普通用户泄露预算与核销数据。
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    campaign_id: int
+    campaign_code: str
+    campaign_name: str
+    coupon_kind: str
+    face_value: Decimal
+    threshold_amount: Decimal
+    applicable_station_id: int | None = None
+    station_name: str | None = None
+    valid_from: date
+    valid_to: date
+    per_user_limit: int
+    redeem_rule: str
 
 
 class CouponIssueIn(BaseModel):
@@ -309,14 +340,40 @@ class CouponRedeemOut(BaseModel):
     payable_amount: Decimal = Field(description="核销后订单应付金额（元）")
 
 
+class CouponRedeemRecordOut(BaseModel):
+    """核销台账的一行（对应视图 v_coupon_redeem_ledger），供对账与客诉追溯。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    redeem_id: int
+    coupon_id: int
+    coupon_no: str
+    campaign_id: int
+    campaign_name: str
+    coupon_kind: str
+    order_id: int
+    user_id: int
+    username: str | None = None
+    phone_masked: str | None = None
+    station_id: int
+    station_code: str | None = None
+    station_name: str | None = None
+    face_value: Decimal
+    order_amount: Decimal
+    redeemed_at: datetime | None = None
+
+
 __all__ = [
     "CampaignIn",
     "CampaignOut",
+    "CampaignPublicOut",
+    "CampaignStatusIn",
     "CouponIssueIn",
     "CouponIssueOut",
     "CouponOut",
     "CouponRedeemIn",
     "CouponRedeemOut",
+    "CouponRedeemRecordOut",
     "FleetCardIn",
     "FleetCreditOut",
     "UserMaskedOut",
