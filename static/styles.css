@@ -1300,8 +1300,38 @@
 
     .row-actions {
         display: inline-flex;
-        flex-wrap: wrap;
+        flex-wrap: nowrap;
         gap: 6px;
+    }
+
+    /* 操作列固定在表格右侧：窄屏横向滚动时按钮不会被裁到卡片外（点击不到） */
+    .table-wrap td.actions-cell,
+    .table-wrap th.actions-col {
+        position: sticky;
+        inset-inline-end: 0;
+        z-index: 1;
+        background: var(--surface);
+        box-shadow: -10px 0 12px -12px rgba(0, 0, 0, 0.25);
+    }
+
+    .table-wrap thead th.actions-col {
+        z-index: 3;
+    }
+
+    .table-wrap tbody tr:hover td.actions-cell {
+        background: var(--muted);
+    }
+
+    /* 1280 笔记本宽度下收紧单元格左右内边距，尽量让宽表免横向滚动（sticky 列只作兜底） */
+    @media (max-width: 1366px) {
+        .table-wrap th,
+        .table-wrap td {
+            padding-inline: 7px;
+        }
+
+        .table-wrap table {
+            font-size: 0.75rem;
+        }
     }
 
     @media (max-width: 640px) {
@@ -1344,6 +1374,12 @@
 
         tbody tr td:last-child {
             border-block-end: 0;
+        }
+
+        /* 移动端表格已转为卡片布局，固定操作列失去意义，需还原为静态定位 */
+        .table-wrap td.actions-cell {
+            position: static;
+            box-shadow: none;
         }
 
         td[colspan] {
