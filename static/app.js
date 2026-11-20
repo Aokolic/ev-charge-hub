@@ -158,6 +158,14 @@
         admin: "管",
     };
 
+    const ROLE_DEFAULT_UID = {
+        driver: 9001,
+        fleet: 9101,
+        ops: 2,
+        settlement: 6,
+        admin: 1,
+    };
+
     const GUN_TYPE_LABELS = {
         DC_FAST: "直流快充",
         AC_SLOW: "交流慢充",
@@ -1091,11 +1099,29 @@
         renderUserContext();
     }
 
-    async function switchDevRole(role, { fetchData = true } = {}) {
+    async function switchDevRole(role, { fetchData = true, keepCustomUid = false } = {}) {
         const rawUid = Number($("devUserId").value);
-        const userId = Number.isFinite(rawUid) && rawUid >= 1 ? Math.trunc(rawUid) : 9001;
+        const validRawUid = Number.isFinite(rawUid) && rawUid >= 1 ? Math.trunc(rawUid) : null;
         const rawFid = Number($("devFleetId").value);
         const fleetId = Number.isFinite(rawFid) && rawFid >= 1 ? Math.trunc(rawFid) : 1;
+
+        // 切角色时自动对齐该角色的种子账号 UID，避免沿用跨角色 UID 导致权限或归属异常
+        let userId;
+        if (keepCustomUid) {
+            userId = validRawUid ?? ROLE_DEFAULT_UID[role] ?? 9001;
+        } else if (role === "fleet") {
+            userId = fleetId >= 1 && fleetId <= 5 ? 9100 + fleetId : ROLE_DEFAULT_UID.fleet;
+        } else if (role === "driver") {
+            userId =
+                validRawUid !== null && validRawUid >= 9001 && validRawUid <= 9020
+                    ? validRawUid
+                    : ROLE_DEFAULT_UID.driver;
+        } else {
+            userId = ROLE_DEFAULT_UID[role] ?? validRawUid ?? 9001;
+        }
+        if (!keepCustomUid) {
+            $("devUserId").value = String(userId);
+        }
 
         const controller = beginRequest("auth:switchRole");
         const startEpoch = state.authEpoch;
@@ -1699,7 +1725,7 @@
                 return;
             }
             const role = state.user?.role;
-            const canFinishRole = role === "driver" || role === "ops";
+            const canFinishRole = role === "driver" || role === "fleet" || role === "ops";
             const canPayRole = role === "driver" || role === "fleet";
 
             tbody.innerHTML = data.items
@@ -2536,16 +2562,19 @@
     // ------------------------------------------------------------------------
     // Tab 6: RBAC 与约束实验室
     // ------------------------------------------------------------------------
-    function logConsole(method, url, status, data, elapsedMs = null) {
+    function appendConsoleEntry(header, data) {
         const box = $("apiConsole");
         const codeEl = box.querySelector("code") || box;
-        const stamp = new Date().toLocaleTimeString();
-        const roleTag = state.user ? `[${state.user.role}]` : "[anon]";
-        const timeTag = elapsedMs !== null ? ` (${elapsedMs}ms)` : "";
-        const header = `[${stamp}] ${roleTag} ${method} ${url} -> HTTP ${status}${timeTag}`;
         const body = typeof data === "string" ? data : JSON.stringify(data, null, 2);
         const prev = codeEl.textContent === "等待发起探测请求..." ? "" : `\n\n${codeEl.textContent}`;
         codeEl.textContent = `${header}\n${body}${prev}`;
+    }
+
+    function logConsole(method, url, status, data, elapsedMs = null) {
+        const stamp = new Date().toLocaleTimeString();
+        const roleTag = state.user ? `[${state.user.role}]` : "[anon]";
+        const timeTag = elapsedMs !== null ? ` (${elapsedMs}ms)` : "";
+        appendConsoleEntry(`[${stamp}] ${roleTag} ${method} ${url} -> HTTP ${status}${timeTag}`, data);
     }
 
     async function probeEndpoint(method, url, body = null) {
@@ -2821,12 +2850,15 @@
         document.querySelectorAll(".uid-preset-btn").forEach((btn) => {
             btn.addEventListener("click", () => {
                 $("devUserId").value = btn.dataset.uid;
+                if (btn.dataset.fleet) {
+                    $("devFleetId").value = btn.dataset.fleet;
+                }
             });
         });
         $("devContextForm").addEventListener("submit", async (e) => {
             e.preventDefault();
             const currentRole = state.user?.role || "driver";
-            await switchDevRole(currentRole);
+            await switchDevRole(currentRole, { fetchData: true, keepCustomUid: true });
             closeIdentityPopover();
         });
         $("topbarLoginBtn").addEventListener("click", () => {
@@ -3766,17 +3798,28 @@
                 showToast("超额支付拦截由 /api/orders/{id}/pay 触发，该接口只对车主与车队开放，请先在顶栏切换角色后再测", true);
                 return;
             }
-            let targetOrderId = 6;
-            if (state.user && (state.user.role === "driver" || state.user.role === "fleet")) {
-                try {
-                    const { data } = await apiFetch("/api/orders?page=1&page_size=20");
-                    const paidOrFinished = data.items?.find((o) => o.status === "PAID" || o.status === "FINISHED");
-                    if (paidOrFinished) targetOrderId = paidOrFinished.order_id;
-                } catch {
-                    // 回退到默认订单 6
-                }
+            const epoch = state.authEpoch;
+            let paidOrFinished = null;
+            try {
+                const { data } = await apiFetch("/api/orders?page=1&page_size=20", {
+                    skipAuthRedirect: true,
+                });
+                if (epoch !== state.authEpoch) return;
+                paidOrFinished = data.items?.find((o) => o.status === "PAID" || o.status === "FINISHED") || null;
+            } catch (err) {
+                if (epoch !== state.authEpoch) return;
+                logConsole("GET", "/api/orders?page=1&page_size=20", err.status || "ERR", err.data || err.message, err.elapsedMs ?? null);
+                showToast(`查询当前账号订单失败 (${err.status || "-"})：${err.message}`, true);
+                return;
             }
-            probeEndpoint("POST", `/api/orders/${targetOrderId}/pay`, {
+            if (!paidOrFinished) {
+                const msg = "当前账号暂无已完成或已支付订单可供超付探测，请先完成一笔充电或切换至预设账号 9006";
+                const stamp = new Date().toLocaleTimeString();
+                appendConsoleEntry(`[${stamp}] [${role}] POST /api/orders/{id}/pay -> 已中止（无可用订单）`, msg);
+                showToast(msg, true);
+                return;
+            }
+            probeEndpoint("POST", `/api/orders/${paidOrFinished.order_id}/pay`, {
                 amount: "99999.00",
                 method: "WECHAT",
                 txn_no: genTxnNo("LABOVR"),
