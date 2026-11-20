@@ -4,9 +4,7 @@
 响应模型；禁止在本层直接写 SQL，也不吞掉数据库约束异常（由 main.py 全局翻译）。
 """
 
-from datetime import datetime
-
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, status
 from sqlalchemy.orm import Session
 
 from app.auth import CurrentUser, RoleEnum, require_roles
@@ -16,6 +14,8 @@ from app.db import get_db
 from app.schemas.common import ActionResult, PageParams, PageResult
 from app.schemas.monitor import (
     AlarmOut,
+    EscalateIn,
+    RealtimeTelemetryOut,
     RepairAcceptIn,
     RepairArriveIn,
     RepairCloseIn,
@@ -33,9 +33,14 @@ def _monitor_error_to_http(exc: MonitorError) -> HTTPException:
     return HTTPException(status_code=exc.status_code, detail=exc.message)
 
 
-@router.post("/telemetry/batch", response_model=ActionResult, summary="批量上报分钟级遥测")
+@router.post(
+    "/telemetry/batch",
+    response_model=ActionResult,
+    status_code=status.HTTP_201_CREATED,
+    summary="批量上报分钟级遥测",
+)
 def upload_telemetry_batch(
-    items: list[TelemetryIn],
+    items: list[TelemetryIn] = Body(..., min_length=1, max_length=1000),
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(require_roles(RoleEnum.ADMIN)),
 ) -> ActionResult:
@@ -46,14 +51,20 @@ def upload_telemetry_batch(
     return ActionResult(message=f"已写入 {count} 条遥测数据")
 
 
-@router.get("/telemetry/latest/{pile_id}", summary="查询充电桩最新遥测")
+@router.get(
+    "/telemetry/latest/{pile_id}",
+    response_model=RealtimeTelemetryOut,
+    summary="查询充电桩最新遥测",
+)
 def get_latest_telemetry(
-    pile_id: int,
+    pile_id: int = Path(ge=1),
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(require_roles(RoleEnum.OPS, RoleEnum.ADMIN)),
-) -> dict:
+) -> RealtimeTelemetryOut:
     try:
-        return monitor_dao.get_latest_telemetry(db, pile_id)
+        return RealtimeTelemetryOut.model_validate(
+            monitor_dao.get_latest_telemetry(db, pile_id)
+        )
     except MonitorError as exc:
         raise _monitor_error_to_http(exc) from exc
 
@@ -79,12 +90,12 @@ def list_alarms(
 
 @router.post("/alarms/escalate", response_model=ActionResult, summary="执行告警 SLA 超时升级")
 def escalate_overdue_alarms(
-    check_time: datetime | None = None,
+    payload: EscalateIn = Body(default=EscalateIn()),
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(require_roles(RoleEnum.ADMIN)),
 ) -> ActionResult:
     try:
-        count = monitor_dao.escalate_overdue_alarms(db, check_time)
+        count = monitor_dao.escalate_overdue_alarms(db, payload.check_time)
     except MonitorError as exc:
         raise _monitor_error_to_http(exc) from exc
     return ActionResult(message=f"本次共升级 {count} 条超时未响应告警")
@@ -93,21 +104,42 @@ def escalate_overdue_alarms(
 @router.post(
     "/alarms/{alarm_id}/repair-orders",
     response_model=ActionResult,
+    status_code=status.HTTP_201_CREATED,
     summary="为告警派发维修工单",
 )
 def dispatch_repair_order(
-    alarm_id: int,
     payload: RepairDispatchIn,
+    alarm_id: int = Path(ge=1),
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(require_roles(RoleEnum.ADMIN)),
 ) -> ActionResult:
-    if payload.alarm_id != alarm_id:
-        raise HTTPException(status_code=400, detail="路径告警ID与请求体不一致")
     try:
-        work_order_id = monitor_dao.dispatch_repair_order(db, payload)
+        work_order_id = monitor_dao.dispatch_repair_order(db, alarm_id, payload)
     except MonitorError as exc:
         raise _monitor_error_to_http(exc) from exc
     return ActionResult(message="维修工单已派发", id=work_order_id)
+
+
+@router.get(
+    "/repair-orders",
+    response_model=PageResult[RepairOrderOut],
+    summary="分页查询维修工单",
+)
+def list_repair_orders(
+    page: PageParams = Depends(),
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(require_roles(RoleEnum.OPS, RoleEnum.ADMIN)),
+) -> PageResult[RepairOrderOut]:
+    try:
+        data = monitor_dao.list_workorders(db, page, user.role, user.user_id)
+    except MonitorError as exc:
+        raise _monitor_error_to_http(exc) from exc
+    return PageResult[RepairOrderOut](
+        total=data["total"],
+        page=data["page"],
+        page_size=data["page_size"],
+        items=[RepairOrderOut.model_validate(row) for row in data["items"]],
+    )
 
 
 @router.get("/repair-orders/mine", response_model=PageResult[RepairOrderOut], summary="查询本人维修工单")
@@ -130,7 +162,7 @@ def list_my_repair_orders(
 
 @router.get("/repair-orders/{work_order_id}", response_model=RepairOrderOut, summary="查询维修工单详情")
 def get_repair_order(
-    work_order_id: int,
+    work_order_id: int = Path(ge=1),
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(require_roles(RoleEnum.OPS, RoleEnum.ADMIN)),
 ) -> RepairOrderOut:
@@ -143,8 +175,8 @@ def get_repair_order(
 
 @router.post("/repair-orders/{work_order_id}/accept", response_model=ActionResult, summary="运维接单")
 def accept_repair_order(
-    work_order_id: int,
     payload: RepairAcceptIn,
+    work_order_id: int = Path(ge=1),
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(require_roles(RoleEnum.OPS)),
 ) -> ActionResult:
@@ -157,8 +189,8 @@ def accept_repair_order(
 
 @router.post("/repair-orders/{work_order_id}/arrive", response_model=ActionResult, summary="运维到场")
 def arrive_repair_order(
-    work_order_id: int,
     payload: RepairArriveIn,
+    work_order_id: int = Path(ge=1),
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(require_roles(RoleEnum.OPS)),
 ) -> ActionResult:
@@ -171,8 +203,8 @@ def arrive_repair_order(
 
 @router.post("/repair-orders/{work_order_id}/complete", response_model=ActionResult, summary="维修完成")
 def complete_repair_order(
-    work_order_id: int,
     payload: RepairCompleteIn,
+    work_order_id: int = Path(ge=1),
     db: Session = Depends(get_db),
     user: CurrentUser = Depends(require_roles(RoleEnum.OPS)),
 ) -> ActionResult:
@@ -190,15 +222,45 @@ def complete_repair_order(
     return ActionResult(message="维修工单已完成维修", id=work_order_id)
 
 
-@router.post("/repair-orders/{work_order_id}/close", response_model=ActionResult, summary="复核关闭工单")
-def close_repair_order(
-    work_order_id: int,
-    payload: RepairCloseIn,
+@router.post(
+    "/repair-orders/{work_order_id}/verify",
+    response_model=ActionResult,
+    summary="复核维修工单",
+)
+def verify_repair_order(
+    work_order_id: int = Path(ge=1),
+    payload: RepairCloseIn = Body(default=RepairCloseIn()),
     db: Session = Depends(get_db),
-    user: CurrentUser = Depends(require_roles(RoleEnum.OPS)),
+    user: CurrentUser = Depends(require_roles(RoleEnum.OPS, RoleEnum.ADMIN)),
 ) -> ActionResult:
     try:
-        message = monitor_dao.close_repair_order(db, work_order_id, user.user_id, payload.verified_at)
+        monitor_dao.verify_repair_order(
+            db,
+            work_order_id,
+            user.user_id,
+            user.role,
+            payload.verified_at,
+        )
+    except MonitorError as exc:
+        raise _monitor_error_to_http(exc) from exc
+    return ActionResult(message="维修工单已复核", id=work_order_id)
+
+
+@router.post("/repair-orders/{work_order_id}/close", response_model=ActionResult, summary="关闭工单")
+def close_repair_order(
+    work_order_id: int = Path(ge=1),
+    payload: RepairCloseIn = Body(default=RepairCloseIn()),
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(require_roles(RoleEnum.OPS, RoleEnum.ADMIN)),
+) -> ActionResult:
+    try:
+        message = monitor_dao.close_repair_order(
+            db,
+            work_order_id,
+            user.user_id,
+            user.role,
+            payload.verified_at,
+        )
     except MonitorError as exc:
         raise _monitor_error_to_http(exc) from exc
     return ActionResult(message=message, id=work_order_id)

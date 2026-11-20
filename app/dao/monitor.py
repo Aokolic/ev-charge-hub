@@ -8,10 +8,10 @@
 3. 告警 SLA 超时升级调用存储过程 proc_escalate_overdue_alarms。
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import bindparam, func, select, text
 from sqlalchemy.orm import Session
 
 from app.auth import RoleEnum
@@ -45,7 +45,7 @@ _WORKORDER_BASE_SQL = (
 )
 
 _REALTIME_SQL = (
-    "SELECT pile_id, station_id, pile_code, station_name, collected_at, "
+    "SELECT pile_id, station_id, station_code, pile_code, station_name, collected_at, "
     "output_voltage, output_current, power, module_temp, offline_duration_sec, "
     "fault_code, heartbeat_lag_sec, pile_status "
     "FROM v_monitor_realtime_status"
@@ -60,6 +60,43 @@ def _now() -> datetime:
     return datetime.now()
 
 
+def _to_naive_local(value: datetime | None) -> datetime | None:
+    """把带时区时间转换为本地无时区时间，兼容 MySQL DATETIME 列。"""
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone().replace(tzinfo=None)
+    return value
+
+
+def _checked_time(
+    value: datetime | None,
+    *,
+    now: datetime,
+    previous: datetime | None = None,
+    label: str,
+) -> datetime:
+    """校验业务时间：不允许明显未来时间，也不允许早于前置节点。"""
+    actual = _to_naive_local(value) or now
+    if actual > now + timedelta(seconds=60):
+        raise MonitorError(f"{label}不能晚于当前时间", status_code=400)
+    if previous is not None and actual < previous:
+        raise MonitorError(f"{label}不能早于前置时间节点", status_code=400)
+    return actual
+
+
+def _ensure_active_ops_user(db: Session, user_id: int) -> None:
+    """派单前校验维修人员是存在且启用的 ops 账号。"""
+    row = db.execute(
+        text("SELECT role, status FROM user_account WHERE user_id = :user_id"),
+        {"user_id": user_id},
+    ).mappings().first()
+    if row is None:
+        raise MonitorError("维修人员账号不存在", status_code=404)
+    if row["role"] != "ops" or row["status"] != "ACTIVE":
+        raise MonitorError("维修人员必须是启用状态的 ops 账号", status_code=400)
+
+
 def _commit_or_rollback(db: Session) -> None:
     """显式提交；若底层约束/触发器报错，先回滚再原样上抛交给 main.py 全局翻译。"""
     try:
@@ -71,6 +108,28 @@ def _commit_or_rollback(db: Session) -> None:
 
 def create_telemetry_batch(db: Session, items: list[TelemetryIn]) -> int:
     """批量写入分钟级遥测（事实表 append-only），返回成功写入条数。"""
+    if not 1 <= len(items) <= 1000:
+        raise MonitorError("单次遥测批量必须在 1~1000 条之间", status_code=400)
+
+    pile_ids = sorted({item.pile_id for item in items})
+    pile_rows = db.execute(
+        text(
+            "SELECT pile_id, rated_power FROM charging_pile "
+            "WHERE pile_id IN :pile_ids"
+        ).bindparams(bindparam("pile_ids", expanding=True)),
+        {"pile_ids": pile_ids},
+    ).mappings().all()
+    pile_power = {int(row["pile_id"]): row["rated_power"] for row in pile_rows}
+    missing = set(pile_ids) - set(pile_power)
+    if missing:
+        raise MonitorError(f"充电桩不存在：{sorted(missing)}", status_code=404)
+    for item in items:
+        if item.power > pile_power[item.pile_id]:
+            raise MonitorError(
+                f"遥测功率超过充电桩额定功率：pile_id={item.pile_id}",
+                status_code=400,
+            )
+
     rows = [
         PileTelemetry(
             pile_id=item.pile_id,
@@ -157,21 +216,43 @@ def get_workorder(
 
 def dispatch_repair_order(
     db: Session,
+    alarm_id: int,
     payload: RepairDispatchIn,
 ) -> int:
-    """为指定告警派发维修工单，并在同一事务内将告警从 ACTIVE 推进到 PROCESSING。"""
+    """锁定告警后派发维修工单，避免并发重复派单或派给无效维修人员。"""
     now = _now()
-    alarm = db.get(AlarmRecord, payload.alarm_id)
+    alarm = db.execute(
+        select(AlarmRecord).where(AlarmRecord.alarm_id == alarm_id).with_for_update()
+    ).scalar_one_or_none()
     if alarm is None:
         raise MonitorError("告警不存在", status_code=404)
-    if alarm.status == "CLOSED":
-        raise MonitorError("已关闭告警不能再次派发维修工单", status_code=409)
+    if alarm.status not in ("ACTIVE", "PROCESSING"):
+        raise MonitorError("已恢复或已关闭告警不能再次派发维修工单", status_code=409)
+
+    _ensure_active_ops_user(db, payload.maintainer_id)
+    existing = db.scalar(
+        select(RepairOrder.work_order_id)
+        .where(
+            RepairOrder.alarm_id == alarm_id,
+            RepairOrder.status != "CLOSED",
+        )
+        .limit(1)
+    )
+    if existing is not None:
+        raise MonitorError("同一告警已存在未闭环维修工单，禁止重复派单", status_code=409)
+
+    dispatched_at = _checked_time(
+        payload.dispatched_at,
+        now=now,
+        previous=alarm.occurred_at,
+        label="派单时间",
+    )
 
     order = RepairOrder(
-        alarm_id=payload.alarm_id,
+        alarm_id=alarm_id,
         maintainer_id=payload.maintainer_id,
         status="DISPATCHED",
-        dispatched_at=payload.dispatched_at or now,
+        dispatched_at=dispatched_at,
         created_at=now,
         updated_at=now,
     )
@@ -189,12 +270,13 @@ def dispatch_repair_order(
 def _require_owned_order(
     db: Session,
     work_order_id: int,
-    maintainer_id: int,
+    actor_id: int,
+    role: RoleEnum = RoleEnum.OPS,
 ) -> RepairOrder:
     order = db.get(RepairOrder, work_order_id)
     if order is None:
         raise MonitorError("维修工单不存在", status_code=404)
-    if order.maintainer_id != maintainer_id:
+    if role == RoleEnum.OPS and order.maintainer_id != actor_id:
         raise MonitorError("无权操作他人的维修工单", status_code=403)
     return order
 
@@ -205,6 +287,9 @@ def _transition(
     maintainer_id: int,
     expected_status: str,
     target_status: str,
+    time_field: str | None = None,
+    previous_field: str | None = None,
+    time_label: str = "操作时间",
     **fields: Any,
 ) -> None:
     """工单状态机通用推进：校验当前状态后更新并一次提交。"""
@@ -214,10 +299,19 @@ def _transition(
             f"当前工单状态为 {order.status}，不能直接变更为 {target_status}",
             status_code=409,
         )
+    now = _now()
+    if time_field:
+        previous = getattr(order, previous_field, None) if previous_field else None
+        fields[time_field] = _checked_time(
+            fields.get(time_field),
+            now=now,
+            previous=previous,
+            label=time_label,
+        )
     for name, value in fields.items():
         setattr(order, name, value)
     order.status = target_status
-    order.updated_at = _now()
+    order.updated_at = now
     _commit_or_rollback(db)
 
 
@@ -234,6 +328,9 @@ def accept_repair_order(
         "DISPATCHED",
         "ACCEPTED",
         accepted_at=accepted_at or _now(),
+        time_field="accepted_at",
+        previous_field="dispatched_at",
+        time_label="接单时间",
     )
 
 
@@ -250,6 +347,9 @@ def arrive_repair_order(
         "ACCEPTED",
         "ARRIVED",
         arrived_at=arrived_at or _now(),
+        time_field="arrived_at",
+        previous_field="accepted_at",
+        time_label="到场时间",
     )
 
 
@@ -268,6 +368,9 @@ def complete_repair_order(
         "ARRIVED",
         "REPAIRED",
         repaired_at=repaired_at or _now(),
+        time_field="repaired_at",
+        previous_field="arrived_at",
+        time_label="修复时间",
         replaced_parts=replaced_parts,
         result=result,
     )
@@ -276,21 +379,28 @@ def complete_repair_order(
 def close_repair_order(
     db: Session,
     work_order_id: int,
-    maintainer_id: int,
+    actor_id: int,
+    role: RoleEnum,
     verified_at: datetime | None,
 ) -> str:
-    """复核关闭工单，并在同告警全部工单闭环且设备最近遥测正常时解除告警。"""
+    """复核关闭工单；仅在修复后连续两条遥测均正常时解除告警。"""
     now = _now()
-    order = _require_owned_order(db, work_order_id, maintainer_id)
-    if order.status != "REPAIRED":
+    order = _require_owned_order(db, work_order_id, actor_id, role)
+    if order.status not in ("REPAIRED", "VERIFIED"):
         raise MonitorError(
-            f"当前工单状态为 {order.status}，必须先完成维修后才能复核关闭",
+            f"当前工单状态为 {order.status}，必须先完成维修或复核后才能关闭",
             status_code=409,
         )
 
+    verification_time = _checked_time(
+        verified_at or order.verified_at,
+        now=now,
+        previous=order.repaired_at,
+        label="复核时间",
+    )
     order.status = "CLOSED"
-    order.verified_at = verified_at or now
-    order.closed_at = now
+    order.verified_at = verification_time
+    order.closed_at = max(now, verification_time)
     order.updated_at = now
     # autoflush=False，显式 flush 后再统计同告警未闭环工单，避免把当前工单误算进去
     db.flush()
@@ -304,38 +414,92 @@ def close_repair_order(
         )
     ) or 0
 
-    message = "维修工单已复核关闭"
+    message = "维修工单已关闭"
     if open_count == 0:
-        latest_fault_code = db.execute(
+        alarm = db.get(AlarmRecord, order.alarm_id)
+        if alarm is None:
+            raise MonitorError("工单关联告警不存在", status_code=404)
+
+        telemetry_rows = db.execute(
             text(
-                "SELECT fault_code FROM pile_telemetry "
-                "WHERE pile_id = (SELECT pile_id FROM alarm_record WHERE alarm_id = :alarm_id) "
-                "ORDER BY collected_at DESC LIMIT 1"
+                "SELECT fault_code, offline_duration_sec "
+                "FROM pile_telemetry "
+                "WHERE pile_id = :pile_id "
+                "  AND collected_at >= :repaired_at "
+                "ORDER BY collected_at DESC "
+                "LIMIT 2"
             ),
-            {"alarm_id": order.alarm_id},
-        ).scalar()
-        if latest_fault_code is None:
-            alarm = db.get(AlarmRecord, order.alarm_id)
-            if alarm is not None and alarm.status in ("ACTIVE", "PROCESSING"):
+            {"pile_id": alarm.pile_id, "repaired_at": order.repaired_at},
+        ).mappings().all()
+
+        healthy = (
+            len(telemetry_rows) >= 2
+            and all(
+                row["fault_code"] is None
+                and int(row["offline_duration_sec"] or 0) == 0
+                for row in telemetry_rows
+            )
+        )
+        if healthy:
+            if alarm.status in ("ACTIVE", "PROCESSING"):
                 alarm.status = "RECOVERED"
                 alarm.recovered_at = now
                 alarm.updated_at = now
-            message = "维修工单已复核关闭，告警已解除"
+            message = "维修工单已关闭，修复后连续遥测正常，告警已解除"
+        elif not telemetry_rows:
+            message = "维修工单已关闭，但修复后没有遥测数据，告警保持处理中"
+        elif len(telemetry_rows) < 2:
+            message = "维修工单已关闭，但修复后连续正常遥测不足 2 条，告警保持处理中"
         else:
-            message = "维修工单已复核关闭，但设备最近遥测仍存在故障，告警保持处理中"
+            message = "维修工单已关闭，但修复后遥测仍有故障或离线，告警保持处理中"
 
     _commit_or_rollback(db)
     return message
 
 
+def verify_repair_order(
+    db: Session,
+    work_order_id: int,
+    actor_id: int,
+    role: RoleEnum,
+    verified_at: datetime | None,
+) -> None:
+    """将已修复工单推进到 VERIFIED，允许 ops 本人或 admin 复核。"""
+    now = _now()
+    order = _require_owned_order(db, work_order_id, actor_id, role)
+    if order.status == "VERIFIED":
+        return
+    if order.status != "REPAIRED":
+        raise MonitorError(
+            f"当前工单状态为 {order.status}，不能直接复核",
+            status_code=409,
+        )
+    order.verified_at = _checked_time(
+        verified_at,
+        now=now,
+        previous=order.repaired_at,
+        label="复核时间",
+    )
+    order.status = "VERIFIED"
+    order.updated_at = now
+    _commit_or_rollback(db)
+
+
 def escalate_overdue_alarms(db: Session, check_time: datetime | None = None) -> int:
     """调用存储过程升级超时未响应告警，返回本次升级条数。"""
-    db.execute(
-        text("CALL proc_escalate_overdue_alarms(:p_check_time, @p_escalated_count)"),
-        {"p_check_time": check_time or _now()},
-    )
-    db.commit()
-    return int(db.execute(text("SELECT @p_escalated_count")).scalar() or 0)
+    actual_check_time = _to_naive_local(check_time) or _now()
+    try:
+        db.execute(
+            text("CALL proc_escalate_overdue_alarms(:p_check_time, @p_escalated_count)"),
+            {"p_check_time": actual_check_time},
+        )
+        # 必须在同一连接、同一事务内读取 OUT 变量，commit 后再读可能换连接而丢失会话变量
+        count = int(db.execute(text("SELECT @p_escalated_count")).scalar() or 0)
+        db.commit()
+        return count
+    except Exception:
+        db.rollback()
+        raise
 
 
 __all__ = [
@@ -351,4 +515,5 @@ __all__ = [
     "get_workorder",
     "list_alarms",
     "list_workorders",
+    "verify_repair_order",
 ]

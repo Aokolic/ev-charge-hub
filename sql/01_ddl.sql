@@ -165,6 +165,11 @@ CREATE TABLE IF NOT EXISTS device_status_log (
 --   5. 删除顺序按外键依赖倒序排列，保证本脚本可反复重跑。
 -- ============================================================================
 
+-- 业务线3的 repair_order 引用 user_account，必须先于 user_account 删除，避免外键阻塞重跑
+DROP TABLE IF EXISTS repair_order;
+DROP TABLE IF EXISTS alarm_record;
+DROP TABLE IF EXISTS pile_telemetry;
+
 DROP TABLE IF EXISTS coupon_redeem_record;
 DROP TABLE IF EXISTS coupon_record;
 DROP TABLE IF EXISTS coupon_campaign;
@@ -470,9 +475,7 @@ CREATE TABLE payment_record (
 
 -- ============================================================================
 -- 【业务线 3】设备运行遥测（分区表）、告警与维修工单（负责人：成员 3 / 代润森）
--- 说明：依赖 charging_pile(pile_id)、charging_gun(gun_id)；repair_order.maintainer_id
---       与业务线4 user_account(user_id) 语义对齐（逻辑外键，待 04-develop 建表后由组长
---       统一补 FK，避免本分支先行建表时因 user_account 尚未创建而无法执行）。
+-- 说明：依赖 charging_pile(pile_id)、charging_gun(gun_id)、user_account(user_id)。
 -- ============================================================================
 
 -- 3.1 分钟级设备运行遥测事实表（按采集时间 RANGE 分区；分区表禁止外键）
@@ -488,7 +491,6 @@ CREATE TABLE IF NOT EXISTS pile_telemetry (
     fault_code           VARCHAR(32)     NULL                    COMMENT '故障码（无故障为 NULL）',
     PRIMARY KEY (telemetry_id, collected_at),
     UNIQUE KEY uk_pile_telemetry_time (pile_id, collected_at),
-    KEY idx_pile_telemetry_pile_time (pile_id, collected_at),
     KEY idx_pile_telemetry_fault_time (fault_code, collected_at),
     CONSTRAINT chk_telemetry_voltage CHECK (output_voltage IS NULL OR output_voltage BETWEEN 0 AND 1000),
     CONSTRAINT chk_telemetry_current CHECK (output_current IS NULL OR output_current BETWEEN 0 AND 1000),
@@ -509,7 +511,7 @@ CREATE TABLE IF NOT EXISTS alarm_record (
     alarm_id            BIGINT UNSIGNED                         NOT NULL AUTO_INCREMENT COMMENT '告警主键ID',
     pile_id             BIGINT UNSIGNED                         NOT NULL                COMMENT '关联充电桩ID',
     gun_id              BIGINT UNSIGNED                         NULL                    COMMENT '关联充电枪ID（仅枪级告警非空）',
-    alarm_code          VARCHAR(32)                             NOT NULL                COMMENT '告警码（如 E-OVERVOLT / E-MODULE_OVERHEAT）',
+    alarm_code          VARCHAR(32)                             NOT NULL                COMMENT '告警码（如 E_OVERVOLT / E_MODULE_OVERHEAT）',
     alarm_level         ENUM('L1', 'L2', 'L3', 'L4')            NOT NULL                COMMENT '当前告警等级：L1-一级(最紧急) / L4-四级',
     original_level      ENUM('L1', 'L2', 'L3', 'L4')            NOT NULL                COMMENT '初始告警等级（升级后不可回退）',
     response_limit_min  SMALLINT UNSIGNED                       NOT NULL                COMMENT '该等级 SLA 响应时限（分钟）',
@@ -554,15 +556,24 @@ CREATE TABLE IF NOT EXISTS repair_order (
     PRIMARY KEY (work_order_id),
     KEY idx_workorder_alarm_status (alarm_id, status),
     KEY idx_workorder_maintainer_status (maintainer_id, status),
+    KEY idx_workorder_dispatch_time (dispatched_at),
     CONSTRAINT fk_workorder_alarm
         FOREIGN KEY (alarm_id) REFERENCES alarm_record (alarm_id)
         ON DELETE RESTRICT ON UPDATE RESTRICT,
+    CONSTRAINT fk_workorder_maintainer
+        FOREIGN KEY (maintainer_id) REFERENCES user_account (user_id)
+        ON DELETE RESTRICT ON UPDATE RESTRICT,
     CONSTRAINT chk_workorder_time_order CHECK (
-        (accepted_at IS NULL OR accepted_at >= dispatched_at)
-        AND (arrived_at IS NULL OR arrived_at >= accepted_at)
-        AND (repaired_at IS NULL OR repaired_at >= arrived_at)
-        AND (verified_at IS NULL OR verified_at >= repaired_at)
-        AND (closed_at IS NULL OR closed_at >= verified_at)
+        (status = 'DISPATCHED' OR accepted_at IS NOT NULL)
+        AND (status IN ('DISPATCHED', 'ACCEPTED') OR arrived_at IS NOT NULL)
+        AND (status IN ('DISPATCHED', 'ACCEPTED', 'ARRIVED') OR repaired_at IS NOT NULL)
+        AND (status IN ('DISPATCHED', 'ACCEPTED', 'ARRIVED', 'REPAIRED') OR verified_at IS NOT NULL)
+        AND (status <> 'CLOSED' OR closed_at IS NOT NULL)
+        AND (accepted_at IS NULL OR accepted_at >= dispatched_at)
+        AND (arrived_at IS NULL OR (accepted_at IS NOT NULL AND arrived_at >= accepted_at))
+        AND (repaired_at IS NULL OR (arrived_at IS NOT NULL AND repaired_at >= arrived_at))
+        AND (verified_at IS NULL OR (repaired_at IS NOT NULL AND verified_at >= repaired_at))
+        AND (closed_at IS NULL OR (verified_at IS NOT NULL AND closed_at >= verified_at))
     )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='业务线3-维修工单表';
 

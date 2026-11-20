@@ -10,7 +10,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 AlarmLevel = Literal["L1", "L2", "L3", "L4"]
@@ -18,6 +18,7 @@ AlarmStatus = Literal["ACTIVE", "PROCESSING", "RECOVERED", "CLOSED"]
 WorkOrderStatus = Literal[
     "DISPATCHED", "ACCEPTED", "ARRIVED", "REPAIRED", "VERIFIED", "CLOSED"
 ]
+DeviceStatus = Literal["IDLE", "OCCUPIED", "FAULT", "OFFLINE"]
 
 
 class TelemetryIn(BaseModel):
@@ -27,10 +28,24 @@ class TelemetryIn(BaseModel):
     collected_at: datetime = Field(description="采集时间（毫秒精度）")
     output_voltage: Decimal | None = Field(default=None, ge=0, le=1000, description="输出电压(V)")
     output_current: Decimal | None = Field(default=None, ge=0, le=1000, description="输出电流(A)")
-    power: Decimal = Field(default=Decimal("0"), ge=0, description="当前功率(kW)")
+    power: Decimal = Field(default=Decimal("0"), ge=0, le=1000, description="当前功率(kW)")
     module_temp: Decimal | None = Field(default=None, ge=-40, le=150, description="模块温度(℃)")
-    offline_duration_sec: int = Field(default=0, ge=0, description="离线时长(秒)")
+    offline_duration_sec: int = Field(
+        default=0,
+        ge=0,
+        le=31_536_000,
+        description="离线时长(秒)，上限一年",
+    )
     fault_code: str | None = Field(default=None, max_length=32, description="故障码，无故障为空")
+
+    @field_validator("fault_code", mode="before")
+    @classmethod
+    def _normalize_fault_code(cls, value: object) -> object:
+        """空白故障码统一转 None，避免空字符串绕过“无故障”语义。"""
+        if isinstance(value, str):
+            cleaned = value.strip()
+            return cleaned or None
+        return value
 
     @model_validator(mode="after")
     def _check_telemetry_consistency(self) -> Self:
@@ -40,12 +55,25 @@ class TelemetryIn(BaseModel):
         return self
 
 
-class TelemetryOut(TelemetryIn):
-    """遥测响应模型。"""
+class RealtimeTelemetryOut(BaseModel):
+    """最新遥测响应模型（金额/功率保持 Decimal）。"""
 
     model_config = ConfigDict(from_attributes=True)
 
-    telemetry_id: int = Field(description="遥测记录主键ID")
+    pile_id: int
+    station_id: int
+    station_code: str
+    station_name: str
+    pile_code: str
+    pile_status: DeviceStatus
+    collected_at: datetime
+    output_voltage: Decimal | None
+    output_current: Decimal | None
+    power: Decimal
+    module_temp: Decimal | None
+    offline_duration_sec: int
+    fault_code: str | None
+    heartbeat_lag_sec: int | None
 
 
 class AlarmOut(BaseModel):
@@ -65,12 +93,13 @@ class AlarmOut(BaseModel):
     status: AlarmStatus
     escalated_count: int
     escalated_at: datetime | None
+    latest_maintainer_id: int | None
+    overdue_flag: bool
 
 
 class RepairDispatchIn(BaseModel):
     """告警派发维修工单入参。"""
 
-    alarm_id: int = Field(ge=1, description="告警ID")
     maintainer_id: int = Field(ge=1, description="维修人员 user_id")
     dispatched_at: datetime | None = Field(default=None, description="派单时间，缺省取数据库当前时间")
 
@@ -101,6 +130,12 @@ class RepairCloseIn(BaseModel):
     verified_at: datetime | None = Field(default=None, description="复核时间")
 
 
+class EscalateIn(BaseModel):
+    """告警 SLA 超时升级入参。"""
+
+    check_time: datetime | None = Field(default=None, description="检查时间，缺省取当前时间")
+
+
 class RepairOrderOut(BaseModel):
     """维修工单响应模型。"""
 
@@ -118,12 +153,17 @@ class RepairOrderOut(BaseModel):
     closed_at: datetime | None
     replaced_parts: str | None
     result: str | None
+    response_minutes: int
+    overdue_flag: bool
 
 
 __all__ = [
     "AlarmLevel",
     "AlarmStatus",
     "AlarmOut",
+    "DeviceStatus",
+    "EscalateIn",
+    "RealtimeTelemetryOut",
     "RepairAcceptIn",
     "RepairArriveIn",
     "RepairCloseIn",
@@ -131,6 +171,5 @@ __all__ = [
     "RepairDispatchIn",
     "RepairOrderOut",
     "TelemetryIn",
-    "TelemetryOut",
     "WorkOrderStatus",
 ]

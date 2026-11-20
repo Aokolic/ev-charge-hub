@@ -661,6 +661,11 @@ ON DUPLICATE KEY UPDATE
 
 
 -- 3. 维修工单（24 条：alarm_id=21/22 各 2 张工单演示 1:N；时间节点严格递增）
+--    种子重跑时临时跳过“同告警仅一张未关闭工单”守卫；生产写入仍由触发器和 DAO 行锁保护。
+--    user_account 测试账号在本段之后才写入，因此临时关闭外键检查；脚本末尾恢复。
+SET @skip_repair_order_guard = 1;
+SET @old_foreign_key_checks = @@FOREIGN_KEY_CHECKS;
+SET FOREIGN_KEY_CHECKS = 0;
 
 INSERT INTO repair_order (
 
@@ -744,7 +749,8 @@ ON DUPLICATE KEY UPDATE
 
     result         = nv.result;
 
-
+SET @skip_repair_order_guard = NULL;
+SET FOREIGN_KEY_CHECKS = @old_foreign_key_checks;
 
 -- ============================================================================
 
