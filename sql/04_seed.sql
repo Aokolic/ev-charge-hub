@@ -388,7 +388,7 @@ INSERT INTO pile_telemetry (
 (3,  3,  TIMESTAMPADD(MINUTE, 3,  '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 30.1, 0,    NULL),
 (4,  4,  TIMESTAMPADD(MINUTE, 4,  '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 26.3, 0,    NULL),
 (5,  5,  TIMESTAMPADD(MINUTE, 5,  '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 31.2, 0,    NULL),
-(6,  6,  TIMESTAMPADD(MINUTE, 6,  '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 55.8, 0,    'E-CONTACTOR_STUCK'),
+(6,  6,  TIMESTAMPADD(MINUTE, 6,  '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 55.8, 0,    'E_CONTACTOR_STUCK'),
 (7,  7,  TIMESTAMPADD(MINUTE, 7,  '2026-11-15 08:00:00'), 480.0, 60.00, 28.800, 45.1, 0, NULL),
 (8,  8,  TIMESTAMPADD(MINUTE, 8,  '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 27.4, 0,    NULL),
 (9,  9,  TIMESTAMPADD(MINUTE, 9,  '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 29.0, 0,    NULL),
@@ -400,7 +400,7 @@ INSERT INTO pile_telemetry (
 (15, 15, TIMESTAMPADD(MINUTE, 15, '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 30.7, 0,    NULL),
 (16, 16, TIMESTAMPADD(MINUTE, 16, '2026-11-15 08:00:00'), 450.0, 48.00, 21.600, 42.9, 0, NULL),
 (17, 17, TIMESTAMPADD(MINUTE, 17, '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 27.1, 0,    NULL),
-(18, 18, TIMESTAMPADD(MINUTE, 18, '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 61.3, 0,    'E-ESTOP_TRIGGERED'),
+(18, 18, TIMESTAMPADD(MINUTE, 18, '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 61.3, 0,    'E_ESTOP_TRIGGERED'),
 (19, 19, TIMESTAMPADD(MINUTE, 19, '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 26.9, 0,    NULL),
 (20, 20, TIMESTAMPADD(MINUTE, 20, '2026-11-15 08:00:00'), 0.0,   NULL, 0.000, 31.8, 0,    NULL),
 (21, 21, TIMESTAMPADD(MINUTE, 21, '2026-11-15 08:00:00'), NULL,  NULL, 0.000, 0.0,  120,  'E_OFFLINE'),
@@ -423,9 +423,9 @@ INSERT INTO alarm_record (
     alarm_id, pile_id, gun_id, alarm_code, alarm_level, original_level,
     response_limit_min, occurred_at, recovered_at, status, escalated_count, escalated_at
 ) VALUES
-(1,  6,  11, 'E-CONTACTOR_STUCK',   'L1', 'L1', 15,  '2026-11-16 09:30:00', NULL,                 'ACTIVE',     0, NULL),
+(1,  6,  11, 'E_CONTACTOR_STUCK',   'L1', 'L1', 15,  '2026-11-16 09:30:00', NULL,                 'ACTIVE',     0, NULL),
 (2,  13, NULL, 'E_COMM_TIMEOUT',     'L2', 'L2', 30,  '2026-11-16 08:00:00', NULL,                 'ACTIVE',     0, NULL),
-(3,  18, 34,  'E-ESTOP_TRIGGERED',   'L3', 'L3', 120, '2026-11-15 10:00:00', NULL,                 'ACTIVE',     0, NULL),
+(3,  18, 34,  'E_ESTOP_TRIGGERED',   'L3', 'L3', 120, '2026-11-15 10:00:00', NULL,                 'ACTIVE',     0, NULL),
 (4,  2,  3,   'E_MODULE_OVERHEAT',   'L1', 'L1', 15,  '2026-11-16 10:20:00', NULL,                 'PROCESSING', 0, NULL),
 (5,  6,  11,  'E_CONTACTOR_STUCK',   'L2', 'L2', 30,  '2026-11-14 06:00:00', '2026-11-14 10:00:00', 'RECOVERED',  0, NULL),
 (6,  6,  11,  'E_INSULATION_LOW',    'L1', 'L1', 15,  '2026-11-13 06:00:00', '2026-11-13 09:00:00', 'CLOSED',     0, NULL),
@@ -440,7 +440,7 @@ INSERT INTO alarm_record (
 (15, 10, NULL, 'E_TEMP_SENSOR_FAIL', 'L4', 'L4', 480, '2026-11-15 05:00:00', NULL,                 'PROCESSING', 0, NULL),
 (16, 2,  3,   'E_MODULE_OVERHEAT',   'L2', 'L2', 30,  '2026-11-13 06:00:00', '2026-11-13 07:30:00', 'RECOVERED',  0, NULL),
 (17, 12, NULL, 'E_FAN_SPEED_LOW',    'L3', 'L3', 120, '2026-11-12 04:00:00', '2026-11-12 09:00:00', 'CLOSED',     0, NULL),
-(18, 5,  17,  'E_OVER_CURRENT',      'L1', 'L1', 15,  '2026-11-16 10:50:00', NULL,                 'PROCESSING', 0, NULL),
+(18, 9,  17,  'E_OVER_CURRENT',      'L1', 'L1', 15,  '2026-11-16 10:50:00', NULL,                 'PROCESSING', 0, NULL),
 (19, 8,  NULL, 'E_COMM_RETRY_LIMIT', 'L2', 'L1', 30,  '2026-11-16 07:10:00', NULL,                 'PROCESSING', 1, '2026-11-16 07:41:00'),
 (20, 14, NULL, 'E_COOLANT_LEAK',     'L4', 'L4', 480, '2026-11-11 03:00:00', '2026-11-11 12:00:00', 'RECOVERED',  0, NULL),
 (21, 15, 29,  'E_OVER_CURRENT',      'L2', 'L2', 30,  '2026-11-16 08:15:00', NULL,                 'PROCESSING', 0, NULL),
@@ -461,6 +461,12 @@ ON DUPLICATE KEY UPDATE
 
 
 -- 3. 维修工单（24 条：alarm_id=21/22 各 2 张工单演示 1:N；时间节点严格递增）
+--    种子重跑时临时跳过“同告警仅一张未关闭工单”守卫；生产写入仍由触发器和 DAO 行锁保护。
+--    user_account 测试账号在本段之后才写入，因此临时关闭外键检查；脚本末尾恢复。
+SET @skip_repair_order_guard = 1;
+SET @old_foreign_key_checks = @@FOREIGN_KEY_CHECKS;
+SET FOREIGN_KEY_CHECKS = 0;
+
 INSERT INTO repair_order (
     work_order_id, alarm_id, maintainer_id, status, dispatched_at, accepted_at,
     arrived_at, repaired_at, verified_at, closed_at, replaced_parts, result
@@ -502,6 +508,9 @@ ON DUPLICATE KEY UPDATE
     closed_at      = nv.closed_at,
     replaced_parts = nv.replaced_parts,
     result         = nv.result;
+
+SET @skip_repair_order_guard = NULL;
+SET FOREIGN_KEY_CHECKS = @old_foreign_key_checks;
 
 -- ============================================================================
 -- 【业务线 4】用户、车辆、企业车队与优惠券测试数据（负责人：成员 4 / 李海波）

@@ -2,8 +2,8 @@
 
 铁律：本模块只做 SQLAlchemy 2.0 映射，严禁调用 Base.metadata.create_all()。
 表结构以 sql/01_ddl.sql 为唯一真源；跨线外键（charging_pile / charging_gun /
-user_account）在 DDL 中维护，本层仅按列语义映射为普通 BIGINT 字段，避免在
-其他业务线 ORM 模型尚未实现时因 ForeignKey 解析导致整站导入失败。
+user_account）在 DDL 中维护，本层按列语义映射为 BIGINT 字段，保持查询层与
+数据库约束解耦。
 """
 
 from datetime import datetime

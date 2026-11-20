@@ -382,6 +382,7 @@ FROM (
         pt.fault_code,
         ROW_NUMBER() OVER (PARTITION BY pt.pile_id ORDER BY pt.collected_at DESC) AS rn
     FROM pile_telemetry AS pt
+    WHERE pt.collected_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
 ) AS t
 INNER JOIN charging_pile AS p
     ON p.pile_id = t.pile_id
@@ -424,7 +425,7 @@ SELECT
              SELECT 1
                FROM repair_order AS r
               WHERE r.alarm_id = a.alarm_id
-                AND r.status IN ('ACCEPTED', 'ARRIVED', 'REPAIRED', 'VERIFIED', 'CLOSED')
+                AND r.status IN ('ACCEPTED', 'ARRIVED', 'REPAIRED', 'VERIFIED')
          )
         THEN 1
         ELSE 0
