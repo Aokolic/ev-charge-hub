@@ -303,18 +303,20 @@ def list_price_rules(db: Session, station_id: int) -> list[PricingRule]:
 
 
 def create_price_rule(db: Session, payload) -> PricingRule:
-    """新增一条分时电价；同一站同一 period 不允许时间重叠。"""
-    overlap = db.execute(
+    """新增一条分时电价。
+
+    同一场站同一时段如果已有生效规则，就把旧的停用再插新的——
+    现实里“调价”就是这么做的，历史订单的电费快照不受影响。
+    """
+    db.execute(
         text(
-            "SELECT COUNT(*) FROM pricing_rule "
+            "UPDATE pricing_rule SET is_active = 0 "
             "WHERE station_id = :sid AND period = :p AND is_active = 1 "
             "  AND start_time < :end AND end_time > :start"
         ),
         {"sid": payload.station_id, "p": payload.period,
          "start": payload.start_time, "end": payload.end_time},
-    ).scalar_one()
-    if overlap:
-        raise ValueError("该场站同一时段已有电价规则，请先停用旧的")
+    )
 
     rule = PricingRule(
         station_id=payload.station_id,

@@ -179,36 +179,6 @@ def period_stat(
     return [PeriodStatOut.model_validate(r) for r in rows]
 
 
-@router.get("/{order_id}/payments", response_model=list[PaymentOut], summary="订单支付流水")
-def list_payments(
-    order_id: int,
-    db: Session = Depends(get_db),
-    user: CurrentUser = Depends(_CAN_READ),
-) -> list[PaymentOut]:
-    order = order_dao.get_order(db, order_id)
-    if order is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "订单不存在")
-    if user.role in (RoleEnum.DRIVER, RoleEnum.FLEET):
-        _check_owner(db, order, user, "查看")
-    return [PaymentOut.model_validate(p) for p in order_dao.list_payments(db, order_id)]
-
-
-@router.get("/{order_id}", response_model=OrderDetailOut, summary="订单详情")
-def order_detail(
-    order_id: int,
-    db: Session = Depends(get_db),
-    user: CurrentUser = Depends(_CAN_READ),
-) -> OrderDetailOut:
-    order, details = order_dao.get_order_detail(db, order_id)
-    if order is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "订单不存在")
-    if user.role in (RoleEnum.DRIVER, RoleEnum.FLEET):
-        _check_owner(db, order, user, "查看")
-    data = OrderOut.model_validate(order).model_dump()
-    data["details"] = details
-    return OrderDetailOut.model_validate(data)
-
-
 # ---------------- 电价规则（运维 / 管理员） ----------------
 @router.get(
     "/prices",
@@ -256,3 +226,33 @@ def set_price_active(
     if rule is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "电价规则不存在")
     return PriceRuleOut.model_validate(rule)
+
+
+@router.get("/{order_id}/payments", response_model=list[PaymentOut], summary="订单支付流水")
+def list_payments(
+    order_id: int,
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(_CAN_READ),
+) -> list[PaymentOut]:
+    order = order_dao.get_order(db, order_id)
+    if order is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "订单不存在")
+    if user.role in (RoleEnum.DRIVER, RoleEnum.FLEET):
+        _check_owner(db, order, user, "查看")
+    return [PaymentOut.model_validate(p) for p in order_dao.list_payments(db, order_id)]
+
+
+@router.get("/{order_id}", response_model=OrderDetailOut, summary="订单详情")
+def order_detail(
+    order_id: int,
+    db: Session = Depends(get_db),
+    user: CurrentUser = Depends(_CAN_READ),
+) -> OrderDetailOut:
+    order, details = order_dao.get_order_detail(db, order_id)
+    if order is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "订单不存在")
+    if user.role in (RoleEnum.DRIVER, RoleEnum.FLEET):
+        _check_owner(db, order, user, "查看")
+    data = OrderOut.model_validate(order).model_dump()
+    data["details"] = details
+    return OrderDetailOut.model_validate(data)

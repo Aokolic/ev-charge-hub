@@ -1,6 +1,6 @@
 """业务线2：订单计费的入参/出参契约。"""
 
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -126,8 +126,8 @@ class PriceRuleOut(BaseModel):
     rule_id: int
     station_id: int
     period: str
-    start_time: str
-    end_time: str
+    start_time: time
+    end_time: time
     energy_price: Decimal
     service_price: Decimal
     free_minutes: int
