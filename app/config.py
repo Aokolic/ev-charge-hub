@@ -42,6 +42,25 @@ def _get_int(name: str, default: int) -> int:
         raise ValueError(f"环境变量 {name}={raw!r} 不是合法整数。") from exc
 
 
+def _get_positive_int(name: str, default: int) -> int:
+    """将环境变量解析为正整数（> 0），防止超时或阈值配置为 0/负数引发逻辑异常。"""
+    value = _get_int(name, default)
+    if value <= 0:
+        raise ValueError(f"环境变量 {name}={value} 必须为大于 0 的正整数。")
+    return value
+
+
+def _get_secret_key() -> str:
+    """读取签名密钥：未配置时回退本地开发默认值；显式配置为空白串时拒绝启动。"""
+    raw = os.getenv("SECRET_KEY")
+    if raw is None:
+        return "dev-secret-change-in-production"
+    cleaned = raw.strip()
+    if not cleaned:
+        raise ValueError("环境变量 SECRET_KEY 已显式设置但为空白，请填写有效密钥或移除该配置项。")
+    return cleaned
+
+
 @dataclass(frozen=True)  # frozen=True 保证配置只读，防止运行期被意外修改
 class Settings:
     """应用全局只读配置集合。"""
@@ -54,10 +73,23 @@ class Settings:
     SQL_ECHO: bool = _get_bool("SQL_ECHO", False)  # 设为 True 可在控制台打印每条执行 SQL
 
     # 认证与安全策略配置（供 auth.py 使用）
-    SECRET_KEY: str = os.getenv("SECRET_KEY", "dev-secret-change-in-production")
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = _get_int("ACCESS_TOKEN_EXPIRE_MINUTES", 120)
-    LOGIN_MAX_FAILS: int = _get_int("LOGIN_MAX_FAILS", 5)      # 连续登录失败触发锁定的阈值
-    LOGIN_LOCK_MINUTES: int = _get_int("LOGIN_LOCK_MINUTES", 15)  # 账号锁定时长（分钟）
+    SECRET_KEY: str = _get_secret_key()
+    ENABLE_DEV_TOKEN: bool = _get_bool("ENABLE_DEV_TOKEN", True)  # 生产环境须设为 false 关闭快捷签发
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = _get_positive_int("ACCESS_TOKEN_EXPIRE_MINUTES", 120)
+    LOGIN_MAX_FAILS: int = _get_positive_int("LOGIN_MAX_FAILS", 5)      # 连续登录失败触发锁定的阈值
+    LOGIN_LOCK_MINUTES: int = _get_positive_int("LOGIN_LOCK_MINUTES", 15)  # 账号锁定时长（分钟）
+
+    def __post_init__(self) -> None:
+        """兜底校验直接构造 Settings 实例时的密钥与正整数约束。"""
+        if not self.SECRET_KEY or not self.SECRET_KEY.strip():
+            raise ValueError("SECRET_KEY 不能为空。")
+        for field_name in (
+            "ACCESS_TOKEN_EXPIRE_MINUTES",
+            "LOGIN_MAX_FAILS",
+            "LOGIN_LOCK_MINUTES",
+        ):
+            if getattr(self, field_name) <= 0:
+                raise ValueError(f"{field_name} 必须大于 0。")
 
 
 # 导出全组公用配置单例，其他模块统一使用 `from app.config import settings`

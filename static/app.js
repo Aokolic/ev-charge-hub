@@ -7,6 +7,7 @@
         token: localStorage.getItem("ev_hub_token") || "",
         user: null,
         authMode: localStorage.getItem("ev_hub_auth_mode") || "",
+        authEpoch: 0,
         rolesMap: {},
         activePanel: "panel-home",
         operatorsMode: "full",
@@ -34,6 +35,36 @@
         stationCache: new Map(),
         operatorCache: new Map(),
     };
+
+    // 请求并发控制器注册表（按业务目标 key 管理，新请求自动中止未完成的旧请求）
+    const abortControllers = new Map();
+
+    function beginRequest(key) {
+        const prev = abortControllers.get(key);
+        if (prev) prev.abort();
+        const controller = new AbortController();
+        abortControllers.set(key, controller);
+        return controller;
+    }
+
+    function finishRequest(key, controller) {
+        if (abortControllers.get(key) === controller) {
+            abortControllers.delete(key);
+        }
+    }
+
+    function abortRequestsByPrefix(prefix = "") {
+        for (const [key, controller] of abortControllers.entries()) {
+            if (!prefix || key.startsWith(prefix)) {
+                controller.abort();
+                abortControllers.delete(key);
+            }
+        }
+    }
+
+    function isAbortError(err) {
+        return Boolean(err && (err.name === "AbortError" || err.code === 20));
+    }
 
     const ROUTES = {
         "#/home": {
@@ -138,6 +169,8 @@
     };
 
     const SOURCE_LABELS = {
+        INIT: "建档初始化",
+        ACCEPTANCE: "验收投运",
         MANUAL: "人工维护",
         ORDER: "订单联动",
         HEARTBEAT: "心跳巡检",
@@ -145,9 +178,10 @@
     };
 
     const DIFF_TYPE_LABELS = {
+        MISSING_ORDER: "缺失订单",
         AMOUNT_MISMATCH: "金额不符",
-        MISSING_TXN: "流水缺失",
-        DUPLICATE_TXN: "重复流水",
+        DUPLICATE_PAY: "重复支付",
+        UNPAID: "订单未结清",
     };
 
     const HOME_MODULES = [
@@ -218,14 +252,92 @@
         return String(val).replace("T", " ").slice(0, 19);
     }
 
+    function getLocalDateString(d = new Date()) {
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, "0");
+        const day = String(d.getDate()).padStart(2, "0");
+        return `${y}-${m}-${day}`;
+    }
+
+    function parsePositiveInt(el, label) {
+        const raw = String(el?.value ?? "").trim();
+        const num = Number(raw);
+        if (!raw || !Number.isInteger(num) || num < 1) {
+            showToast(`请输入有效的正整数${label}`, true);
+            el?.focus();
+            return null;
+        }
+        return num;
+    }
+
+    // 格式化 FastAPI / Pydantic v2 返回的错误 detail（兼容 422 校验数组与对象）
+    function formatApiErrorDetail(detail, fallback = "请求失败") {
+        if (Array.isArray(detail)) {
+            const msgs = detail
+                .map((item) => {
+                    if (typeof item === "string") return item.trim();
+                    if (item && typeof item === "object") {
+                        const locParts = Array.isArray(item.loc)
+                            ? item.loc.filter((part) => part !== "body" && part !== "query" && part !== "path")
+                            : [];
+                        const field = locParts.length ? String(locParts[locParts.length - 1]) : "";
+                        const rawMsg = String(item.msg || item.detail || item.message || "")
+                            .replace(/^Value error,\s*/i, "")
+                            .trim();
+                        if (field && rawMsg) return `${field}: ${rawMsg}`;
+                        if (rawMsg) return rawMsg;
+                        try {
+                            return JSON.stringify(item);
+                        } catch {
+                            return "";
+                        }
+                    }
+                    return String(item ?? "").trim();
+                })
+                .filter(Boolean);
+            return msgs.length ? msgs.join("；") : fallback;
+        }
+        if (typeof detail === "string") {
+            const trimmed = detail.trim();
+            return trimmed || fallback;
+        }
+        if (detail && typeof detail === "object") {
+            if (typeof detail.message === "string" && detail.message.trim()) return detail.message.trim();
+            try {
+                const json = JSON.stringify(detail);
+                return json && json !== "{}" ? json : fallback;
+            } catch {
+                return fallback;
+            }
+        }
+        return detail !== undefined && detail !== null ? String(detail).trim() || fallback : fallback;
+    }
+
+    function normalizeDecimalText(raw) {
+        const s = String(raw).trim();
+        const match = s.match(/^([+-]?)(\d+)(?:\.(\d*))?[eE]([+-]?\d+)$/);
+        if (!match) return s;
+        const [, sign, intPart, fracPart = "", expStr] = match;
+        const exp = Number(expStr);
+        const digits = intPart + fracPart;
+        const decimalPos = intPart.length + exp;
+        if (decimalPos <= 0) {
+            return `${sign === "-" ? "-" : ""}0.${"0".repeat(-decimalPos)}${digits}`;
+        }
+        if (decimalPos >= digits.length) {
+            return `${sign === "-" ? "-" : ""}${digits}${"0".repeat(decimalPos - digits.length)}`;
+        }
+        return `${sign === "-" ? "-" : ""}${digits.slice(0, decimalPos)}.${digits.slice(decimalPos)}`;
+    }
+
     function sumDecimalStrings(values, scale = 2) {
         const factor = 10n ** BigInt(scale);
         let totalScaled = 0n;
         for (const raw of values) {
             if (raw === null || raw === undefined || raw === "") continue;
-            const s = String(raw).trim();
+            const s = normalizeDecimalText(raw);
             const neg = s.startsWith("-");
-            const clean = neg ? s.slice(1) : s;
+            const clean = neg ? s.slice(1) : s.startsWith("+") ? s.slice(1) : s;
             const [intPart = "0", fracPart = ""] = clean.split(".");
             const intVal = BigInt(intPart.replace(/\D/g, "") || "0");
             const paddedFrac = (fracPart.replace(/\D/g, "") + "0".repeat(scale)).slice(0, scale);
@@ -258,12 +370,12 @@
     // ------------------------------------------------------------------------
     const activeToasts = [];
 
-    function announceStatus(message) {
-        const live = $("liveAnnouncer");
-        if (live) {
-            live.textContent = "";
+    function announceStatus(message, isError = false) {
+        const target = isError ? $("assertiveAnnouncer") || $("liveAnnouncer") : $("liveAnnouncer");
+        if (target) {
+            target.textContent = "";
             requestAnimationFrame(() => {
-                live.textContent = message;
+                target.textContent = message;
             });
         }
         if (typeof document.body.ariaNotify === "function") {
@@ -314,7 +426,7 @@
     function showToast(message, isError = false) {
         // 打开模态对话框时，不向背景推送遮挡或无障碍不可达的 Toast
         if (document.querySelector("dialog[open]")) {
-            announceStatus(message);
+            announceStatus(message, isError);
             return;
         }
 
@@ -384,18 +496,32 @@
         }
         repositionToasts();
         scheduleHide();
-        announceStatus(message);
+        announceStatus(message, isError);
     }
 
     // ------------------------------------------------------------------------
     // 原生 Dialog 辅助与降级兼容
     // ------------------------------------------------------------------------
+    function closeAllDialogs() {
+        document.querySelectorAll("dialog[open]").forEach((dlg) => {
+            try {
+                dlg.close("abort");
+            } catch {
+                // 忽略已关闭状态
+            }
+        });
+        currentActionHandler = null;
+    }
+
     function setupDialogs() {
         const supportsClosedBy = "closedBy" in HTMLDialogElement.prototype;
 
         document.querySelectorAll("dialog").forEach((dlg) => {
             dlg.addEventListener("close", () => {
                 dlg.returnValue = "";
+                if (dlg.id === "actionDialog") {
+                    currentActionHandler = null;
+                }
             });
 
             if (!supportsClosedBy && dlg.getAttribute("closedby") === "any") {
@@ -405,10 +531,11 @@
                 };
                 let pressedOutside = false;
                 dlg.addEventListener("pointerdown", (e) => {
-                    pressedOutside = isOutside(e);
+                    pressedOutside = e.target === dlg && isOutside(e);
                 });
                 dlg.addEventListener("pointerup", (e) => {
-                    if (pressedOutside && isOutside(e)) dlg.close();
+                    if (pressedOutside && e.target === dlg && isOutside(e)) dlg.close();
+                    pressedOutside = false;
                 });
             }
         });
@@ -457,7 +584,7 @@
     let sessionExpiring = false;
 
     async function apiFetch(url, options = {}) {
-        const { skipAuthRedirect = false, ...fetchOptions } = options;
+        const { skipAuthRedirect = false, signal, ...fetchOptions } = options;
         const headers = new Headers(fetchOptions.headers || {});
         if (state.token) {
             headers.set("Authorization", `Bearer ${state.token}`);
@@ -466,7 +593,7 @@
             headers.set("Content-Type", "application/json");
         }
         const started = performance.now();
-        const resp = await fetch(url, { ...fetchOptions, headers });
+        const resp = await fetch(url, { ...fetchOptions, headers, signal });
         const elapsedMs = Math.round(performance.now() - started);
         const text = await resp.text();
         let data = text;
@@ -476,10 +603,14 @@
             // 保留原始文本
         }
         if (!resp.ok) {
-            const detail =
-                typeof data === "object" && data !== null && data.detail
+            const fallback = `请求失败 (${resp.status})`;
+            const rawDetail =
+                typeof data === "object" && data !== null && "detail" in data && data.detail !== undefined && data.detail !== null
                     ? data.detail
-                    : `请求失败 (${resp.status})`;
+                    : typeof data === "string" && data.trim()
+                    ? data.trim().slice(0, 200)
+                    : null;
+            const detail = rawDetail !== null ? formatApiErrorDetail(rawDetail, fallback) : fallback;
             if (
                 resp.status === 401 &&
                 !skipAuthRedirect &&
@@ -576,9 +707,113 @@
             for (const item of data) {
                 state.rolesMap[item.role] = item;
             }
+            if (state.user) {
+                const roleMeta = state.rolesMap[state.user.role];
+                if (roleMeta) {
+                    if ($("currentRoleDesc")) $("currentRoleDesc").textContent = roleMeta.description;
+                    if ($("homeRoleDesc")) $("homeRoleDesc").textContent = roleMeta.description;
+                }
+            }
         } catch {
             // 忽略字典拉取失败
         }
+    }
+
+    function resetPeriodStatPlaceholder({ force = false } = {}) {
+        const box = $("periodStatBox");
+        if (!box) return;
+        if (!force && box.querySelector("table")) return;
+        const role = state.user?.role;
+        if (role === "ops" || role === "admin") {
+            box.innerHTML = '<div class="empty-hint">请选择日期范围并点击“查询峰平谷统计”。</div>';
+        } else {
+            box.innerHTML = '<div class="empty-hint">请切换至“运维”或“管理员”身份后查询分时电价统计。</div>';
+        }
+    }
+
+    function syncRoleActionVisibility() {
+        const role = state.user?.role;
+        const canStartOrder = role === "driver" || role === "fleet";
+        const canOps = role === "ops" || role === "admin";
+        const isAdmin = role === "admin";
+        const canSeeRealtime = role === "admin" || role === "settlement";
+        const canSettle = role === "settlement" || role === "admin";
+
+        const manualOrderBtn = $("openManualOrderBtn");
+        if (manualOrderBtn) {
+            manualOrderBtn.hidden = !canStartOrder;
+            manualOrderBtn.disabled = !canStartOrder;
+        }
+
+        ["heartbeatCheckBtn", "commissionPileBtn", "reportHeartbeatBtn", "openPileStatusBtn"].forEach((id) => {
+            const btn = $(id);
+            if (btn) btn.disabled = !canOps;
+        });
+
+        const opFullBtn = $("loadOperatorsFullBtn");
+        if (opFullBtn) {
+            opFullBtn.hidden = !isAdmin;
+            opFullBtn.disabled = !isAdmin;
+        }
+        const opSummaryBtn = $("loadOperatorsSummaryBtn");
+        if (opSummaryBtn) opSummaryBtn.disabled = !canSeeRealtime;
+        const createOpBtn = $("openCreateOperatorBtn");
+        if (createOpBtn) {
+            createOpBtn.hidden = !isAdmin;
+            createOpBtn.disabled = !isAdmin;
+        }
+        const assetDisclosure = $("assetCreateDisclosure");
+        if (assetDisclosure) {
+            assetDisclosure.hidden = !isAdmin;
+            assetDisclosure.querySelectorAll('button[type="submit"]').forEach((btn) => {
+                btn.disabled = !isAdmin;
+            });
+        }
+
+        const drillPilesBtn = $("drillPilesBtn");
+        const drillGunsBtn = $("drillGunsBtn");
+        if (drillPilesBtn) drillPilesBtn.disabled = !canOps;
+        if (drillGunsBtn) drillGunsBtn.disabled = !canOps;
+
+        const genBtn = $("generateBillForm")?.querySelector('button[type="submit"]');
+        const billSearchBtn = $("billSearchForm")?.querySelector('button[type="submit"]');
+        const rfBtn = $("redFlushForm")?.querySelector('button[type="submit"]');
+        const refreshDiffsBtn = $("refreshDiffsBtn");
+        if (genBtn) genBtn.disabled = !canSettle;
+        if (billSearchBtn) billSearchBtn.disabled = !canSettle;
+        if (rfBtn) rfBtn.disabled = !canSettle;
+        if (refreshDiffsBtn) refreshDiffsBtn.disabled = !canSettle;
+
+        const statStationsLabel = $("statStationsLabel");
+        if (statStationsLabel) {
+            statStationsLabel.textContent = role === "settlement" ? "接入场站" : "营业场站";
+        }
+    }
+
+    function resetWorkspacePaginationAndSession({ clearInvoices = true } = {}) {
+        Object.keys(state.pages).forEach((k) => {
+            state.pages[k] = 1;
+        });
+        state.stationCache.clear();
+        state.operatorCache.clear();
+        if (clearInvoices) {
+            state.sessionInvoices = [];
+            if ($("sessionInvoicesList")) renderSessionInvoices();
+        }
+        const drillBox = $("drillResultBox");
+        if (drillBox) {
+            drillBox.className = "empty-hint";
+            drillBox.textContent = "输入场站 ID 或桩 ID，逐级查看下属设备。";
+        }
+        resetPeriodStatPlaceholder({ force: true });
+    }
+
+    function setRoleButtonsDisabled(disabled) {
+        document.querySelectorAll(".role-pill, .auth-role-btn, .quick-role-btn").forEach((btn) => {
+            btn.disabled = disabled;
+        });
+        const reissueBtn = $("reissueRoleBtn");
+        if (reissueBtn) reissueBtn.disabled = disabled;
     }
 
     function renderRoleNotice() {
@@ -664,6 +899,7 @@
             }
             if (accountMeta) accountMeta.textContent = "";
             if (desc) desc.textContent = "请先登录平台账号或选择演示角色进入工作台。";
+            syncRoleActionVisibility();
             renderRoleNotice();
             renderHomeOverview();
             return;
@@ -704,11 +940,14 @@
         }
         if (desc) desc.textContent = roleMeta ? roleMeta.description : "";
 
-        // 同步账号参数输入框
-        $("devUserId").value = state.user.user_id;
-        if (state.user.fleet_id) {
-            $("devFleetId").value = state.user.fleet_id;
+        // 仅在演示身份下同步演示联调输入框，避免正式账号登录覆盖调试 UID
+        if (isDemo) {
+            $("devUserId").value = state.user.user_id;
+            if (state.user.fleet_id) {
+                $("devFleetId").value = state.user.fleet_id;
+            }
         }
+        syncRoleActionVisibility();
         renderRoleNotice();
         renderHomeOverview();
     }
@@ -746,7 +985,7 @@
         } else {
             $("authSubheading").textContent = isLogin
                 ? "登录您的 EV Charge Hub 账号"
-                : "注册成为普通车主或企业车队账号";
+                : "自助注册普通车主账号";
         }
         setInlineAlert($("authError"), "");
     }
@@ -777,13 +1016,18 @@
     function handleSessionExpired(reason = "") {
         if (sessionExpiring) return;
         sessionExpiring = true;
+        closeAllDialogs();
+        closeIdentityPopover();
+        state.authEpoch += 1;
+        abortRequestsByPrefix("panel:");
+        abortRequestsByPrefix("modal:");
+        abortRequestsByPrefix("auth:");
         state.token = "";
         state.user = null;
         state.authMode = "";
-        state.sessionInvoices = [];
         localStorage.removeItem("ev_hub_token");
         localStorage.removeItem("ev_hub_auth_mode");
-        closeIdentityPopover();
+        resetWorkspacePaginationAndSession();
         renderUserContext();
         showAuthView("login", { updateHash: true });
         setInlineAlert($("authError"), "登录状态已失效，请重新登录或选择演示角色进入。");
@@ -792,24 +1036,39 @@
 
     function logoutUser() {
         sessionExpiring = false;
+        closeAllDialogs();
+        closeIdentityPopover();
+        state.authEpoch += 1;
+        abortRequestsByPrefix("panel:");
+        abortRequestsByPrefix("modal:");
+        abortRequestsByPrefix("auth:");
         state.token = "";
         state.user = null;
         state.authMode = "";
-        state.sessionInvoices = [];
         localStorage.removeItem("ev_hub_token");
         localStorage.removeItem("ev_hub_auth_mode");
-        closeIdentityPopover();
+        resetWorkspacePaginationAndSession();
         renderUserContext();
         showAuthView("login", { updateHash: true });
         showToast("已退出登录");
     }
 
     async function switchDevRole(role, { fetchData = true } = {}) {
-        const userId = Math.max(1, Number($("devUserId").value || 9001));
-        const fleetId = Math.max(1, Number($("devFleetId").value || 1));
+        const rawUid = Number($("devUserId").value);
+        const userId = Number.isFinite(rawUid) && rawUid >= 1 ? Math.trunc(rawUid) : 9001;
+        const rawFid = Number($("devFleetId").value);
+        const fleetId = Number.isFinite(rawFid) && rawFid >= 1 ? Math.trunc(rawFid) : 1;
+
+        const controller = beginRequest("auth:switchRole");
+        const startEpoch = state.authEpoch;
+        abortRequestsByPrefix("panel:");
+        abortRequestsByPrefix("modal:");
+        setRoleButtonsDisabled(true);
+
         try {
             const { data } = await apiFetch("/api/auth/dev-token", {
                 method: "POST",
+                signal: controller.signal,
                 body: JSON.stringify({
                     user_id: userId,
                     username: `demo_${role}`,
@@ -817,12 +1076,19 @@
                     fleet_id: role === "fleet" ? fleetId : null,
                 }),
             });
+            if (controller.signal.aborted || startEpoch !== state.authEpoch) {
+                return false;
+            }
             sessionExpiring = false;
+            state.authEpoch += 1;
+            abortRequestsByPrefix("panel:");
+            abortRequestsByPrefix("modal:");
             state.token = data.access_token;
             state.user = data.user;
             state.authMode = "demo";
             localStorage.setItem("ev_hub_token", state.token);
             localStorage.setItem("ev_hub_auth_mode", "demo");
+            resetWorkspacePaginationAndSession();
             renderUserContext();
             showToast(`已切换为 ${data.user.role_label}（#${data.user.user_id}）`);
             if (fetchData) {
@@ -830,18 +1096,34 @@
             }
             return true;
         } catch (err) {
+            if (isAbortError(err) || startEpoch !== state.authEpoch) {
+                return false;
+            }
             showToast(err.message, true);
             if ($("authView") && !$("authView").hidden) {
                 setInlineAlert($("authError"), `演示角色登录失败：${err.message}`);
             }
             return false;
+        } finally {
+            finishRequest("auth:switchRole", controller);
+            if (!abortControllers.has("auth:switchRole")) {
+                setRoleButtonsDisabled(false);
+            }
         }
     }
 
     async function restoreSession() {
-        if (!state.token) return false;
+        if (!state.token) return { ok: false, reason: "empty" };
+        const controller = beginRequest("auth:restore");
+        const epoch = state.authEpoch;
         try {
-            const { data } = await apiFetch("/api/auth/me");
+            const { data } = await apiFetch("/api/auth/me", {
+                signal: controller.signal,
+                skipAuthRedirect: true,
+            });
+            if (controller.signal.aborted || epoch !== state.authEpoch) {
+                return { ok: false, reason: "aborted" };
+            }
             sessionExpiring = false;
             state.user = data;
             const savedMode = localStorage.getItem("ev_hub_auth_mode");
@@ -852,14 +1134,23 @@
                     ? "demo"
                     : "account";
             renderUserContext();
-            return true;
-        } catch {
-            state.token = "";
-            state.user = null;
-            state.authMode = "";
-            localStorage.removeItem("ev_hub_token");
-            localStorage.removeItem("ev_hub_auth_mode");
-            return false;
+            return { ok: true };
+        } catch (err) {
+            if (isAbortError(err) || epoch !== state.authEpoch) {
+                return { ok: false, reason: "aborted" };
+            }
+            // 仅在 401/403 凭证无效或账号被禁时清理本地 JWT；500/网络异常保留凭证
+            if (err.status === 401 || err.status === 403) {
+                state.token = "";
+                state.user = null;
+                state.authMode = "";
+                localStorage.removeItem("ev_hub_token");
+                localStorage.removeItem("ev_hub_auth_mode");
+                return { ok: false, reason: "invalid", err };
+            }
+            return { ok: false, reason: "transient", err };
+        } finally {
+            finishRequest("auth:restore", controller);
         }
     }
 
@@ -960,6 +1251,7 @@
         const statGuns = $("statGuns");
         const statOrders = $("statOrders");
         const role = state.user?.role;
+        const epoch = state.authEpoch;
 
         const updateLegend = (counts) => {
             ["IDLE", "OCCUPIED", "FAULT", "OFFLINE"].forEach((st) => {
@@ -970,13 +1262,17 @@
 
         // 1. 订单总数
         if (state.user) {
-            apiFetch("/api/orders?page=1&page_size=1")
+            const ordersCtrl = beginRequest("panel:home:orders");
+            apiFetch("/api/orders?page=1&page_size=1", { signal: ordersCtrl.signal })
                 .then(({ data }) => {
+                    if (ordersCtrl.signal.aborted || epoch !== state.authEpoch) return;
                     if (statOrders) statOrders.textContent = String(data?.total ?? 0);
                 })
-                .catch(() => {
+                .catch((err) => {
+                    if (isAbortError(err) || epoch !== state.authEpoch) return;
                     if (statOrders) statOrders.textContent = "—";
-                });
+                })
+                .finally(() => finishRequest("panel:home:orders", ordersCtrl));
         } else if (statOrders) {
             statOrders.textContent = "—";
         }
@@ -997,10 +1293,14 @@
             OFFLINE: { cls: "s-offline", text: "离线" },
         };
 
+        const controller = beginRequest("panel:home:main");
         try {
             if (role === "settlement") {
                 // 结算专员无 /api/stations/overview 权限，改用 /api/stations/realtime-status 合成阵列
-                const { data } = await apiFetch("/api/stations/realtime-status?page=1&page_size=20");
+                const { data } = await apiFetch("/api/stations/realtime-status?page=1&page_size=20", {
+                    signal: controller.signal,
+                });
+                if (controller.signal.aborted || epoch !== state.authEpoch) return;
                 const items = data?.items || [];
                 const totalGuns = items.reduce((acc, s) => acc + Number(s.total_guns || 0), 0);
                 if (statStations) statStations.textContent = String(data?.total ?? 0);
@@ -1028,7 +1328,8 @@
                         const cellsHtml = seqList
                             .map((st, idx) => {
                                 const info = statusMap[st] || statusMap.OFFLINE;
-                                return `<span class="gun-cell ${info.cls}" title="${escapeHtml(s.station_name)} · #${idx + 1} · ${info.text}">${String(idx + 1).padStart(2, "0")}</span>`;
+                                const seqLabel = String(idx + 1).padStart(2, "0");
+                                return `<span class="gun-cell ${info.cls}" title="${escapeHtml(s.station_name)} · #${escapeHtml(idx + 1)} · ${escapeHtml(info.text)}">${escapeHtml(seqLabel)}</span>`;
                             })
                             .join("");
 
@@ -1039,7 +1340,7 @@
                                     <small>${escapeHtml(s.station_code)}</small>
                                 </div>
                                 <div class="matrix-cells">${cellsHtml}</div>
-                                <div class="matrix-count"><b>${idleCnt}</b> / ${seqList.length} 闲</div>
+                                <div class="matrix-count"><b>${escapeHtml(idleCnt)}</b> / ${escapeHtml(seqList.length)} 闲</div>
                             </div>`;
                     })
                     .join("");
@@ -1051,9 +1352,10 @@
             }
 
             const [stationsResp, gunsResp] = await Promise.all([
-                apiFetch("/api/stations/overview?page=1&page_size=20"),
-                apiFetch("/api/stations/guns/availability?page=1&page_size=100"),
+                apiFetch("/api/stations/overview?page=1&page_size=20", { signal: controller.signal }),
+                apiFetch("/api/stations/guns/availability?page=1&page_size=100", { signal: controller.signal }),
             ]);
+            if (controller.signal.aborted || epoch !== state.authEpoch) return;
 
             const stationItems = stationsResp.data?.items || [];
             const gunItems = gunsResp.data?.items || [];
@@ -1088,6 +1390,7 @@
 
             updateLegend(counts);
 
+            const canOrder = role === "driver" || role === "fleet";
             const rowsHtml = Array.from(stationMap.values())
                 .filter((st) => st.guns.length > 0)
                 .map((st) => {
@@ -1099,7 +1402,9 @@
                             const info = statusMap[g.gun_status] || statusMap.OFFLINE;
                             const typeLabel = g.gun_type === "DC_FAST" ? "直流快充" : "交流慢充";
                             const tip = `${g.gun_code} · ${typeLabel} ${g.max_power}kW · ${info.text}`;
-                            return `<span class="gun-cell ${info.cls}" data-gun-id="${escapeHtml(g.gun_id)}" data-station-id="${escapeHtml(g.station_id)}" data-station-name="${escapeHtml(st.station_name)}" data-gun-code="${escapeHtml(g.gun_code)}" data-gun-status="${escapeHtml(g.gun_status)}" title="${escapeHtml(tip)}">${escapeHtml(String(g.gun_seq).padStart(2, "0"))}</span>`;
+                            const actionHint = g.gun_status === "IDLE" && canOrder ? "，点击扫码开单" : "，点击查看场站充电枪";
+                            const ariaLabel = `${st.station_name} ${tip}${actionHint}`;
+                            return `<button type="button" class="gun-cell ${info.cls}" data-gun-id="${escapeHtml(g.gun_id)}" data-station-id="${escapeHtml(g.station_id)}" data-station-name="${escapeHtml(st.station_name)}" data-gun-code="${escapeHtml(g.gun_code)}" data-gun-status="${escapeHtml(g.gun_status)}" title="${escapeHtml(tip)}" aria-label="${escapeHtml(ariaLabel)}">${escapeHtml(String(g.gun_seq).padStart(2, "0"))}</button>`;
                         })
                         .join("");
 
@@ -1110,17 +1415,20 @@
                                 <small>${escapeHtml(st.station_code)}</small>
                             </div>
                             <div class="matrix-cells">${cellsHtml}</div>
-                            <div class="matrix-count"><b>${idleCnt}</b> / ${st.guns.length} 闲</div>
+                            <div class="matrix-count"><b>${escapeHtml(idleCnt)}</b> / ${escapeHtml(st.guns.length)} 闲</div>
                         </div>`;
                 })
                 .join("");
 
             matrixBox.innerHTML = rowsHtml || '<div class="empty-hint">暂无营业中的充电枪状态数据。</div>';
         } catch (err) {
+            if (isAbortError(err) || epoch !== state.authEpoch) return;
             if (statStations) statStations.textContent = "—";
             if (statGuns) statGuns.textContent = "—";
             updateLegend({ IDLE: 0, OCCUPIED: 0, FAULT: 0, OFFLINE: 0 });
             matrixBox.innerHTML = `<div class="empty-hint">加载充电枪阵列失败 (${escapeHtml(err.status || "-")})：${escapeHtml(err.message)}</div>`;
+        } finally {
+            finishRequest("panel:home:main", controller);
         }
     }
 
@@ -1139,8 +1447,17 @@
         if (kw) qs.set("keyword", kw);
         if ($("onlyIdleFast").checked) qs.set("only_idle_fast", "true");
 
+        const controller = beginRequest("panel:stations");
+        const epoch = state.authEpoch;
         try {
-            const { data } = await apiFetch(`/api/stations/overview?${qs.toString()}`);
+            const { data } = await apiFetch(`/api/stations/overview?${qs.toString()}`, {
+                signal: controller.signal,
+            });
+            if (controller.signal.aborted || epoch !== state.authEpoch) return;
+            if (!data.items.length && page > 1 && Number(data.total || 0) > 0) {
+                const clampedPage = Math.max(1, Math.ceil(Number(data.total) / state.pageSize.stations));
+                if (clampedPage !== page) return loadDriverStations(clampedPage);
+            }
             if (!data.items.length) {
                 grid.innerHTML = '<div class="empty-hint">未找到符合条件的营业场站。</div>';
                 pager.innerHTML = "";
@@ -1175,8 +1492,8 @@
                                         <strong>${escapeHtml(s.idle_slow_gun_count)}</strong>
                                     </div>
                                     <div class="station-metric">
-                                        <span>车位余量</span>
-                                        <strong>${escapeHtml(s.available_spaces)} / ${escapeHtml(s.total_spaces)}</strong>
+                                        <span>活跃充电桩</span>
+                                        <strong>${escapeHtml(s.active_pile_count)} 台</strong>
                                     </div>
                                 </div>
                                 <div class="station-meters">
@@ -1189,8 +1506,8 @@
                                     </div>
                                     <div class="meter-row">
                                         <div class="meter-label">
-                                            <span>活跃充电桩</span>
-                                            <strong>${escapeHtml(s.active_pile_count)} 台</strong>
+                                            <span>空闲车位</span>
+                                            <strong>${escapeHtml(s.available_spaces)} / ${escapeHtml(s.total_spaces)}</strong>
                                         </div>
                                         <div class="meter-track"><div class="meter-fill meter-blue" style="--pct:${spacePct}%"></div></div>
                                     </div>
@@ -1206,8 +1523,11 @@
 
             renderPagination(pager, data, (nextPage) => loadDriverStations(nextPage));
         } catch (err) {
+            if (isAbortError(err) || epoch !== state.authEpoch) return;
             grid.innerHTML = `<div class="empty-hint">无法加载场站概览 (${escapeHtml(err.status || "-")})：${escapeHtml(err.message)}</div>`;
             pager.innerHTML = "";
+        } finally {
+            finishRequest("panel:stations", controller);
         }
     }
 
@@ -1226,8 +1546,17 @@
         if (gType) qs.set("gun_type", gType);
         if (gStatus) qs.set("gun_status", gStatus);
 
+        const controller = beginRequest("panel:guns");
+        const epoch = state.authEpoch;
         try {
-            const { data } = await apiFetch(`/api/stations/guns/availability?${qs.toString()}`);
+            const { data } = await apiFetch(`/api/stations/guns/availability?${qs.toString()}`, {
+                signal: controller.signal,
+            });
+            if (controller.signal.aborted || epoch !== state.authEpoch) return;
+            if (!data.items.length && page > 1 && Number(data.total || 0) > 0) {
+                const clampedPage = Math.max(1, Math.ceil(Number(data.total) / state.pageSize.guns));
+                if (clampedPage !== page) return loadDriverGuns(clampedPage);
+            }
             if (!data.items.length) {
                 tbody.innerHTML = '<tr><td colspan="9"><div class="empty-hint">暂无符合条件的可用充电枪</div></td></tr>';
                 pager.innerHTML = "";
@@ -1250,15 +1579,18 @@
                             <td data-label="最大功率 (kW)" class="num">${escapeHtml(g.max_power)}</td>
                             <td data-label="当前状态">${statusBadge(g.gun_status)}</td>
                             <td data-label="操作" class="actions-cell">
-                                <button
-                                    class="btn ${orderBtnCls} btn-xs start-gun-order-btn"
-                                    data-station-id="${escapeHtml(g.station_id)}"
-                                    data-station-name="${escapeHtml(g.station_name)}"
-                                    data-gun-id="${escapeHtml(g.gun_id)}"
-                                    data-gun-code="${escapeHtml(g.gun_code)}"
-                                    type="button"
-                                    ${canOrder ? "" : 'title="仅车主或车队角色可执行扫码开单"'}
-                                >${orderBtnLabel}</button>
+                                ${
+                                    canOrder
+                                        ? `<button
+                                            class="btn ${orderBtnCls} btn-xs start-gun-order-btn"
+                                            data-station-id="${escapeHtml(g.station_id)}"
+                                            data-station-name="${escapeHtml(g.station_name)}"
+                                            data-gun-id="${escapeHtml(g.gun_id)}"
+                                            data-gun-code="${escapeHtml(g.gun_code)}"
+                                            type="button"
+                                        >${orderBtnLabel}</button>`
+                                        : '<span class="meta">仅限车主/车队</span>'
+                                }
                             </td>
                         </tr>`;
                 })
@@ -1266,8 +1598,11 @@
 
             renderPagination(pager, data, (nextPage) => loadDriverGuns(nextPage));
         } catch (err) {
+            if (isAbortError(err) || epoch !== state.authEpoch) return;
             tbody.innerHTML = `<tr><td colspan="9"><div class="empty-hint">查询失败 (${escapeHtml(err.status || "-")})：${escapeHtml(err.message)}</div></td></tr>`;
             pager.innerHTML = "";
+        } finally {
+            finishRequest("panel:guns", controller);
         }
     }
 
@@ -1299,14 +1634,24 @@
                 ? `当前仅展示账号 #${state.user.user_id} 本人名下的充电订单与计费状态`
                 : "当前展示全平台充电订单与实时计费状态";
         }
+        resetPeriodStatPlaceholder();
 
         const qs = new URLSearchParams({
             page: String(page),
             page_size: String(state.pageSize.orders),
         });
 
+        const controller = beginRequest("panel:orders");
+        const epoch = state.authEpoch;
         try {
-            const { data } = await apiFetch(`/api/orders?${qs.toString()}`);
+            const { data } = await apiFetch(`/api/orders?${qs.toString()}`, {
+                signal: controller.signal,
+            });
+            if (controller.signal.aborted || epoch !== state.authEpoch) return;
+            if (!data.items.length && page > 1 && Number(data.total || 0) > 0) {
+                const clampedPage = Math.max(1, Math.ceil(Number(data.total) / state.pageSize.orders));
+                if (clampedPage !== page) return loadOrders(clampedPage);
+            }
             if (!data.items.length) {
                 tbody.innerHTML = '<tr><td colspan="10"><div class="empty-hint">当前视角下暂无充电订单（可在“找站与开单”扫码启动充电，或在右上角将用户编号切为 9001 查看示例订单）。</div></td></tr>';
                 pager.innerHTML = "";
@@ -1352,8 +1697,11 @@
 
             renderPagination(pager, data, (nextPage) => loadOrders(nextPage));
         } catch (err) {
+            if (isAbortError(err) || epoch !== state.authEpoch) return;
             tbody.innerHTML = `<tr><td colspan="10"><div class="empty-hint">加载订单失败 (${escapeHtml(err.status || "-")})：${escapeHtml(err.message)}</div></td></tr>`;
             pager.innerHTML = "";
+        } finally {
+            finishRequest("panel:orders", controller);
         }
     }
 
@@ -1363,8 +1711,13 @@
         $("detailDialogBody").innerHTML = '<div class="empty-hint">正在加载订单详情...</div>';
         dlg.showModal();
 
+        const controller = beginRequest("modal:detail");
+        const epoch = state.authEpoch;
         try {
-            const { data } = await apiFetch(`/api/orders/${orderId}`);
+            const { data } = await apiFetch(`/api/orders/${orderId}`, {
+                signal: controller.signal,
+            });
+            if (controller.signal.aborted || epoch !== state.authEpoch) return;
             const detailsHtml = data.details?.length
                 ? `
                     <div class="table-wrap" tabindex="0" role="region" aria-label="分时计费段明细">
@@ -1415,7 +1768,10 @@
                 ${detailsHtml}
             `;
         } catch (err) {
+            if (isAbortError(err) || epoch !== state.authEpoch) return;
             $("detailDialogBody").innerHTML = `<div class="inline-alert">加载失败 (${escapeHtml(err.status || "-")})：${escapeHtml(err.message)}</div>`;
+        } finally {
+            finishRequest("modal:detail", controller);
         }
     }
 
@@ -1425,9 +1781,14 @@
         const endDate = $("statEndDate").value;
         if (!startDate || !endDate) return;
 
+        const controller = beginRequest("panel:periodStats");
+        const epoch = state.authEpoch;
         try {
             const qs = new URLSearchParams({ start_date: startDate, end_date: endDate });
-            const { data } = await apiFetch(`/api/orders/stats/period?${qs.toString()}`);
+            const { data } = await apiFetch(`/api/orders/stats/period?${qs.toString()}`, {
+                signal: controller.signal,
+            });
+            if (controller.signal.aborted || epoch !== state.authEpoch) return;
             if (!data.length) {
                 box.innerHTML = '<div class="empty-hint">所选日期区间内暂无分时计费数据。</div>';
                 return;
@@ -1465,13 +1826,16 @@
                 </table>
             `;
         } catch (err) {
+            if (isAbortError(err) || epoch !== state.authEpoch) return;
             if (err.status === 500) {
-                box.innerHTML = '<div class="empty-hint">分时统计服务暂不可用，请稍后重试。</div>';
+                box.innerHTML = `<div class="empty-hint">分时统计服务异常 (500)：${escapeHtml(err.message)}，请稍后重试。</div>`;
             } else if (err.status === 403) {
-                box.innerHTML = '<div class="empty-hint">请切换至“运维”或“管理员”身份后查询分时电价统计。</div>';
+                box.innerHTML = `<div class="empty-hint">当前身份无权查询分时电价统计 (403)：${escapeHtml(err.message)}，请切换为“运维”或“管理员”身份。</div>`;
             } else {
                 box.innerHTML = `<div class="empty-hint">查询失败 (${escapeHtml(err.status || "-")})：${escapeHtml(err.message)}</div>`;
             }
+        } finally {
+            finishRequest("panel:periodStats", controller);
         }
     }
 
@@ -1491,8 +1855,17 @@
         if (stId) qs.set("station_id", stId);
         if (ps) qs.set("pile_status", ps);
 
+        const controller = beginRequest("panel:faults");
+        const epoch = state.authEpoch;
         try {
-            const { data } = await apiFetch(`/api/stations/faults?${qs.toString()}`);
+            const { data } = await apiFetch(`/api/stations/faults?${qs.toString()}`, {
+                signal: controller.signal,
+            });
+            if (controller.signal.aborted || epoch !== state.authEpoch) return;
+            if (!data.items.length && page > 1 && Number(data.total || 0) > 0) {
+                const clampedPage = Math.max(1, Math.ceil(Number(data.total) / state.pageSize.faults));
+                if (clampedPage !== page) return loadFaults(clampedPage);
+            }
             if (!data.items.length) {
                 tbody.innerHTML = '<tr><td colspan="8"><div class="empty-hint">当前筛选条件下无故障或离线桩枪记录。</div></td></tr>';
                 pager.innerHTML = "";
@@ -1507,7 +1880,7 @@
                         <td data-label="桩状态">${statusBadge(r.pile_status)}</td>
                         <td data-label="枪编号">${r.gun_code ? `#${escapeHtml(r.gun_id)} <code>${escapeHtml(r.gun_code)}</code>` : "-"}</td>
                         <td data-label="枪状态">${r.gun_status ? statusBadge(r.gun_status) : "-"}</td>
-                        <td data-label="心跳滞后 (s)" class="num">${r.heartbeat_lag_sec ?? "-"}</td>
+                        <td data-label="心跳滞后 (s)" class="num">${escapeHtml(r.heartbeat_lag_sec ?? "-")}</td>
                         <td data-label="脱敏热线">${escapeHtml(r.service_phone_masked || "-")}</td>
                         <td data-label="排障处置" class="actions-cell">
                             <div class="row-actions">
@@ -1526,8 +1899,11 @@
 
             renderPagination(pager, data, (nextPage) => loadFaults(nextPage));
         } catch (err) {
+            if (isAbortError(err) || epoch !== state.authEpoch) return;
             tbody.innerHTML = `<tr><td colspan="8"><div class="empty-hint">无权限或加载失败 (${escapeHtml(err.status || "-")})：${escapeHtml(err.message)}</div></td></tr>`;
             pager.innerHTML = "";
+        } finally {
+            finishRequest("panel:faults", controller);
         }
     }
 
@@ -1546,8 +1922,17 @@
         if (dt) qs.set("device_type", dt);
         if (ts) qs.set("todo_status", ts);
 
+        const controller = beginRequest("panel:logs");
+        const epoch = state.authEpoch;
         try {
-            const { data } = await apiFetch(`/api/stations/status-logs?${qs.toString()}`);
+            const { data } = await apiFetch(`/api/stations/status-logs?${qs.toString()}`, {
+                signal: controller.signal,
+            });
+            if (controller.signal.aborted || epoch !== state.authEpoch) return;
+            if (!data.items.length && page > 1 && Number(data.total || 0) > 0) {
+                const clampedPage = Math.max(1, Math.ceil(Number(data.total) / state.pageSize.logs));
+                if (clampedPage !== page) return loadStatusLogs(clampedPage);
+            }
             if (!data.items.length) {
                 tbody.innerHTML = '<tr><td colspan="9"><div class="empty-hint">暂无符合条件的状态变更日志。</div></td></tr>';
                 pager.innerHTML = "";
@@ -1578,34 +1963,52 @@
 
             renderPagination(pager, data, (nextPage) => loadStatusLogs(nextPage));
         } catch (err) {
+            if (isAbortError(err) || epoch !== state.authEpoch) return;
             tbody.innerHTML = `<tr><td colspan="9"><div class="empty-hint">无权限或加载失败 (${escapeHtml(err.status || "-")})：${escapeHtml(err.message)}</div></td></tr>`;
             pager.innerHTML = "";
+        } finally {
+            finishRequest("panel:logs", controller);
         }
     }
 
     async function runHeartbeatCheck() {
+        const btn = $("heartbeatCheckBtn");
+        const epoch = state.authEpoch;
+        if (btn) btn.disabled = true;
         try {
             const { data } = await apiFetch("/api/stations/piles/heartbeat-check", {
                 method: "POST",
                 body: JSON.stringify({ check_time: null }),
             });
+            if (epoch !== state.authEpoch) return;
             showToast(`${data.message}：标记离线桩 ${data.affected_piles} 台、枪 ${data.affected_guns} 把`);
             loadFaults(1);
             loadStatusLogs(1);
         } catch (err) {
+            if (epoch !== state.authEpoch) return;
             showToast(`巡检失败 (${err.status || "-"})：${err.message}`, true);
+        } finally {
+            if (btn) syncRoleActionVisibility();
         }
     }
 
     async function reportSingleHeartbeat() {
-        const pileId = Number($("opsPileId").value || 0);
+        const pileId = parsePositiveInt($("opsPileId"), "充电桩 ID");
         if (!pileId) return;
+        const btn = $("reportHeartbeatBtn");
+        const epoch = state.authEpoch;
+        if (btn) btn.disabled = true;
         try {
             const { data } = await apiFetch(`/api/stations/piles/${pileId}/heartbeat`, { method: "POST" });
+            if (epoch !== state.authEpoch) return;
             showToast(`桩 #${data.pile_id} (${data.pile_code}) 心跳已刷新`);
             loadFaults();
+            loadStatusLogs(1);
         } catch (err) {
+            if (epoch !== state.authEpoch) return;
             showToast(`上报失败 (${err.status || "-"})：${err.message}`, true);
+        } finally {
+            if (btn) syncRoleActionVisibility();
         }
     }
 
@@ -1627,8 +2030,18 @@
         if (opId) qs.set("operator_id", opId);
         if (stStatus) qs.set("station_status", stStatus);
 
+        const controller = beginRequest("panel:realtime");
+        const epoch = state.authEpoch;
         try {
-            const { data } = await apiFetch(`/api/stations/realtime-status?${qs.toString()}`);
+            const { data } = await apiFetch(`/api/stations/realtime-status?${qs.toString()}`, {
+                signal: controller.signal,
+            });
+            if (controller.signal.aborted || epoch !== state.authEpoch) return;
+            if (!data.items.length && page > 1 && Number(data.total || 0) > 0) {
+                const clampedPage = Math.max(1, Math.ceil(Number(data.total) / state.pageSize.realtime));
+                if (clampedPage !== page) return loadRealtimeBoard(clampedPage);
+            }
+
             let totalPiles = 0;
             let pendingPiles = 0;
             let abnormalPiles = 0;
@@ -1671,31 +2084,31 @@
                             <td data-label="营业状态">${statusBadge(s.station_status)}</td>
                             <td data-label="充电桩分布">
                                 <div class="mini-pills">
-                                    <span class="mini-pill">总 ${s.total_piles}</span>
-                                    ${s.pending_acceptance_piles > 0 ? `<span class="mini-pill pill-warn">验 ${s.pending_acceptance_piles}</span>` : ""}
-                                    <span class="mini-pill pill-ok">闲 ${s.idle_piles}</span>
-                                    <span class="mini-pill pill-blue">忙 ${s.occupied_piles}</span>
-                                    ${pileAbnormal > 0 ? `<span class="mini-pill pill-danger">异 ${pileAbnormal}</span>` : '<span class="mini-pill">异 0</span>'}
+                                    <span class="mini-pill">总 ${escapeHtml(s.total_piles)}</span>
+                                    ${Number(s.pending_acceptance_piles) > 0 ? `<span class="mini-pill pill-warn">验 ${escapeHtml(s.pending_acceptance_piles)}</span>` : ""}
+                                    <span class="mini-pill pill-ok">闲 ${escapeHtml(s.idle_piles)}</span>
+                                    <span class="mini-pill pill-blue">忙 ${escapeHtml(s.occupied_piles)}</span>
+                                    ${pileAbnormal > 0 ? `<span class="mini-pill pill-danger">异 ${escapeHtml(pileAbnormal)}</span>` : '<span class="mini-pill">异 0</span>'}
                                 </div>
                             </td>
                             <td data-label="装机功率 (kW)" class="num"><strong>${escapeHtml(s.total_rated_power)}</strong></td>
                             <td data-label="充电枪分布">
                                 <div class="mini-pills">
-                                    <span class="mini-pill">总 ${s.total_guns}</span>
-                                    <span class="mini-pill pill-ok">闲 ${s.idle_guns}</span>
-                                    <span class="mini-pill pill-blue">忙 ${s.occupied_guns}</span>
-                                    ${gunAbnormal > 0 ? `<span class="mini-pill pill-danger">异 ${gunAbnormal}</span>` : '<span class="mini-pill">异 0</span>'}
+                                    <span class="mini-pill">总 ${escapeHtml(s.total_guns)}</span>
+                                    <span class="mini-pill pill-ok">闲 ${escapeHtml(s.idle_guns)}</span>
+                                    <span class="mini-pill pill-blue">忙 ${escapeHtml(s.occupied_guns)}</span>
+                                    ${gunAbnormal > 0 ? `<span class="mini-pill pill-danger">异 ${escapeHtml(gunAbnormal)}</span>` : '<span class="mini-pill">异 0</span>'}
                                 </div>
                             </td>
                             <td data-label="操作" class="actions-cell">
-                                <div class="row-actions">
-                                    <button class="btn btn-outline btn-xs drill-station-btn" data-station-id="${escapeHtml(s.station_id)}" type="button">钻取桩</button>
-                                    ${
-                                        isAdmin
-                                            ? `<button class="btn btn-outline btn-xs edit-station-btn" data-station-id="${escapeHtml(s.station_id)}" type="button">编辑</button>`
-                                            : ""
-                                    }
-                                </div>
+                                ${
+                                    isAdmin
+                                        ? `<div class="row-actions">
+                                            <button class="btn btn-outline btn-xs drill-station-btn" data-station-id="${escapeHtml(s.station_id)}" type="button">钻取桩</button>
+                                            <button class="btn btn-outline btn-xs edit-station-btn" data-station-id="${escapeHtml(s.station_id)}" type="button">编辑</button>
+                                        </div>`
+                                        : '<span class="meta">只读看板</span>'
+                                }
                             </td>
                         </tr>`;
                 })
@@ -1703,19 +2116,40 @@
 
             renderPagination(pager, data, (nextPage) => loadRealtimeBoard(nextPage));
         } catch (err) {
+            if (isAbortError(err) || epoch !== state.authEpoch) return;
             kpis.innerHTML = "";
             tbody.innerHTML = `<tr><td colspan="8"><div class="empty-hint">无权限或加载失败 (${escapeHtml(err.status || "-")})：${escapeHtml(err.message)}</div></td></tr>`;
             pager.innerHTML = "";
+        } finally {
+            finishRequest("panel:realtime", controller);
         }
     }
 
     async function loadOperators(summaryOnly = state.operatorsMode === "summary") {
         state.operatorsMode = summaryOnly ? "summary" : "full";
+        const fullBtn = $("loadOperatorsFullBtn");
+        const summaryBtn = $("loadOperatorsSummaryBtn");
+        if (fullBtn) {
+            fullBtn.className = `btn btn-xs ${summaryOnly ? "btn-outline" : "btn-primary"}`;
+            fullBtn.setAttribute("aria-pressed", summaryOnly ? "false" : "true");
+        }
+        if (summaryBtn) {
+            summaryBtn.className = `btn btn-xs ${summaryOnly ? "btn-primary" : "btn-outline"}`;
+            summaryBtn.setAttribute("aria-pressed", summaryOnly ? "true" : "false");
+        }
+
         const tbody = $("operatorsBody");
         const endpoint = summaryOnly ? "/api/stations/operators/summary" : "/api/stations/operators";
+        const controller = beginRequest("panel:operators");
+        const epoch = state.authEpoch;
         try {
-            const { data } = await apiFetch(endpoint);
+            const { data } = await apiFetch(endpoint, { signal: controller.signal });
+            if (controller.signal.aborted || epoch !== state.authEpoch) return;
             state.operatorCache.clear();
+            if (!data.length) {
+                renderTableEmptyRow(tbody, 7, "暂无合作运营商档案。");
+                return;
+            }
             const isAdmin = state.user?.role === "admin";
             tbody.innerHTML = data
                 .map((op) => {
@@ -1739,15 +2173,23 @@
                 })
                 .join("");
         } catch (err) {
+            if (isAbortError(err) || epoch !== state.authEpoch) return;
             tbody.innerHTML = `<tr><td colspan="7"><div class="empty-hint">无权限或加载失败 (${escapeHtml(err.status || "-")})：${escapeHtml(err.message)}</div></td></tr>`;
+        } finally {
+            finishRequest("panel:operators", controller);
         }
     }
 
     async function drillPiles(stationId) {
         const box = $("drillResultBox");
         $("drillStationId").value = stationId;
+        const controller = beginRequest("panel:drill");
+        const epoch = state.authEpoch;
         try {
-            const { data } = await apiFetch(`/api/stations/${stationId}/piles`);
+            const { data } = await apiFetch(`/api/stations/${stationId}/piles`, {
+                signal: controller.signal,
+            });
+            if (controller.signal.aborted || epoch !== state.authEpoch) return;
             if (!data.length) {
                 box.className = "empty-hint";
                 box.textContent = `场站 #${stationId} 暂无充电桩。`;
@@ -1797,16 +2239,24 @@
                 </table>
             `;
         } catch (err) {
+            if (isAbortError(err) || epoch !== state.authEpoch) return;
             box.className = "empty-hint";
             box.textContent = `查桩失败 (${err.status || "-"})：${err.message}`;
+        } finally {
+            finishRequest("panel:drill", controller);
         }
     }
 
     async function drillGuns(pileId) {
         const box = $("drillResultBox");
         $("drillPileId").value = pileId;
+        const controller = beginRequest("panel:drill");
+        const epoch = state.authEpoch;
         try {
-            const { data } = await apiFetch(`/api/stations/piles/${pileId}/guns`);
+            const { data } = await apiFetch(`/api/stations/piles/${pileId}/guns`, {
+                signal: controller.signal,
+            });
+            if (controller.signal.aborted || epoch !== state.authEpoch) return;
             if (!data.length) {
                 box.className = "empty-hint";
                 box.textContent = `充电桩 #${pileId} 暂未配置充电枪。`;
@@ -1850,8 +2300,11 @@
                 </table>
             `;
         } catch (err) {
+            if (isAbortError(err) || epoch !== state.authEpoch) return;
             box.className = "empty-hint";
             box.textContent = `查枪失败 (${err.status || "-"})：${err.message}`;
+        } finally {
+            finishRequest("panel:drill", controller);
         }
     }
 
@@ -1869,8 +2322,17 @@
         const opId = $("billOperatorFilter").value.trim();
         if (opId) qs.set("operator_id", opId);
 
+        const controller = beginRequest("panel:bills");
+        const epoch = state.authEpoch;
         try {
-            const { data } = await apiFetch(`/api/settlements?${qs.toString()}`);
+            const { data } = await apiFetch(`/api/settlements?${qs.toString()}`, {
+                signal: controller.signal,
+            });
+            if (controller.signal.aborted || epoch !== state.authEpoch) return;
+            if (!data.items.length && page > 1 && Number(data.total || 0) > 0) {
+                const clampedPage = Math.max(1, Math.ceil(Number(data.total) / state.pageSize.bills));
+                if (clampedPage !== page) return loadBills(clampedPage);
+            }
             if (!data.items.length) {
                 tbody.innerHTML = '<tr><td colspan="12"><div class="empty-hint">暂无结算单数据。</div></td></tr>';
                 pager.innerHTML = "";
@@ -1909,8 +2371,11 @@
 
             renderPagination(pager, data, (nextPage) => loadBills(nextPage));
         } catch (err) {
+            if (isAbortError(err) || epoch !== state.authEpoch) return;
             tbody.innerHTML = `<tr><td colspan="12"><div class="empty-hint">无权限或加载失败 (${escapeHtml(err.status || "-")})：${escapeHtml(err.message)}</div></td></tr>`;
             pager.innerHTML = "";
+        } finally {
+            finishRequest("panel:bills", controller);
         }
     }
 
@@ -1923,8 +2388,17 @@
             page_size: String(state.pageSize.diffs),
         });
 
+        const controller = beginRequest("panel:diffs");
+        const epoch = state.authEpoch;
         try {
-            const { data } = await apiFetch(`/api/settlements/diffs?${qs.toString()}`);
+            const { data } = await apiFetch(`/api/settlements/diffs?${qs.toString()}`, {
+                signal: controller.signal,
+            });
+            if (controller.signal.aborted || epoch !== state.authEpoch) return;
+            if (!data.items.length && page > 1 && Number(data.total || 0) > 0) {
+                const clampedPage = Math.max(1, Math.ceil(Number(data.total) / state.pageSize.diffs));
+                if (clampedPage !== page) return loadDiffs(clampedPage);
+            }
             if (!data.items.length) {
                 tbody.innerHTML = '<tr><td colspan="7"><div class="empty-hint">当前无待处理对账差异。</div></td></tr>';
                 pager.innerHTML = "";
@@ -1949,8 +2423,11 @@
 
             renderPagination(pager, data, (nextPage) => loadDiffs(nextPage));
         } catch (err) {
+            if (isAbortError(err) || epoch !== state.authEpoch) return;
             tbody.innerHTML = `<tr><td colspan="7"><div class="empty-hint">无权限或加载失败 (${escapeHtml(err.status || "-")})：${escapeHtml(err.message)}</div></td></tr>`;
             pager.innerHTML = "";
+        } finally {
+            finishRequest("panel:diffs", controller);
         }
     }
 
@@ -1960,8 +2437,13 @@
         $("detailDialogBody").innerHTML = '<div class="empty-hint">正在加载账单详情...</div>';
         dlg.showModal();
 
+        const controller = beginRequest("modal:detail");
+        const epoch = state.authEpoch;
         try {
-            const { data } = await apiFetch(`/api/settlements/${billId}`);
+            const { data } = await apiFetch(`/api/settlements/${billId}`, {
+                signal: controller.signal,
+            });
+            if (controller.signal.aborted || epoch !== state.authEpoch) return;
             $("detailDialogBody").innerHTML = `
                 <div class="detail-kv-grid">
                     <div class="detail-kv"><span>账单 ID / 账期</span><strong>#${escapeHtml(data.bill_id)} · ${escapeHtml(data.bill_month)}</strong></div>
@@ -1976,7 +2458,10 @@
                 </div>
             `;
         } catch (err) {
+            if (isAbortError(err) || epoch !== state.authEpoch) return;
             $("detailDialogBody").innerHTML = `<div class="inline-alert">加载失败 (${escapeHtml(err.status || "-")})：${escapeHtml(err.message)}</div>`;
+        } finally {
+            finishRequest("modal:detail", controller);
         }
     }
 
@@ -1987,10 +2472,13 @@
             return;
         }
         list.innerHTML = state.sessionInvoices
-            .map(
-                (inv) =>
-                    `<li><button class="btn btn-outline btn-xs pick-invoice-btn" data-invoice-id="${escapeHtml(inv.invoice_id)}" data-amount="${escapeHtml(inv.amount)}" type="button">#${escapeHtml(inv.invoice_id)} · ${escapeHtml(inv.invoice_no)} (¥${escapeHtml(inv.amount)})</button></li>`
-            )
+            .map((inv) => {
+                const label = `#${escapeHtml(inv.invoice_id)} · ${escapeHtml(inv.invoice_no)} (¥${escapeHtml(inv.amount)})`;
+                if (inv.red_flushed) {
+                    return `<li><button class="btn btn-outline btn-xs" type="button" disabled>已红冲 · ${label}</button></li>`;
+                }
+                return `<li><button class="btn btn-outline btn-xs pick-invoice-btn" data-invoice-id="${escapeHtml(inv.invoice_id)}" data-amount="${escapeHtml(inv.amount)}" type="button">${label}</button></li>`;
+            })
             .join("");
     }
 
@@ -2098,7 +2586,7 @@
         return "#/home";
     }
 
-    function activatePanel(panelId, { updateHash = true, fetchData = true } = {}) {
+    function activatePanel(panelId, { updateHash = true, pushHistory = false, fetchData = true } = {}) {
         const targetHash = hashFromPanel(panelId);
         const routeCfg = ROUTES[targetHash] || ROUTES["#/home"];
         const resolvedPanel = routeCfg.panel;
@@ -2127,7 +2615,11 @@
         });
 
         if (updateHash && location.hash !== targetHash) {
-            history.replaceState(null, "", targetHash);
+            if (pushHistory) {
+                history.pushState(null, "", targetHash);
+            } else {
+                history.replaceState(null, "", targetHash);
+            }
         }
 
         renderRoleNotice();
@@ -2181,8 +2673,14 @@
                 renderTableEmptyRow($("operatorsBody"), 7, msg);
             }
             if (role === "ops") {
-                drillPiles(Number($("drillStationId").value || 1));
-            } else if (role !== "admin") {
+                const stId = Number($("drillStationId").value);
+                drillPiles(Number.isInteger(stId) && stId >= 1 ? stId : 1);
+            } else if (role === "admin") {
+                const box = $("drillResultBox");
+                if (box && box.className === "empty-hint") {
+                    box.textContent = "输入场站 ID 或桩 ID，逐级查看下属设备。";
+                }
+            } else {
                 const box = $("drillResultBox");
                 if (box) {
                     box.className = "empty-hint";
@@ -2213,12 +2711,12 @@
         $("themeToggle")?.addEventListener("click", toggleTheme);
         $("authThemeToggle")?.addEventListener("click", toggleTheme);
 
-        // 侧边导航与 Hash 路由同步
+        // 侧边导航与 Hash 路由同步（显式点击侧栏推进浏览器历史记录）
         $("mainNav")?.addEventListener("click", (e) => {
             const link = e.target.closest(".nav-link[data-panel]");
             if (!link) return;
             e.preventDefault();
-            activatePanel(link.dataset.panel);
+            activatePanel(link.dataset.panel, { pushHistory: true });
         });
         window.addEventListener("hashchange", () => {
             const authMode = authModeFromHash(location.hash);
@@ -2243,7 +2741,8 @@
         $("gunMatrix")?.addEventListener("click", (e) => {
             const cell = e.target.closest(".gun-cell[data-gun-id]");
             if (!cell) return;
-            const canOrder = state.user && (state.user.role === "driver" || state.user.role === "fleet");
+            const role = state.user?.role;
+            const canOrder = role === "driver" || role === "fleet";
             if (cell.dataset.gunStatus === "IDLE" && canOrder) {
                 openStartOrderModal({
                     stationId: cell.dataset.stationId,
@@ -2251,9 +2750,9 @@
                     stationName: cell.dataset.stationName,
                     gunCode: cell.dataset.gunCode,
                 });
-            } else {
+            } else if (!role || TAB_ACCESS["panel-driver"].roles.includes(role)) {
                 $("gunStationFilter").value = cell.dataset.stationId || "";
-                activatePanel("panel-driver");
+                activatePanel("panel-driver", { pushHistory: true });
             }
         });
 
@@ -2321,17 +2820,57 @@
             });
         });
 
-        // 多标签页清空登录凭证时同步退回登录页
-        window.addEventListener("storage", (e) => {
-            if (e.key !== "ev_hub_token") return;
-            if (!e.newValue && (state.token || state.user)) {
-                state.token = "";
-                state.user = null;
-                state.authMode = "";
-                state.sessionInvoices = [];
+        // 多标签页认证与主题状态同步（含 localStorage.clear()、登出与切换账号）
+        window.addEventListener("storage", async (e) => {
+            if (e.key === "ev_hub_theme") {
+                const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+                document.documentElement.dataset.theme = e.newValue || (prefersDark ? "dark" : "light");
+                syncThemeToggles();
+                return;
+            }
+            if (e.key !== null && e.key !== "ev_hub_token") return;
+
+            if (e.key === null || !e.newValue) {
+                if (state.token || state.user) {
+                    closeAllDialogs();
+                    closeIdentityPopover();
+                    state.authEpoch += 1;
+                    abortRequestsByPrefix("panel:");
+                    abortRequestsByPrefix("modal:");
+                    abortRequestsByPrefix("auth:");
+                    state.token = "";
+                    state.user = null;
+                    state.authMode = "";
+                    resetWorkspacePaginationAndSession();
+                    renderUserContext();
+                    showAuthView("login", { updateHash: true });
+                    showToast("登录凭证已清除，请重新登录");
+                }
+                return;
+            }
+
+            if (e.newValue !== state.token) {
+                closeAllDialogs();
                 closeIdentityPopover();
-                renderUserContext();
-                showAuthView("login", { updateHash: true });
+                state.authEpoch += 1;
+                abortRequestsByPrefix("panel:");
+                abortRequestsByPrefix("modal:");
+                abortRequestsByPrefix("auth:");
+                state.token = e.newValue;
+                state.authMode = localStorage.getItem("ev_hub_auth_mode") || "";
+                resetWorkspacePaginationAndSession();
+                const res = await restoreSession();
+                if (res.ok) {
+                    if ($("authView") && !$("authView").hidden) {
+                        hideAuthView({ updateHash: true, fetchData: true });
+                    } else {
+                        refreshActivePanelData();
+                    }
+                    showToast("已在其他标签页切换账号，已同步最新身份");
+                } else if (res.reason === "invalid") {
+                    renderUserContext();
+                    showAuthView("login", { updateHash: true });
+                }
             }
         });
 
@@ -2349,13 +2888,6 @@
         setupPwdToggle("toggleLoginPwdBtn", "loginPassword", "显示登录密码", "隐藏登录密码");
         setupPwdToggle("toggleRegPwdBtn", "regPassword", "显示注册密码", "隐藏注册密码");
 
-        $("regRole").addEventListener("change", () => {
-            const isFleet = $("regRole").value === "fleet";
-            $("regFleetWrap").hidden = !isFleet;
-            $("regFleetId").required = isFleet;
-            if (!isFleet) $("regFleetId").value = "";
-        });
-
         $("loginForm").addEventListener("submit", async (e) => {
             e.preventDefault();
             const submitBtn = $("loginSubmitBtn");
@@ -2370,19 +2902,24 @@
                     }),
                 });
                 sessionExpiring = false;
+                state.authEpoch += 1;
+                abortRequestsByPrefix("panel:");
+                abortRequestsByPrefix("modal:");
+                abortRequestsByPrefix("auth:");
                 state.token = data.access_token;
                 state.user = data.user;
                 state.authMode = "account";
                 localStorage.setItem("ev_hub_token", state.token);
                 localStorage.setItem("ev_hub_auth_mode", "account");
                 $("loginPassword").value = "";
+                resetWorkspacePaginationAndSession();
                 renderUserContext();
                 hideAuthView({ updateHash: true, fetchData: true });
                 showToast(`登录成功：${data.user.username}`);
             } catch (err) {
                 const msg =
                     err.status === 500
-                        ? "账号登录服务暂未开通，可点击下方演示角色快速体验对应工作台。"
+                        ? "账号登录服务异常 (500)，请稍后重试；演示环境下也可点击下方演示角色快速进入。"
                         : `登录失败 (${err.status || "-"})：${err.message}`;
                 setInlineAlert($("authError"), msg);
             } finally {
@@ -2396,13 +2933,13 @@
             submitBtn.disabled = true;
             setInlineAlert($("authError"), "");
             try {
-                const role = $("regRole").value;
+                const role = $("regRole").value || "driver";
                 const payload = {
                     username: $("regUsername").value.trim(),
                     phone: $("regPhone").value.trim(),
                     password: $("regPassword").value,
                     role,
-                    fleet_id: role === "fleet" ? Number($("regFleetId").value) : null,
+                    fleet_id: null,
                 };
                 const { data } = await apiFetch("/api/auth/register", {
                     method: "POST",
@@ -2416,7 +2953,7 @@
             } catch (err) {
                 const msg =
                     err.status === 500
-                        ? "自助注册服务暂未开通，可点击下方演示角色快速体验对应工作台。"
+                        ? "自助注册服务异常 (500)，请稍后重试；演示环境下也可点击下方演示角色快速进入。"
                         : `注册失败 (${err.status || "-"})：${err.message}`;
                 setInlineAlert($("authError"), msg);
             } finally {
@@ -2475,6 +3012,7 @@
             const submitBtn = $("startOrderSubmitBtn");
             submitBtn.disabled = true;
             setInlineAlert($("startOrderError"), "");
+            const epoch = state.authEpoch;
             try {
                 const vehicleRaw = $("soVehicleId").value.trim();
                 const socRaw = $("soStartSoc").value.trim();
@@ -2488,12 +3026,17 @@
                     method: "POST",
                     body: JSON.stringify(payload),
                 });
+                if (epoch !== state.authEpoch) return;
                 $("startOrderDialog").close();
                 showToast(`开单成功：${data.order_no}（订单 #${data.order_id}）`);
                 if (state.activePanel === "panel-home") loadHomeData();
-                if (state.activePanel === "panel-driver") loadDriverGuns();
+                if (state.activePanel === "panel-driver") {
+                    loadDriverStations();
+                    loadDriverGuns();
+                }
                 if (state.activePanel === "panel-orders") loadOrders(1);
             } catch (err) {
+                if (epoch !== state.authEpoch) return;
                 setInlineAlert($("startOrderError"), `开单被拦截 (${err.status || "-"})：${err.message}`);
             } finally {
                 submitBtn.disabled = false;
@@ -2538,6 +3081,7 @@
             const submitBtn = $("finishOrderSubmitBtn");
             submitBtn.disabled = true;
             setInlineAlert($("finishOrderError"), "");
+            const epoch = state.authEpoch;
             try {
                 const orderId = $("foOrderId").value;
                 const endSoc = $("foEndSoc").value.trim();
@@ -2548,10 +3092,12 @@
                         end_soc: endSoc || null,
                     }),
                 });
+                if (epoch !== state.authEpoch) return;
                 $("finishOrderDialog").close();
                 showToast(`订单 #${data.order_id} 计费完成：应付 ¥${data.total_amount}`);
                 loadOrders();
             } catch (err) {
+                if (epoch !== state.authEpoch) return;
                 setInlineAlert($("finishOrderError"), `结束计费失败 (${err.status || "-"})：${err.message}`);
             } finally {
                 submitBtn.disabled = false;
@@ -2575,6 +3121,7 @@
             const submitBtn = $("payOrderSubmitBtn");
             submitBtn.disabled = true;
             setInlineAlert($("payOrderError"), "");
+            const epoch = state.authEpoch;
             try {
                 const orderId = $("poOrderId").value;
                 const { data } = await apiFetch(`/api/orders/${orderId}/pay`, {
@@ -2585,10 +3132,12 @@
                         txn_no: $("poTxnNo").value.trim(),
                     }),
                 });
+                if (epoch !== state.authEpoch) return;
                 $("payOrderDialog").close();
                 showToast(`流水已记账：${data.txn_no}（¥${data.amount} · ${data.status}）`);
                 loadOrders();
             } catch (err) {
+                if (epoch !== state.authEpoch) return;
                 setInlineAlert($("payOrderError"), `支付/退款被拦截 (${err.status || "-"})：${err.message}`);
             } finally {
                 submitBtn.disabled = false;
@@ -2599,12 +3148,12 @@
         $("heartbeatCheckBtn").addEventListener("click", runHeartbeatCheck);
         $("reportHeartbeatBtn").addEventListener("click", reportSingleHeartbeat);
         $("commissionPileBtn").addEventListener("click", () => {
-            const pileId = Number($("opsPileId").value || 0);
+            const pileId = parsePositiveInt($("opsPileId"), "充电桩 ID");
             if (!pileId) return;
             openCommissionDialog(pileId);
         });
         $("openPileStatusBtn").addEventListener("click", () => {
-            const pileId = Number($("opsPileId").value || 0);
+            const pileId = parsePositiveInt($("opsPileId"), "充电桩 ID");
             if (!pileId) return;
             openDeviceStatusDialog("PILE", pileId, "OFFLINE");
         });
@@ -2621,6 +3170,9 @@
             const pileBtn = e.target.closest(".recover-pile-btn");
             const gunBtn = e.target.closest(".recover-gun-btn");
             const customBtn = e.target.closest(".custom-pile-status-btn");
+            const actionBtn = pileBtn || gunBtn;
+            const epoch = state.authEpoch;
+            if (actionBtn) actionBtn.disabled = true;
             try {
                 if (pileBtn) {
                     const pid = pileBtn.dataset.pileId;
@@ -2633,6 +3185,7 @@
                             remark: "运维调度台快速恢复充电桩为空闲",
                         }),
                     });
+                    if (epoch !== state.authEpoch) return;
                     showToast(`充电桩 #${pid} 已恢复空闲`);
                     loadFaults();
                     loadStatusLogs(1);
@@ -2647,6 +3200,7 @@
                             remark: "运维调度台快速恢复充电枪为空闲",
                         }),
                     });
+                    if (epoch !== state.authEpoch) return;
                     showToast(`充电枪 #${gid} 已恢复空闲`);
                     loadFaults();
                     loadStatusLogs(1);
@@ -2654,7 +3208,10 @@
                     openDeviceStatusDialog("PILE", customBtn.dataset.pileId, customBtn.dataset.cur);
                 }
             } catch (err) {
+                if (epoch !== state.authEpoch) return;
                 showToast(`状态更新失败 (${err.status || "-"})：${err.message}`, true);
+            } finally {
+                if (actionBtn && document.contains(actionBtn)) actionBtn.disabled = false;
             }
         });
 
@@ -2674,8 +3231,8 @@
                         method: "POST",
                         body: JSON.stringify({ remark: vals.remark.trim() }),
                     });
-                    showToast(`${data.message} (#${data.id})`);
                     loadStatusLogs();
+                    return `${data.message} (#${data.id})`;
                 },
             });
         });
@@ -2713,8 +3270,8 @@
                         method: "POST",
                         body: JSON.stringify(vals),
                     });
-                    showToast(`运营商创建成功：#${data.operator_id} ${data.operator_name}`);
                     loadOperators(false);
+                    return `运营商创建成功：#${data.operator_id} ${data.operator_name}`;
                 },
             });
         });
@@ -2747,8 +3304,8 @@
                         method: "PATCH",
                         body: JSON.stringify(vals),
                     });
-                    showToast(`运营商 #${data.operator_id} 已更新`);
                     loadOperators(false);
+                    return `运营商 #${data.operator_id} 已更新`;
                 },
             });
         });
@@ -2793,15 +3350,21 @@
                                 available_spaces: Number(vals.available_spaces),
                             }),
                         });
-                        showToast(`场站 #${data.station_id} 更新成功`);
                         loadRealtimeBoard();
+                        return `场站 #${data.station_id} 更新成功`;
                     },
                 });
             }
         });
 
-        $("drillPilesBtn").addEventListener("click", () => drillPiles(Number($("drillStationId").value || 1)));
-        $("drillGunsBtn").addEventListener("click", () => drillGuns(Number($("drillPileId").value || 1)));
+        $("drillPilesBtn").addEventListener("click", () => {
+            const stId = parsePositiveInt($("drillStationId"), "场站 ID");
+            if (stId) drillPiles(stId);
+        });
+        $("drillGunsBtn").addEventListener("click", () => {
+            const pileId = parsePositiveInt($("drillPileId"), "充电桩 ID");
+            if (pileId) drillGuns(pileId);
+        });
         $("drillResultBox").addEventListener("click", (e) => {
             const gunBtn = e.target.closest(".drill-pile-btn");
             const pileStatusBtn = e.target.closest(".drill-pile-status-btn");
@@ -2810,22 +3373,28 @@
             if (gunBtn) {
                 drillGuns(Number(gunBtn.dataset.pileId));
             } else if (pileStatusBtn) {
-                openDeviceStatusDialog("PILE", pileStatusBtn.dataset.pileId, pileStatusBtn.dataset.cur, () =>
-                    drillPiles(Number($("drillStationId").value || 1))
-                );
+                openDeviceStatusDialog("PILE", pileStatusBtn.dataset.pileId, pileStatusBtn.dataset.cur, () => {
+                    drillPiles(Number($("drillStationId").value || 1));
+                    if (state.user?.role === "admin") loadRealtimeBoard();
+                });
             } else if (commBtn) {
-                openCommissionDialog(Number(commBtn.dataset.pileId), () =>
-                    drillPiles(Number($("drillStationId").value || 1))
-                );
+                openCommissionDialog(Number(commBtn.dataset.pileId), () => {
+                    drillPiles(Number($("drillStationId").value || 1));
+                    if (state.user?.role === "admin") loadRealtimeBoard();
+                });
             } else if (gunStatusBtn) {
-                openDeviceStatusDialog("GUN", gunStatusBtn.dataset.gunId, gunStatusBtn.dataset.cur, () =>
-                    drillGuns(Number($("drillPileId").value || 1))
-                );
+                openDeviceStatusDialog("GUN", gunStatusBtn.dataset.gunId, gunStatusBtn.dataset.cur, () => {
+                    drillGuns(Number($("drillPileId").value || 1));
+                    if (state.user?.role === "admin") loadRealtimeBoard();
+                });
             }
         });
 
         $("createStationForm").addEventListener("submit", async (e) => {
             e.preventDefault();
+            const submitBtn = e.target.querySelector('button[type="submit"]');
+            if (submitBtn) submitBtn.disabled = true;
+            const epoch = state.authEpoch;
             const fd = new FormData(e.target);
             const payload = Object.fromEntries(fd.entries());
             payload.operator_id = Number(payload.operator_id);
@@ -2836,15 +3405,22 @@
                     method: "POST",
                     body: JSON.stringify(payload),
                 });
+                if (epoch !== state.authEpoch) return;
                 showToast(`场站创建成功：#${data.station_id} ${data.station_name}`);
                 loadRealtimeBoard(1);
             } catch (err) {
+                if (epoch !== state.authEpoch) return;
                 showToast(`创建场站被拦截 (${err.status || "-"})：${err.message}`, true);
+            } finally {
+                if (submitBtn) syncRoleActionVisibility();
             }
         });
 
         $("createPileForm").addEventListener("submit", async (e) => {
             e.preventDefault();
+            const submitBtn = e.target.querySelector('button[type="submit"]');
+            if (submitBtn) submitBtn.disabled = true;
+            const epoch = state.authEpoch;
             const fd = new FormData(e.target);
             const payload = Object.fromEntries(fd.entries());
             payload.station_id = Number(payload.station_id);
@@ -2855,15 +3431,23 @@
                     method: "POST",
                     body: JSON.stringify(payload),
                 });
+                if (epoch !== state.authEpoch) return;
                 showToast(`充电桩建档成功：#${data.pile_id} ${data.pile_code}`);
                 drillPiles(payload.station_id);
+                loadRealtimeBoard();
             } catch (err) {
+                if (epoch !== state.authEpoch) return;
                 showToast(`建档被拦截 (${err.status || "-"})：${err.message}`, true);
+            } finally {
+                if (submitBtn) syncRoleActionVisibility();
             }
         });
 
         $("createGunForm").addEventListener("submit", async (e) => {
             e.preventDefault();
+            const submitBtn = e.target.querySelector('button[type="submit"]');
+            if (submitBtn) submitBtn.disabled = true;
+            const epoch = state.authEpoch;
             const fd = new FormData(e.target);
             const payload = Object.fromEntries(fd.entries());
             payload.pile_id = Number(payload.pile_id);
@@ -2873,16 +3457,24 @@
                     method: "POST",
                     body: JSON.stringify(payload),
                 });
+                if (epoch !== state.authEpoch) return;
                 showToast(`充电枪建档成功：#${data.gun_id} ${data.gun_code}`);
                 drillGuns(payload.pile_id);
+                loadRealtimeBoard();
             } catch (err) {
+                if (epoch !== state.authEpoch) return;
                 showToast(`建枪被拦截 (${err.status || "-"})：${err.message}`, true);
+            } finally {
+                if (submitBtn) syncRoleActionVisibility();
             }
         });
 
         // Tab 5 结算对账与开票红冲
         $("generateBillForm").addEventListener("submit", async (e) => {
             e.preventDefault();
+            const submitBtn = e.target.querySelector('button[type="submit"]');
+            if (submitBtn) submitBtn.disabled = true;
+            const epoch = state.authEpoch;
             try {
                 const { data } = await apiFetch("/api/settlements/generate", {
                     method: "POST",
@@ -2892,11 +3484,15 @@
                         platform_rate: $("genPlatformRate").value.trim(),
                     }),
                 });
+                if (epoch !== state.authEpoch) return;
                 showToast(data.message);
                 loadBills(1);
                 loadDiffs(1);
             } catch (err) {
+                if (epoch !== state.authEpoch) return;
                 showToast(`生成结算单失败 (${err.status || "-"})：${err.message}`, true);
+            } finally {
+                if (submitBtn) syncRoleActionVisibility();
             }
         });
 
@@ -2944,8 +3540,8 @@
                         state.sessionInvoices.unshift(data);
                         renderSessionInvoices();
                         $("rfInvoiceId").value = data.invoice_id;
-                        showToast(`开票成功：#${data.invoice_id} ${data.invoice_no}（¥${data.amount}）`);
                         loadBills();
+                        return `开票成功：#${data.invoice_id} ${data.invoice_no}（¥${data.amount}）`;
                     },
                 });
             }
@@ -2966,15 +3562,18 @@
                         method: "POST",
                         body: JSON.stringify({ remark: vals.remark.trim() }),
                     });
-                    showToast(`差异 #${data.diff_id} 已标记处理`);
                     loadDiffs();
                     loadBills();
+                    return `差异 #${data.diff_id} 已标记处理`;
                 },
             });
         });
 
         $("redFlushForm").addEventListener("submit", async (e) => {
             e.preventDefault();
+            const submitBtn = e.target.querySelector('button[type="submit"]');
+            if (submitBtn) submitBtn.disabled = true;
+            const epoch = state.authEpoch;
             const invoiceId = Number($("rfInvoiceId").value);
             const invoiceNo = $("rfInvoiceNo").value.trim();
             const amtRaw = $("rfAmount").value.trim();
@@ -2986,11 +3585,21 @@
                         amount: amtRaw || null,
                     }),
                 });
+                if (epoch !== state.authEpoch) return;
                 $("rfInvoiceNo").value = "";
+                $("rfAmount").value = "";
+                const idx = state.sessionInvoices.findIndex((inv) => Number(inv.invoice_id) === invoiceId);
+                if (idx !== -1) {
+                    state.sessionInvoices[idx] = { ...state.sessionInvoices[idx], red_flushed: true };
+                    renderSessionInvoices();
+                }
                 showToast(`红冲完成：生成负数票 #${data.invoice_id} ${data.invoice_no}（¥${data.amount}）`);
                 loadBills();
             } catch (err) {
+                if (epoch !== state.authEpoch) return;
                 showToast(`红冲被拦截 (${err.status || "-"})：${err.message}`, true);
+            } finally {
+                if (submitBtn) syncRoleActionVisibility();
             }
         });
 
@@ -3002,19 +3611,28 @@
             $("rfAmount").value = `-${btn.dataset.amount}`;
         });
 
-        // 通用弹窗提交处理器
+        // 通用弹窗提交处理器（先关闭对话框，再触发成功 Toast，避免被 dialog[open] 拦截）
         $("actionDialogForm").addEventListener("submit", async (e) => {
             e.preventDefault();
             if (!currentActionHandler) return;
             const submitBtn = $("actionDialogSubmitBtn");
             submitBtn.disabled = true;
             setInlineAlert($("actionDialogError"), "");
+            const epoch = state.authEpoch;
+            const handler = currentActionHandler;
             try {
                 const fd = new FormData(e.target);
                 const vals = Object.fromEntries(fd.entries());
-                await currentActionHandler(vals);
+                const result = await handler(vals);
+                if (epoch !== state.authEpoch) return;
                 $("actionDialog").close();
+                if (typeof result === "string" && result) {
+                    showToast(result);
+                } else if (result && typeof result === "object" && result.message) {
+                    showToast(result.message, Boolean(result.isError));
+                }
             } catch (err) {
+                if (epoch !== state.authEpoch) return;
                 setInlineAlert($("actionDialogError"), `操作被拦截 (${err.status || "-"})：${err.message}`);
             } finally {
                 submitBtn.disabled = false;
@@ -3036,8 +3654,7 @@
                 try {
                     const { data } = await apiFetch("/api/orders?page=1&page_size=20");
                     const paidOrFinished = data.items?.find((o) => o.status === "PAID" || o.status === "FINISHED");
-                    const anyOwn = paidOrFinished || data.items?.[0];
-                    if (anyOwn) targetOrderId = anyOwn.order_id;
+                    if (paidOrFinished) targetOrderId = paidOrFinished.order_id;
                 } catch {
                     // 回退到默认订单 6
                 }
@@ -3062,7 +3679,7 @@
     }
 
     function openCommissionDialog(pileId, onSuccess = null) {
-        const today = new Date().toISOString().slice(0, 10);
+        const today = getLocalDateString();
         openActionDialog({
             title: `充电桩 #${pileId} 协议联调验收投运`,
             desc: "仅已配置充电枪且未验收的充电桩可执行投运；未配枪或重复验收将被规则拦截。",
@@ -3079,9 +3696,13 @@
                         remark: vals.remark.trim(),
                     }),
                 });
-                showToast(`桩 #${data.pile_id} (${data.pile_code}) 已验收投运`);
-                if (onSuccess) onSuccess();
-                else loadStatusLogs(1);
+                if (onSuccess) {
+                    onSuccess();
+                } else {
+                    loadFaults();
+                    loadStatusLogs(1);
+                }
+                return `桩 #${data.pile_id} (${data.pile_code}) 已验收投运`;
             },
         });
     }
@@ -3141,13 +3762,13 @@
                         remark: vals.remark.trim(),
                     }),
                 });
-                showToast(`${isPile ? "充电桩" : "充电枪"} #${targetId} 状态已变更为 ${vals.new_status}`);
                 if (onSuccess) {
                     onSuccess();
                 } else {
                     loadFaults();
                     loadStatusLogs(1);
                 }
+                return `${isPile ? "充电桩" : "充电枪"} #${targetId} 状态已变更为 ${vals.new_status}`;
             },
         });
     }
@@ -3160,32 +3781,55 @@
             localStorage.setItem("ev_hub_theme", themeParam);
         }
 
+        const roleParam = urlParams.get("role");
+        if (urlParams.has("role")) {
+            urlParams.delete("role");
+            const nextSearch = urlParams.toString();
+            const nextUrl = `${location.pathname}${nextSearch ? `?${nextSearch}` : ""}${location.hash}`;
+            history.replaceState(null, "", nextUrl);
+        }
+
         syncThemeToggles();
         bindEvents();
 
         const initialAuthMode = authModeFromHash(location.hash);
         state.activePanel = initialAuthMode ? "panel-home" : panelFromHash(location.hash);
-        await Promise.all([checkDbHealth(), loadRolesMeta()]);
 
-        const roleParam = urlParams.get("role");
+        // 后台非阻塞并发拉取服务健康状态与角色字典，不阻塞首屏渲染
+        checkDbHealth();
+        loadRolesMeta();
+
         const validRoles = ["driver", "fleet", "ops", "settlement", "admin"];
         if (roleParam && validRoles.includes(roleParam)) {
+            renderUserContext();
+            showAuthView("login", { updateHash: false });
             const ok = await switchDevRole(roleParam, { fetchData: false });
             if (ok) {
                 hideAuthView({ updateHash: true, fetchData: true });
             } else {
-                renderUserContext();
                 showAuthView("login", { updateHash: true });
             }
             return;
         }
 
+        if (!state.token) {
+            renderUserContext();
+            showAuthView(initialAuthMode || "login", { updateHash: true });
+            return;
+        }
+
         const restored = await restoreSession();
-        if (restored) {
+        if (restored.ok) {
             hideAuthView({ updateHash: true, fetchData: true });
         } else {
             renderUserContext();
             showAuthView(initialAuthMode || "login", { updateHash: true });
+            if (restored.reason === "transient") {
+                setInlineAlert(
+                    $("authError"),
+                    `恢复登录会话失败 (${restored.err?.status || "网络异常"})，已保留本地凭证，可刷新重试或重新登录。`
+                );
+            }
         }
     }
 

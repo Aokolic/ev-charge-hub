@@ -1160,7 +1160,7 @@ class StationLine1VerificationTest(unittest.TestCase):
         for static_path, marker in (
             ("/", "新能源汽车充电桩运营服务平台"),
             ("/static/", "充电桩运营服务平台"),
-            ("/static/styles.css", "@layer reset, base, components, utilities"),
+            ("/static/styles.css", "@layer reset, base, layout, components, pages, utilities"),
             ("/static/app.js", "/api/stations/overview"),
         ):
             st, raw = asyncio.run(_call_asgi_raw("GET", static_path))

@@ -391,7 +391,7 @@ CREATE TABLE pricing_rule (
     CONSTRAINT ck_rule_price CHECK (energy_price >= 0 AND service_price >= 0 AND min_charge >= 0),
     CONSTRAINT ck_rule_time  CHECK (start_time <> end_time),
     CONSTRAINT ck_rule_date  CHECK (effective_to IS NULL OR effective_to >= effective_from)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='分时电价规则（业务线2）';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='分时电价规则（业务线2）';
 
 -- 充电订单：一次充电一行，钱先记 0，结束时由 sp_order_calc 算出来
 CREATE TABLE charge_order (
@@ -427,7 +427,7 @@ CREATE TABLE charge_order (
                                 AND (end_soc   IS NULL OR end_soc   BETWEEN 0 AND 100)),
     CONSTRAINT ck_order_money CHECK (energy_fee >= 0 AND service_fee >= 0
                                  AND discount_amount >= 0 AND total_amount >= 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='充电订单（业务线2）';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='充电订单（业务线2）';
 
 -- 费用明细：一单跨峰平谷就拆成多行，单价存快照，以后调价不影响老单
 CREATE TABLE order_fee_detail (
@@ -448,7 +448,7 @@ CREATE TABLE order_fee_detail (
     CONSTRAINT fk_detail_order FOREIGN KEY (order_id) REFERENCES charge_order (order_id) ON DELETE CASCADE,
     CONSTRAINT ck_detail_time CHECK (end_time > begin_time),
     CONSTRAINT ck_detail_kwh  CHECK (kwh >= 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='分时费用明细（业务线2）';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='分时费用明细（业务线2）';
 
 -- 支付流水：一单可以付多次，退款记负数，txn_no 唯一防回调重复入账
 CREATE TABLE payment_record (
@@ -465,7 +465,7 @@ CREATE TABLE payment_record (
     KEY idx_payment_order (order_id),
     CONSTRAINT fk_payment_order FOREIGN KEY (order_id) REFERENCES charge_order (order_id) ON DELETE CASCADE,
     CONSTRAINT ck_payment_amount CHECK (amount <> 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='支付流水（业务线2）';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='支付流水（业务线2）';
 
 
 -- ============================================================================
@@ -594,7 +594,7 @@ CREATE TABLE settlement_bill (
     PRIMARY KEY (bill_id),
     UNIQUE KEY uk_bill_month (operator_id, station_id, bill_month),
     CONSTRAINT ck_bill_money CHECK (total_amount >= 0 AND platform_fee >= 0 AND payable_amount >= 0)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='月度结算单（业务线5）';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='月度结算单（业务线5）';
 
 -- 对账差异：账单和订单对不上时记一行，指回具体订单
 CREATE TABLE reconcile_diff (
@@ -611,7 +611,7 @@ CREATE TABLE reconcile_diff (
     PRIMARY KEY (diff_id),
     KEY idx_diff_bill (bill_id, resolved),
     CONSTRAINT fk_diff_bill FOREIGN KEY (bill_id) REFERENCES settlement_bill (bill_id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='对账差异（业务线5）';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='对账差异（业务线5）';
 
 -- 开票记录：红冲不删原票，另开一张负数票，用 red_flush_of 指回去
 CREATE TABLE invoice_record (
@@ -628,7 +628,7 @@ CREATE TABLE invoice_record (
     KEY idx_invoice_bill (bill_id),
     CONSTRAINT fk_invoice_bill FOREIGN KEY (bill_id) REFERENCES settlement_bill (bill_id),
     CONSTRAINT fk_invoice_red FOREIGN KEY (red_flush_of) REFERENCES invoice_record (invoice_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='开票记录（业务线5）';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='开票记录（业务线5）';
 
 -- ============================================================
 -- 跨线外键：等线1（station / charging_gun）、线4（user_account / vehicle）建完表再执行
