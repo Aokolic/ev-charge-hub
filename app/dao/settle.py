@@ -25,9 +25,9 @@ SQL_BILL_ROW = "SELECT * FROM v_settle_bill_detail WHERE bill_id = :bid"
 def list_bills(db: Session, page: PageParams, operator_id: int | None = None) -> dict[str, Any]:
     if operator_id:
         return fetch_view_page(
-            db, SQL_BILL_OF_OPERATOR, {"oid": operator_id}, page, "bill_month DESC"
+            db, SQL_BILL_OF_OPERATOR, {"oid": operator_id}, page, "bill_month DESC, bill_id DESC"
         )
-    return fetch_view_page(db, SQL_BILL_DETAIL, None, page, "bill_month DESC")
+    return fetch_view_page(db, SQL_BILL_DETAIL, None, page, "bill_month DESC, bill_id DESC")
 
 
 def list_open_diffs(db: Session, page: PageParams) -> dict[str, Any]:
