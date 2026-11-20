@@ -54,6 +54,19 @@ _REALTIME_SQL = (
 _ORDER_BY_ALARM = "occurred_at DESC, alarm_id DESC"
 _ORDER_BY_WORKORDER = "dispatched_at DESC, work_order_id DESC"
 
+_SQL_SET_ALARM_STATUS_VARS = text(
+    "SET @status_change_source = 'ALARM', "
+    "@status_todo_status = 'DONE', "
+    "@status_change_remark = :remark"
+)
+_SQL_CLEAR_STATUS_VARS = text(
+    "SET @status_change_source = NULL, "
+    "@status_todo_status = NULL, "
+    "@status_change_remark = NULL"
+)
+_PILE_RECOVERY_REMARK = "维修工单闭环且连续遥测正常，自动恢复空闲"
+_GUN_RECOVERY_REMARK = "维修工单闭环且连续遥测正常，充电枪自动恢复空闲"
+
 
 def _now() -> datetime:
     """统一取应用侧当前时间，保证同一事务内各时间字段一致。"""
@@ -133,7 +146,7 @@ def create_telemetry_batch(db: Session, items: list[TelemetryIn]) -> int:
     rows = [
         PileTelemetry(
             pile_id=item.pile_id,
-            collected_at=item.collected_at,
+            collected_at=_to_naive_local(item.collected_at) or item.collected_at,
             output_voltage=item.output_voltage,
             output_current=item.output_current,
             power=item.power,
@@ -273,7 +286,12 @@ def _require_owned_order(
     actor_id: int,
     role: RoleEnum = RoleEnum.OPS,
 ) -> RepairOrder:
-    order = db.get(RepairOrder, work_order_id)
+    """锁定并返回指定维修工单；ops 角色仅允许操作本人名下工单。"""
+    order = db.execute(
+        select(RepairOrder)
+        .where(RepairOrder.work_order_id == work_order_id)
+        .with_for_update()
+    ).scalar_one_or_none()
     if order is None:
         raise MonitorError("维修工单不存在", status_code=404)
     if role == RoleEnum.OPS and order.maintainer_id != actor_id:
@@ -376,6 +394,118 @@ def complete_repair_order(
     )
 
 
+def _count_open_pile_alarms(db: Session, pile_id: int) -> int:
+    """统计指定充电桩上仍处于 ACTIVE/PROCESSING 状态的未解除告警数。"""
+    return int(
+        db.scalar(
+            select(func.count())
+            .select_from(AlarmRecord)
+            .where(
+                AlarmRecord.pile_id == pile_id,
+                AlarmRecord.status.in_(("ACTIVE", "PROCESSING")),
+            )
+        )
+        or 0
+    )
+
+
+def _count_open_gun_alarms(db: Session, gun_id: int) -> int:
+    """统计指定充电枪上仍处于 ACTIVE/PROCESSING 状态的枪级未解除告警数。"""
+    return int(
+        db.scalar(
+            select(func.count())
+            .select_from(AlarmRecord)
+            .where(
+                AlarmRecord.gun_id == gun_id,
+                AlarmRecord.status.in_(("ACTIVE", "PROCESSING")),
+            )
+        )
+        or 0
+    )
+
+
+def _recover_single_gun(db: Session, gun_id: int) -> None:
+    """设置触发器上下文变量并将单把故障充电枪恢复为空闲（逐枪执行保证每条日志来源均为 ALARM）。"""
+    db.execute(_SQL_SET_ALARM_STATUS_VARS, {"remark": _GUN_RECOVERY_REMARK})
+    db.execute(
+        text(
+            "UPDATE charging_gun "
+            "SET current_status = 'IDLE', status_updated_at = NOW() "
+            "WHERE gun_id = :gid"
+        ),
+        {"gid": gun_id},
+    )
+
+
+def _restore_devices_on_alarm_recovery(db: Session, alarm: AlarmRecord) -> None:
+    """告警恢复后在单事务内联动恢复无剩余未决告警的故障桩与故障枪，并清零会话变量。"""
+    remaining_pile_alarms = _count_open_pile_alarms(db, alarm.pile_id)
+    if remaining_pile_alarms > 0 and alarm.gun_id is None:
+        return
+
+    pile_row = db.execute(
+        text(
+            "SELECT current_status, acceptance_status "
+            "FROM charging_pile WHERE pile_id = :pid FOR UPDATE"
+        ),
+        {"pid": alarm.pile_id},
+    ).mappings().first()
+    if pile_row is None:
+        return
+
+    pile_status = str(pile_row["current_status"])
+    acceptance_status = str(pile_row["acceptance_status"])
+
+    has_error = False
+    try:
+        if remaining_pile_alarms == 0 and acceptance_status == "PASSED" and pile_status == "FAULT":
+            db.execute(_SQL_SET_ALARM_STATUS_VARS, {"remark": _PILE_RECOVERY_REMARK})
+            db.execute(
+                text(
+                    "UPDATE charging_pile "
+                    "SET current_status = 'IDLE', status_updated_at = NOW() "
+                    "WHERE pile_id = :pid"
+                ),
+                {"pid": alarm.pile_id},
+            )
+            pile_status = "IDLE"
+
+        if acceptance_status == "PASSED" and pile_status not in ("FAULT", "OFFLINE"):
+            if alarm.gun_id is not None:
+                if _count_open_gun_alarms(db, alarm.gun_id) == 0:
+                    gun_row = db.execute(
+                        text(
+                            "SELECT gun_id, current_status "
+                            "FROM charging_gun WHERE gun_id = :gid FOR UPDATE"
+                        ),
+                        {"gid": alarm.gun_id},
+                    ).mappings().first()
+                    if gun_row is not None and gun_row["current_status"] == "FAULT":
+                        _recover_single_gun(db, int(gun_row["gun_id"]))
+            elif remaining_pile_alarms == 0:
+                fault_gun_ids = db.execute(
+                    text(
+                        "SELECT gun_id FROM charging_gun "
+                        "WHERE pile_id = :pid AND current_status = 'FAULT' "
+                        "ORDER BY gun_id ASC FOR UPDATE"
+                    ),
+                    {"pid": alarm.pile_id},
+                ).scalars().all()
+                for raw_gun_id in fault_gun_ids:
+                    gun_id = int(raw_gun_id)
+                    if _count_open_gun_alarms(db, gun_id) == 0:
+                        _recover_single_gun(db, gun_id)
+    except Exception:
+        has_error = True
+        raise
+    finally:
+        try:
+            db.execute(_SQL_CLEAR_STATUS_VARS)
+        except Exception:
+            if not has_error:
+                raise
+
+
 def close_repair_order(
     db: Session,
     work_order_id: int,
@@ -383,7 +513,7 @@ def close_repair_order(
     role: RoleEnum,
     verified_at: datetime | None,
 ) -> str:
-    """复核关闭工单；仅在修复后连续两条遥测均正常时解除告警。"""
+    """复核关闭工单；仅在修复后连续两条遥测均正常时解除告警并联动恢复设备状态。"""
     now = _now()
     order = _require_owned_order(db, work_order_id, actor_id, role)
     if order.status not in ("REPAIRED", "VERIFIED"):
@@ -398,63 +528,74 @@ def close_repair_order(
         previous=order.repaired_at,
         label="复核时间",
     )
-    order.status = "CLOSED"
-    order.verified_at = verification_time
-    order.closed_at = max(now, verification_time)
-    order.updated_at = now
-    # autoflush=False，显式 flush 后再统计同告警未闭环工单，避免把当前工单误算进去
-    db.flush()
 
-    open_count = db.scalar(
-        select(func.count())
-        .select_from(RepairOrder)
-        .where(
-            RepairOrder.alarm_id == order.alarm_id,
-            RepairOrder.status.notin_(["CLOSED"]),
-        )
-    ) or 0
+    try:
+        order.status = "CLOSED"
+        order.verified_at = verification_time
+        order.closed_at = max(now, verification_time)
+        order.updated_at = now
+        # autoflush=False，显式 flush 后再统计同告警未闭环工单，避免把当前工单误算进去
+        db.flush()
 
-    message = "维修工单已关闭"
-    if open_count == 0:
-        alarm = db.get(AlarmRecord, order.alarm_id)
-        if alarm is None:
-            raise MonitorError("工单关联告警不存在", status_code=404)
-
-        telemetry_rows = db.execute(
-            text(
-                "SELECT fault_code, offline_duration_sec "
-                "FROM pile_telemetry "
-                "WHERE pile_id = :pile_id "
-                "  AND collected_at >= :repaired_at "
-                "ORDER BY collected_at DESC "
-                "LIMIT 2"
-            ),
-            {"pile_id": alarm.pile_id, "repaired_at": order.repaired_at},
-        ).mappings().all()
-
-        healthy = (
-            len(telemetry_rows) >= 2
-            and all(
-                row["fault_code"] is None
-                and int(row["offline_duration_sec"] or 0) == 0
-                for row in telemetry_rows
+        open_count = db.scalar(
+            select(func.count())
+            .select_from(RepairOrder)
+            .where(
+                RepairOrder.alarm_id == order.alarm_id,
+                RepairOrder.status.notin_(["CLOSED"]),
             )
-        )
-        if healthy:
-            if alarm.status in ("ACTIVE", "PROCESSING"):
-                alarm.status = "RECOVERED"
-                alarm.recovered_at = now
-                alarm.updated_at = now
-            message = "维修工单已关闭，修复后连续遥测正常，告警已解除"
-        elif not telemetry_rows:
-            message = "维修工单已关闭，但修复后没有遥测数据，告警保持处理中"
-        elif len(telemetry_rows) < 2:
-            message = "维修工单已关闭，但修复后连续正常遥测不足 2 条，告警保持处理中"
-        else:
-            message = "维修工单已关闭，但修复后遥测仍有故障或离线，告警保持处理中"
+        ) or 0
 
-    _commit_or_rollback(db)
-    return message
+        message = "维修工单已关闭"
+        if open_count == 0:
+            alarm = db.execute(
+                select(AlarmRecord)
+                .where(AlarmRecord.alarm_id == order.alarm_id)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if alarm is None:
+                raise MonitorError("工单关联告警不存在", status_code=404)
+
+            telemetry_rows = db.execute(
+                text(
+                    "SELECT fault_code, offline_duration_sec "
+                    "FROM pile_telemetry "
+                    "WHERE pile_id = :pile_id "
+                    "  AND collected_at >= :repaired_at "
+                    "ORDER BY collected_at DESC "
+                    "LIMIT 2"
+                ),
+                {"pile_id": alarm.pile_id, "repaired_at": order.repaired_at},
+            ).mappings().all()
+
+            healthy = (
+                len(telemetry_rows) >= 2
+                and all(
+                    row["fault_code"] is None
+                    and int(row["offline_duration_sec"] or 0) == 0
+                    for row in telemetry_rows
+                )
+            )
+            if healthy:
+                if alarm.status in ("ACTIVE", "PROCESSING"):
+                    alarm.status = "RECOVERED"
+                    alarm.recovered_at = now
+                    alarm.updated_at = now
+                    db.flush()
+                    _restore_devices_on_alarm_recovery(db, alarm)
+                message = "维修工单已关闭，修复后连续遥测正常，告警已解除"
+            elif not telemetry_rows:
+                message = "维修工单已关闭，但修复后没有遥测数据，告警保持处理中"
+            elif len(telemetry_rows) < 2:
+                message = "维修工单已关闭，但修复后连续正常遥测不足 2 条，告警保持处理中"
+            else:
+                message = "维修工单已关闭，但修复后遥测仍有故障或离线，告警保持处理中"
+
+        db.commit()
+        return message
+    except Exception:
+        db.rollback()
+        raise
 
 
 def verify_repair_order(

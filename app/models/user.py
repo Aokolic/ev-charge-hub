@@ -102,7 +102,7 @@ class UserAccount(Base):
 
 
 class Vehicle(Base):
-    """车辆档案：一个用户可绑定多辆车；plate_hash 全局唯一 → 同一车牌同刻只归一个车主。"""
+    """车辆档案：一个用户可绑定多辆车；active_plate_hash 全局唯一 → 同一车牌同刻只归一个车主。"""
 
     __tablename__ = "vehicle"
 
@@ -110,7 +110,7 @@ class Vehicle(Base):
     user_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("user_account.user_id"))
     fleet_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("fleet_account.fleet_id"))
     plate_cipher: Mapped[str] = mapped_column(String(255))
-    plate_hash: Mapped[str] = mapped_column(CHAR(64), unique=True)
+    plate_hash: Mapped[str] = mapped_column(CHAR(64), index=True)
     plate_masked: Mapped[str] = mapped_column(String(20))
     plate_color: Mapped[str] = mapped_column(PLATE_COLOR_ENUM, default="GREEN")
     vehicle_model: Mapped[str] = mapped_column(String(64))
@@ -123,6 +123,7 @@ class Vehicle(Base):
     active_plate_hash: Mapped[str | None] = mapped_column(
         CHAR(64),
         Computed("CASE WHEN bind_status = 'BOUND' THEN plate_hash END", persisted=True),
+        unique=True,
     )
     bound_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=FetchedValue())

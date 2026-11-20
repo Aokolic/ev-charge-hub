@@ -78,7 +78,9 @@ def set_bill_status(db: Session, bill_id: int, action: str) -> SettlementBill | 
 
     开票后（INVOICED）不允许再确认或关单，只能先红冲。
     """
-    bill = db.get(SettlementBill, bill_id)
+    bill = db.execute(
+        select(SettlementBill).where(SettlementBill.bill_id == bill_id).with_for_update()
+    ).scalars().first()
     if bill is None:
         return None
 
@@ -103,7 +105,9 @@ def set_bill_status(db: Session, bill_id: int, action: str) -> SettlementBill | 
 
 
 def resolve_diff(db: Session, diff_id: int, remark: str | None) -> ReconcileDiff | None:
-    diff = db.get(ReconcileDiff, diff_id)
+    diff = db.execute(
+        select(ReconcileDiff).where(ReconcileDiff.diff_id == diff_id).with_for_update()
+    ).scalars().first()
     if diff is None:
         return None
     if diff.resolved == 1:
@@ -133,9 +137,13 @@ def list_invoices(db: Session, bill_id: int) -> list[InvoiceRecord]:
 
 def issue_invoice(db: Session, bill_id: int, payload: InvoiceIn) -> InvoiceRecord | None:
     """开票。金额上限、账单状态由触发器 trg_invoice_guard 校验。"""
-    bill = db.get(SettlementBill, bill_id)
+    bill = db.execute(
+        select(SettlementBill).where(SettlementBill.bill_id == bill_id).with_for_update()
+    ).scalars().first()
     if bill is None:
         return None
+    if bill.status == "DRAFT":
+        raise ValueError("草稿账单不能直接开票，请先确认账单")
     if bill.status == "CLOSED":
         raise ValueError("账单已关单，不能再开票")
 
@@ -162,8 +170,25 @@ def red_flush_invoice(
 ) -> InvoiceRecord | None:
     """红冲：开一张负数票指向原票，再把原票状态改成 RED_FLUSHED。
 
-    原票要加 FOR UPDATE 锁，否则两笔并发红冲都能通过校验，把已开票额冲成负数。
+    先按 trg_invoice_guard 同序锁定账单（FOR UPDATE），再锁原票（FOR UPDATE），
+    避免与开票/状态流转并发发生死锁或关单/草稿账单被红冲。
     """
+    bill_id = db.execute(
+        select(InvoiceRecord.bill_id).where(InvoiceRecord.invoice_id == invoice_id)
+    ).scalar_one_or_none()
+    if bill_id is None:
+        return None
+
+    bill = db.execute(
+        select(SettlementBill).where(SettlementBill.bill_id == bill_id).with_for_update()
+    ).scalars().first()
+    if bill is None:
+        return None
+    if bill.status == "CLOSED":
+        raise ValueError("账单已关单，不能红冲发票")
+    if bill.status == "DRAFT":
+        raise ValueError("草稿账单不能红冲发票")
+
     origin = db.execute(
         select(InvoiceRecord).where(InvoiceRecord.invoice_id == invoice_id).with_for_update()
     ).scalars().first()

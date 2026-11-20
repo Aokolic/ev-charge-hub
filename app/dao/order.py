@@ -7,12 +7,12 @@
 4. 开单要锁枪、校验归属并联动枪状态，不能只信任前端传的 gun_id/station_id。
 """
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.orm import Session
 
 from app.dao.common import fetch_view_page
@@ -37,7 +37,24 @@ ORDER BY stat_date, period
 
 # 锁枪并反查桩、站；FOR UPDATE 保证并发开单时同一把枪只有一个事务能进
 SQL_LOCK_GUN = """
-SELECT g.gun_id, g.current_status, g.pile_id, p.station_id
+SELECT g.gun_id,
+       g.current_status AS gun_status,
+       g.pile_id,
+       p.station_id,
+       p.acceptance_status,
+       p.current_status AS pile_status,
+       s.station_status
+  FROM charging_gun g
+  JOIN charging_pile p ON p.pile_id = g.pile_id
+  JOIN station s ON s.station_id = p.station_id
+ WHERE g.gun_id = :gid
+   FOR UPDATE
+"""
+
+SQL_LOCK_GUN_FOR_RELEASE = """
+SELECT g.current_status AS gun_status,
+       p.acceptance_status,
+       p.current_status AS pile_status
   FROM charging_gun g
   JOIN charging_pile p ON p.pile_id = g.pile_id
  WHERE g.gun_id = :gid
@@ -46,23 +63,63 @@ SELECT g.gun_id, g.current_status, g.pile_id, p.station_id
 
 SQL_VEHICLE_OWNER = "SELECT user_id, fleet_id FROM vehicle WHERE vehicle_id = :vid"
 
-SQL_GUN_OCCUPY = """
+SQL_SET_ORDER_GUN_VARS = """
+SET @status_change_source = 'ORDER',
+    @status_todo_status   = 'NONE',
+    @status_change_remark = :remark
+"""
+
+SQL_UPDATE_GUN_STATUS = """
 UPDATE charging_gun
-   SET current_status = 'OCCUPIED', status_updated_at = NOW()
+   SET current_status = :st, status_updated_at = NOW()
  WHERE gun_id = :gid
 """
 
-SQL_GUN_RELEASE = """
-UPDATE charging_gun
-   SET current_status = 'IDLE', status_updated_at = NOW()
- WHERE gun_id = :gid
+SQL_CLEAR_GUN_VARS = """
+SET @status_change_source = NULL,
+    @status_todo_status   = NULL,
+    @status_change_remark = NULL
 """
 
-SQL_STATUS_LOG = """
-INSERT INTO device_status_log
-       (device_type, pile_id, gun_id, prev_status, new_status, change_source, remark)
-VALUES ('GUN', NULL, :gid, :prev, :new, 'ORDER', :remark)
+SQL_LOCK_ACTIVE_RULES = """
+SELECT rule_id, start_time, end_time, effective_from, effective_to
+  FROM pricing_rule
+ WHERE station_id = :sid
+   AND is_active = 1
+   FOR UPDATE
 """
+
+_DAY_SECONDS = 24 * 3600
+
+
+def _set_order_gun_status(db: Session, gun_id: int, new_status: str, remark: str) -> None:
+    """透传 ORDER 来源会话变量更新充电枪状态，由触发器写入唯一一条状态日志。"""
+    has_error = False
+    try:
+        db.execute(text(SQL_SET_ORDER_GUN_VARS), {"remark": remark})
+        db.execute(text(SQL_UPDATE_GUN_STATUS), {"st": new_status, "gid": gun_id})
+    except Exception:
+        has_error = True
+        raise
+    finally:
+        try:
+            db.execute(text(SQL_CLEAR_GUN_VARS))
+        except Exception:
+            if not has_error:
+                raise
+
+
+def _release_gun_if_healthy(db: Session, gun_id: int, order_no: str, action: str) -> None:
+    """仅当枪处于占用且所属桩已验收且非故障/离线时释放为空闲，避免触发 45000 死锁。"""
+    row = db.execute(text(SQL_LOCK_GUN_FOR_RELEASE), {"gid": gun_id}).mappings().first()
+    if row is None:
+        return
+    if (
+        row["gun_status"] == "OCCUPIED"
+        and row["acceptance_status"] == "PASSED"
+        and row["pile_status"] not in ("FAULT", "OFFLINE")
+    ):
+        _set_order_gun_status(db, gun_id, "IDLE", f"{action}释放 {order_no}")
 
 
 def get_order(db: Session, order_id: int) -> ChargeOrder | None:
@@ -102,7 +159,7 @@ def list_fleet_orders(db: Session, fleet_id: int, page: PageParams) -> dict[str,
 def start_order(db: Session, user_id: int, payload: OrderStartIn) -> ChargeOrder:
     """开单。
 
-    顺序是：锁枪 -> 校验归属与状态 -> 校验车辆归属 -> 插订单 -> 改枪状态并记日志。
+    顺序是：锁枪 -> 校验站/桩/枪健康态 -> 校验车辆归属 -> 插订单 -> 改枪状态（触发器记日志）。
     同一把枪已经有人在充时，uk_gun_active 会抛 1062，仍然由唯一索引兜底。
     """
     gun = db.execute(text(SQL_LOCK_GUN), {"gid": payload.gun_id}).mappings().first()
@@ -110,7 +167,13 @@ def start_order(db: Session, user_id: int, payload: OrderStartIn) -> ChargeOrder
         raise ValueError("充电枪不存在")
     if int(gun["station_id"]) != payload.station_id:
         raise ValueError("该充电枪不属于指定场站")
-    if gun["current_status"] != "IDLE":
+    if gun["station_status"] != "OPEN":
+        raise ValueError("场站当前非营业状态，不能开单")
+    if gun["acceptance_status"] != "PASSED":
+        raise ValueError("所属充电桩未通过验收，不能开单")
+    if gun["pile_status"] in ("FAULT", "OFFLINE"):
+        raise ValueError("所属充电桩当前处于故障或离线状态，不能开单")
+    if gun["gun_status"] != "IDLE":
         raise ValueError("充电枪当前不是空闲状态，不能开单")
 
     if payload.vehicle_id is not None:
@@ -126,7 +189,7 @@ def start_order(db: Session, user_id: int, payload: OrderStartIn) -> ChargeOrder
         vehicle_id=payload.vehicle_id,
         gun_id=payload.gun_id,
         station_id=payload.station_id,
-        start_time=datetime.now(),
+        start_time=datetime.now().replace(microsecond=0),
         start_soc=payload.start_soc,
         kwh=Decimal("0.000"),
         status="CHARGING",
@@ -134,17 +197,7 @@ def start_order(db: Session, user_id: int, payload: OrderStartIn) -> ChargeOrder
     db.add(order)
     try:
         db.flush()
-        db.execute(text(SQL_GUN_OCCUPY), {"gid": payload.gun_id})
-        db.execute(
-            text(SQL_STATUS_LOG),
-            {
-                "pid": gun["pile_id"],
-                "gid": payload.gun_id,
-                "prev": "IDLE",
-                "new": "OCCUPIED",
-                "remark": f"开单占用 {order.order_no}",
-            },
-        )
+        _set_order_gun_status(db, payload.gun_id, "OCCUPIED", f"开单占用 {order.order_no}")
         db.commit()
     except Exception:
         db.rollback()
@@ -167,8 +220,8 @@ def finish_order(db: Session, order_id: int, payload: OrderFinishIn) -> ChargeOr
         if Decimal(payload.end_soc) < Decimal(order.start_soc):
             raise ValueError("结束 SOC 不能小于开始 SOC")
 
-    end_time = datetime.now()
-    # 同一秒内结单会让 ck_order_time 失败，兜一个最小 1 秒时长
+    end_time = datetime.now().replace(microsecond=0)
+    # MySQL DATETIME 无微秒，同一秒内结单会让 ck_order_time 失败，兜一个最小 1 秒时长
     if end_time <= order.start_time:
         end_time = order.start_time + timedelta(seconds=1)
 
@@ -180,17 +233,7 @@ def finish_order(db: Session, order_id: int, payload: OrderFinishIn) -> ChargeOr
 
         # 过程内部会重算明细，并回写 energy_fee/service_fee/total_amount/status
         db.execute(text("CALL sp_order_calc(:oid)"), {"oid": order_id})
-        db.execute(text(SQL_GUN_RELEASE), {"gid": order.gun_id})
-        db.execute(
-            text(SQL_STATUS_LOG),
-            {
-                "pid": None,
-                "gid": order.gun_id,
-                "prev": "OCCUPIED",
-                "new": "IDLE",
-                "remark": f"结单释放 {order.order_no}",
-            },
-        )
+        _release_gun_if_healthy(db, order.gun_id, order.order_no, "结单")
         db.commit()
     except Exception:
         db.rollback()
@@ -202,10 +245,13 @@ def finish_order(db: Session, order_id: int, payload: OrderFinishIn) -> ChargeOr
 def pay_order(db: Session, order_id: int, payload: PaymentIn) -> PaymentRecord | None:
     """记一笔支付流水（只收正数）。
 
-    超付、充电中不能付，这些判断都在触发器 trg_payment_guard 里，
-    Python 侧只管插流水；触发器会把订单的 paid_amount/status 一起改掉。
+    超付、充电中不能付以及余额/授信校验都在触发器 trg_payment_guard 里，
+    Python 侧加行锁并插流水；触发器会把订单的 paid_amount/status 与账户余额一起改掉。
     """
-    if db.get(ChargeOrder, order_id) is None:
+    order = db.execute(
+        select(ChargeOrder).where(ChargeOrder.order_id == order_id).with_for_update()
+    ).scalars().first()
+    if order is None:
         return None
 
     record = PaymentRecord(
@@ -227,8 +273,10 @@ def pay_order(db: Session, order_id: int, payload: PaymentIn) -> PaymentRecord |
 
 
 def refund_order(db: Session, order_id: int, payload: RefundIn) -> PaymentRecord | None:
-    """退款：插一条负数流水，触发器负责扣减 paid_amount 并回写状态。"""
-    order = db.get(ChargeOrder, order_id)
+    """退款：插一条负数流水，触发器负责扣减 paid_amount 并回写状态与退回余额/授信。"""
+    order = db.execute(
+        select(ChargeOrder).where(ChargeOrder.order_id == order_id).with_for_update()
+    ).scalars().first()
     if order is None:
         return None
 
@@ -262,7 +310,9 @@ def list_payments(db: Session, order_id: int) -> list[PaymentRecord]:
 
 def cancel_order(db: Session, order_id: int) -> ChargeOrder | None:
     """取消未开始的订单：只有 CHARGING 且没付过钱才能取消。"""
-    order = db.get(ChargeOrder, order_id)
+    order = db.execute(
+        select(ChargeOrder).where(ChargeOrder.order_id == order_id).with_for_update()
+    ).scalars().first()
     if order is None:
         return None
     if order.status != "CHARGING":
@@ -270,10 +320,15 @@ def cancel_order(db: Session, order_id: int) -> ChargeOrder | None:
     if Decimal(order.paid_amount) != 0:
         raise ValueError("已有支付流水的订单不能取消，请走退款")
 
+    end_time = datetime.now().replace(microsecond=0)
+    if end_time <= order.start_time:
+        end_time = order.start_time + timedelta(seconds=1)
+
     try:
         order.status = "CANCELLED"
-        order.end_time = datetime.now()
-        db.execute(text(SQL_GUN_RELEASE), {"gid": order.gun_id})
+        order.end_time = end_time
+        db.flush()
+        _release_gun_if_healthy(db, order.gun_id, order.order_no, "取消")
         db.commit()
     except Exception:
         db.rollback()
@@ -302,21 +357,84 @@ def list_price_rules(db: Session, station_id: int) -> list[PricingRule]:
     )
 
 
+def _to_seconds_since_midnight(value: time | timedelta | str) -> int:
+    """将 TIME 列值（timedelta/time）或 HH:MM 字符串统一转为距零点秒数。"""
+    if isinstance(value, timedelta):
+        return int(value.total_seconds())
+    if isinstance(value, time):
+        return value.hour * 3600 + value.minute * 60 + value.second
+    if isinstance(value, str):
+        parts = value.strip().split(":")
+        if len(parts) not in (2, 3):
+            raise ValueError(f"时间格式非法: {value}")
+        hh = int(parts[0])
+        mm = int(parts[1])
+        ss = int(parts[2]) if len(parts) == 3 else 0
+        if not (
+            0 <= mm < 60
+            and 0 <= ss < 60
+            and (0 <= hh < 24 or (hh == 24 and mm == 0 and ss == 0))
+        ):
+            raise ValueError(f"时间范围非法: {value}")
+        return hh * 3600 + mm * 60 + ss
+    raise ValueError(f"不支持的时间类型: {type(value).__name__}")
+
+
+def _split_day_intervals(start_sec: int, end_sec: int) -> list[tuple[int, int]]:
+    """将日内时段拆分为半开区间列表，正确处理跨零点（start > end）规则。"""
+    if start_sec < end_sec:
+        return [(start_sec, end_sec)]
+    intervals = [(start_sec, _DAY_SECONDS)]
+    if end_sec > 0:
+        intervals.append((0, end_sec))
+    return intervals
+
+
+def _intervals_overlap(
+    a_list: list[tuple[int, int]], b_list: list[tuple[int, int]]
+) -> bool:
+    """判断两组半开区间 [a1, a2) 与 [b1, b2) 是否存在交集。"""
+    return any(a1 < b2 and b1 < a2 for a1, a2 in a_list for b1, b2 in b_list)
+
+
+def _dates_overlap(
+    a_from: date, a_to: date | None, b_from: date, b_to: date | None
+) -> bool:
+    """判断两段闭区间生效日期是否重叠（None 视为长期有效 date.max）。"""
+    return a_from <= (b_to or date.max) and b_from <= (a_to or date.max)
+
+
 def create_price_rule(db: Session, payload) -> PricingRule:
     """新增一条分时电价。
 
-    同一场站同一时段如果已有生效规则，就把旧的停用再插新的——
-    现实里“调价”就是这么做的，历史订单的电费快照不受影响。
+    同一场站不论峰/平/谷，凡与新规则在日内时段和生效日期上同时重叠的在用规则均须停用，
+    防止跨时段或跨零点规则重叠导致 sp_order_calc 重复计费。
     """
-    db.execute(
-        text(
-            "UPDATE pricing_rule SET is_active = 0 "
-            "WHERE station_id = :sid AND period = :p AND is_active = 1 "
-            "  AND start_time < :end AND end_time > :start"
-        ),
-        {"sid": payload.station_id, "p": payload.period,
-         "start": payload.start_time, "end": payload.end_time},
-    )
+    new_start_sec = _to_seconds_since_midnight(payload.start_time)
+    new_end_sec = _to_seconds_since_midnight(payload.end_time)
+    if new_start_sec == new_end_sec:
+        raise ValueError("电价时段开始时间与结束时间不能相同")
+    if payload.effective_to is not None and payload.effective_to < payload.effective_from:
+        raise ValueError("失效日期不能早于生效日期")
+    new_intervals = _split_day_intervals(new_start_sec, new_end_sec)
+
+    active_rules = db.execute(
+        text(SQL_LOCK_ACTIVE_RULES), {"sid": payload.station_id}
+    ).mappings().all()
+
+    deactivate_ids: list[int] = []
+    for row in active_rules:
+        old_intervals = _split_day_intervals(
+            _to_seconds_since_midnight(row["start_time"]),
+            _to_seconds_since_midnight(row["end_time"]),
+        )
+        if _intervals_overlap(new_intervals, old_intervals) and _dates_overlap(
+            payload.effective_from,
+            payload.effective_to,
+            row["effective_from"],
+            row["effective_to"],
+        ):
+            deactivate_ids.append(int(row["rule_id"]))
 
     rule = PricingRule(
         station_id=payload.station_id,
@@ -331,8 +449,18 @@ def create_price_rule(db: Session, payload) -> PricingRule:
         effective_to=payload.effective_to,
         is_active=True,
     )
-    db.add(rule)
-    db.commit()
+    try:
+        if deactivate_ids:
+            db.execute(
+                update(PricingRule)
+                .where(PricingRule.rule_id.in_(deactivate_ids))
+                .values(is_active=0)
+            )
+        db.add(rule)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     db.refresh(rule)
     return rule
 

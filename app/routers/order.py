@@ -41,8 +41,8 @@ def _check_owner(db: Session, order, user: CurrentUser, action: str) -> None:
         if order.user_id != user.user_id:
             raise HTTPException(status.HTTP_403_FORBIDDEN, f"只能{action}自己的订单")
     elif user.role == RoleEnum.FLEET:
-        fleet_id = order_dao.get_user_fleet_id(db, order.user_id)
-        if fleet_id is None or fleet_id != user.fleet_id:
+        fleet_id = None if user.fleet_id is None else order_dao.get_user_fleet_id(db, order.user_id)
+        if user.fleet_id is None or fleet_id is None or fleet_id != user.fleet_id:
             raise HTTPException(status.HTTP_403_FORBIDDEN, f"只能{action}本车队的订单")
 
 
@@ -158,7 +158,11 @@ def list_orders(
     """车主看自己的，车队看本车队，运维/结算/管理员看全部。"""
     if user.role == RoleEnum.DRIVER:
         result = order_dao.list_my_orders(db, user.user_id, page)
-    elif user.role == RoleEnum.FLEET and user.fleet_id is not None:
+    elif user.role == RoleEnum.FLEET:
+        if user.fleet_id is None:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "车队账号未绑定有效企业车队，无法查看订单"
+            )
         result = order_dao.list_fleet_orders(db, user.fleet_id, page)
     else:
         result = order_dao.list_all_orders(db, page)
@@ -232,7 +236,9 @@ def set_price_active(
 def list_payments(
     order_id: int,
     db: Session = Depends(get_db),
-    user: CurrentUser = Depends(_CAN_READ),
+    user: CurrentUser = Depends(
+        require_roles(RoleEnum.DRIVER, RoleEnum.FLEET, RoleEnum.SETTLEMENT, RoleEnum.ADMIN)
+    ),
 ) -> list[PaymentOut]:
     order = order_dao.get_order(db, order_id)
     if order is None:

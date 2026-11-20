@@ -1243,20 +1243,25 @@ ON DUPLICATE KEY UPDATE energy_price = VALUES(energy_price);
 -- 跨线补种子：订单要挂线1 的枪、线4 的车主与车辆，所以放到文件末尾统一插入，
 -- 保证 01_ddl → 02_views → 03_procs → 04_seed 的顺序在空库上也能跑通。
 -- ============================================================
--- 2) 订单：20 条，前 5 条充电中（不同枪，避开 uk_gun_active），其余已支付
+-- 2) 订单：20 条，前 5 条充电中（优先绑定已处于 OCCUPIED 状态的枪，避开 uk_gun_active 并对齐线 1 枪状态），其余已支付
 INSERT IGNORE INTO charge_order
 (order_no, user_id, vehicle_id, gun_id, station_id, start_time, end_time,
  start_soc, end_soc, kwh, discount_amount, status)
 WITH RECURSIVE seq AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM seq WHERE n < 20),
 gun AS (SELECT g.gun_id, p.station_id,
-               ROW_NUMBER() OVER (ORDER BY g.gun_id) AS rn
+               ROW_NUMBER() OVER (
+                   ORDER BY CASE WHEN g.current_status = 'OCCUPIED' THEN 0 ELSE 1 END,
+                            g.gun_id ASC
+               ) AS rn
         FROM charging_gun g JOIN charging_pile p ON p.pile_id = g.pile_id)
 SELECT CONCAT('SEED2025', LPAD(n, 6, '0')),
        9000 + n, 5000 + n, g.gun_id, g.station_id,
        TIMESTAMP('2025-03-01 08:00:00') + INTERVAL n * 7 HOUR,
        CASE WHEN n <= 5 THEN NULL
             ELSE TIMESTAMP('2025-03-01 08:00:00') + INTERVAL n * 7 HOUR + INTERVAL 150 MINUTE END,
-       20, 90, 20 + n,
+       20,
+       CASE WHEN n <= 5 THEN NULL ELSE 90 END,
+       CASE WHEN n <= 5 THEN 0.000 ELSE 20 + n END,
        CASE WHEN MOD(n, 3) = 0 THEN 2.00 ELSE 0.00 END,
        CASE WHEN n <= 5 THEN 'CHARGING' ELSE 'FINISHED' END
 FROM seq
@@ -1269,9 +1274,13 @@ CREATE PROCEDURE seed_calc()
 BEGIN
     DECLARE v_done INT DEFAULT 0;
     DECLARE v_oid BIGINT;
-    -- 只算本脚本插入的种子订单，避免重跑时改动库里别人的历史订单
+    -- 只算本脚本插入且尚未支付的种子订单，避免重跑时对 PAID 订单重算触发 45000
     DECLARE cur CURSOR FOR SELECT order_id FROM charge_order
-        WHERE end_time IS NOT NULL AND order_no LIKE 'SEED2025%' ORDER BY order_id;
+        WHERE end_time IS NOT NULL
+          AND status IN ('CHARGING', 'FINISHED')
+          AND paid_amount = 0
+          AND order_no LIKE 'SEED2025%'
+        ORDER BY order_id;
     DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = 1;
     OPEN cur;
     calc_loop: LOOP
@@ -1286,7 +1295,10 @@ CALL seed_calc();
 DROP PROCEDURE seed_calc;
 
 -- 4) 支付流水：每个已支付订单一条，金额等于应付
---    注意：触发器会回写 charge_order，同一语句里不能再读 charge_order，所以先快照到临时表
+--    注意：触发器会回写 charge_order，同一语句里不能再读 charge_order，所以先快照到临时表；
+--    历史种子流水灌入期间跳过余额/授信扣减，并用 NOT EXISTS 保证重跑幂等。
+SET @skip_balance_sync = 1;
+
 DROP TEMPORARY TABLE IF EXISTS tmp_pay;
 CREATE TEMPORARY TABLE tmp_pay AS
 SELECT order_id, total_amount, end_time FROM charge_order
@@ -1296,7 +1308,11 @@ INSERT IGNORE INTO payment_record (order_id, amount, method, txn_no, status, pai
 SELECT order_id, total_amount,
        CASE MOD(order_id, 3) WHEN 0 THEN 'WECHAT' WHEN 1 THEN 'ALIPAY' ELSE 'BALANCE' END,
        CONCAT('SEEDTXN', order_id), 'SUCCESS', end_time
-FROM tmp_pay;
+FROM tmp_pay
+WHERE NOT EXISTS (
+    SELECT 1 FROM payment_record pr
+    WHERE pr.txn_no = CONCAT('SEEDTXN', tmp_pay.order_id)
+);
 DROP TEMPORARY TABLE tmp_pay;
 
 -- 4.1) 再补 5 条退款流水，保证支付表也够 20 条，同时演示负数流水
@@ -1307,14 +1323,21 @@ WHERE status = 'PAID' ORDER BY order_id LIMIT 5;
 
 INSERT IGNORE INTO payment_record (order_id, amount, method, txn_no, status, paid_at)
 SELECT order_id, -amt, 'WECHAT', CONCAT('SEEDREF', order_id), 'REFUNDED', NOW()
-FROM tmp_refund;
+FROM tmp_refund
+WHERE NOT EXISTS (
+    SELECT 1 FROM payment_record pr
+    WHERE pr.txn_no = CONCAT('SEEDREF', tmp_refund.order_id)
+);
 DROP TEMPORARY TABLE tmp_refund;
--- 5) 结算单：5 个月 × 4 个站 = 20 条
+
+SET @skip_balance_sync = 0;
+
+-- 5) 结算单：5 个月 × 4 个站 = 20 条（初始置为 CONFIRMED 以便后续开票触发器校验通过并自动流转为 INVOICED）
 INSERT INTO settlement_bill
 (operator_id, station_id, bill_month, order_count, total_kwh,
  total_amount, platform_fee, payable_amount, status)
 SELECT s.operator_id, s.station_id, m.bill_month,
-       10, 500.000, 350.00, 17.50, 332.50, 'DRAFT'
+       10, 500.000, 350.00, 17.50, 332.50, 'CONFIRMED'
 FROM (SELECT station_id, operator_id FROM station ORDER BY station_id LIMIT 4) s
 CROSS JOIN (SELECT '2025-01' AS bill_month UNION ALL SELECT '2025-02' UNION ALL SELECT '2025-03'
             UNION ALL SELECT '2025-04' UNION ALL SELECT '2025-05') m
@@ -1340,7 +1363,11 @@ WHERE NOT EXISTS (SELECT 1 FROM invoice_record i WHERE i.bill_id = b.bill_id);
 INSERT INTO invoice_record
 (bill_id, amount, invoice_no, invoice_type, status, issued_at)
 SELECT bill_id, amt, CONCAT('INV2025', LPAD(bill_id, 5, '0')), 'NORMAL', 'ISSUED', NOW()
-FROM tmp_inv;
+FROM tmp_inv
+WHERE NOT EXISTS (
+    SELECT 1 FROM invoice_record i
+    WHERE i.invoice_no = CONCAT('INV2025', LPAD(tmp_inv.bill_id, 5, '0'))
+);
 DROP TEMPORARY TABLE tmp_inv;
 
 -- 自检：各表条数

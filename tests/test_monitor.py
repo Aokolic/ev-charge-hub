@@ -6,7 +6,7 @@
 
 import sys
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -23,7 +23,7 @@ from app.auth import RoleEnum
 from app.config import settings
 from app.dao import monitor as monitor_dao
 from app.dao.monitor import MonitorError
-from app.models.monitor import RepairOrder
+from app.models.monitor import AlarmRecord, RepairOrder
 from app.schemas.common import PageParams
 from app.schemas.monitor import RepairDispatchIn, TelemetryIn
 
@@ -338,6 +338,213 @@ class MonitorIntegrationTest(unittest.TestCase):
                 ],
             )
         self.assertEqual(over_power.exception.status_code, 400)
+
+    def test_p1_6_timezone_telemetry_and_device_recovery(self) -> None:
+        """覆盖带时区遥测时间戳对齐，以及工单闭环恢复告警并联动恢复故障桩/枪状态与 ALARM 审计日志。"""
+        db = self.db
+        base = datetime.now().replace(microsecond=0) - timedelta(minutes=20)
+
+        # A. 准备单枪故障桩（pile_id=18 / gun_id=34 / alarm_id=3），验证带 Z / +00:00 的遥测入库与单枪恢复
+        db.execute(
+            text(
+                "UPDATE alarm_record SET status = 'CLOSED', recovered_at = NOW() "
+                "WHERE pile_id IN (6, 18)"
+            )
+        )
+        db.execute(
+            text(
+                "UPDATE alarm_record SET status = 'ACTIVE', recovered_at = NULL, "
+                "occurred_at = :occ WHERE alarm_id = 3"
+            ),
+            {"occ": base - timedelta(minutes=10)},
+        )
+        db.execute(text("DELETE FROM repair_order WHERE alarm_id = 3"))
+        db.execute(text("DELETE FROM pile_telemetry WHERE pile_id IN (6, 18)"))
+        db.execute(
+            text(
+                "UPDATE charging_pile SET acceptance_status = 'PASSED', current_status = 'FAULT' "
+                "WHERE pile_id IN (6, 18)"
+            )
+        )
+        db.execute(
+            text(
+                "UPDATE charging_gun SET current_status = 'FAULT' "
+                "WHERE gun_id IN (11, 12, 34)"
+            )
+        )
+        db.commit()
+
+        wo_id_a = monitor_dao.dispatch_repair_order(
+            db, 3, RepairDispatchIn(maintainer_id=2, dispatched_at=base)
+        )
+        monitor_dao.accept_repair_order(db, wo_id_a, 2, base + timedelta(minutes=2))
+        monitor_dao.arrive_repair_order(db, wo_id_a, 2, base + timedelta(minutes=5))
+        repaired_a = base + timedelta(minutes=10)
+        monitor_dao.complete_repair_order(
+            db,
+            wo_id_a,
+            2,
+            repaired_a,
+            "急停开关",
+            "更换急停开关并上电自检通过",
+        )
+
+        # 构造带 UTC Z 与 +00:00 后缀的 ISO 遥测时间，应换算为本地无时区时间以匹配 repaired_at
+        t1_iso = (
+            (repaired_a + timedelta(minutes=1))
+            .astimezone(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        t2_iso = (repaired_a + timedelta(minutes=2)).astimezone(timezone.utc).isoformat()
+        inserted = monitor_dao.create_telemetry_batch(
+            db,
+            [
+                TelemetryIn.model_validate(
+                    {
+                        "pile_id": 18,
+                        "collected_at": t1_iso,
+                        "output_voltage": "0.0",
+                        "power": "0.000",
+                        "module_temp": "29.0",
+                    }
+                ),
+                TelemetryIn.model_validate(
+                    {
+                        "pile_id": 18,
+                        "collected_at": t2_iso,
+                        "output_voltage": "0.0",
+                        "power": "0.000",
+                        "module_temp": "28.8",
+                    }
+                ),
+            ],
+        )
+        self.assertEqual(inserted, 2)
+
+        max_log_a = int(
+            db.execute(text("SELECT COALESCE(MAX(log_id), 0) FROM device_status_log")).scalar_one()
+        )
+        msg_a = monitor_dao.close_repair_order(db, wo_id_a, 2, RoleEnum.OPS, None)
+        self.assertIn("告警已解除", msg_a)
+
+        self.assertEqual(
+            db.execute(text("SELECT status FROM alarm_record WHERE alarm_id = 3")).scalar_one(),
+            "RECOVERED",
+        )
+        self.assertEqual(
+            db.execute(
+                text("SELECT current_status FROM charging_pile WHERE pile_id = 18")
+            ).scalar_one(),
+            "IDLE",
+        )
+        self.assertEqual(
+            db.execute(
+                text("SELECT current_status FROM charging_gun WHERE gun_id = 34")
+            ).scalar_one(),
+            "IDLE",
+        )
+        logs_a = db.execute(
+            text(
+                "SELECT device_type, pile_id, gun_id, prev_status, new_status, change_source, todo_status "
+                "FROM device_status_log WHERE log_id > :lid ORDER BY log_id ASC"
+            ),
+            {"lid": max_log_a},
+        ).mappings().all()
+        self.assertEqual(len(logs_a), 2)
+        self.assertTrue(all(row["change_source"] == "ALARM" for row in logs_a))
+        self.assertTrue(all(row["todo_status"] == "DONE" for row in logs_a))
+        self.assertTrue(all(row["prev_status"] == "FAULT" and row["new_status"] == "IDLE" for row in logs_a))
+
+        vars_a = db.execute(
+            text("SELECT @status_change_source, @status_todo_status, @status_change_remark")
+        ).one()
+        self.assertEqual(tuple(vars_a), (None, None, None))
+
+        # B. 验证整桩级告警（gun_id=None，pile_id=6 下有 gun_id=11/12 两把故障枪）闭环时逐枪恢复并全记为 ALARM
+        pile_alarm = AlarmRecord(
+            pile_id=6,
+            gun_id=None,
+            alarm_code="E-CONTACTOR_STUCK",
+            alarm_level="L1",
+            original_level="L1",
+            response_limit_min=15,
+            occurred_at=base - timedelta(minutes=8),
+            status="ACTIVE",
+            escalated_count=0,
+            created_at=base,
+            updated_at=base,
+        )
+        db.add(pile_alarm)
+        db.commit()
+
+        wo_id_b = monitor_dao.dispatch_repair_order(
+            db, pile_alarm.alarm_id, RepairDispatchIn(maintainer_id=3, dispatched_at=base)
+        )
+        monitor_dao.accept_repair_order(db, wo_id_b, 3, base + timedelta(minutes=1))
+        monitor_dao.arrive_repair_order(db, wo_id_b, 3, base + timedelta(minutes=3))
+        repaired_b = base + timedelta(minutes=8)
+        monitor_dao.complete_repair_order(
+            db,
+            wo_id_b,
+            3,
+            repaired_b,
+            "主接触器",
+            "更换主接触器并通过空载测试",
+        )
+        monitor_dao.create_telemetry_batch(
+            db,
+            [
+                TelemetryIn(
+                    pile_id=6,
+                    collected_at=repaired_b + timedelta(minutes=1),
+                    output_voltage=Decimal("0.0"),
+                    power=Decimal("0.000"),
+                ),
+                TelemetryIn(
+                    pile_id=6,
+                    collected_at=repaired_b + timedelta(minutes=2),
+                    output_voltage=Decimal("0.0"),
+                    power=Decimal("0.000"),
+                ),
+            ],
+        )
+
+        max_log_b = int(
+            db.execute(text("SELECT COALESCE(MAX(log_id), 0) FROM device_status_log")).scalar_one()
+        )
+        msg_b = monitor_dao.close_repair_order(db, wo_id_b, 3, RoleEnum.OPS, None)
+        self.assertIn("告警已解除", msg_b)
+
+        self.assertEqual(
+            db.execute(
+                text("SELECT current_status FROM charging_pile WHERE pile_id = 6")
+            ).scalar_one(),
+            "IDLE",
+        )
+        gun_statuses_b = db.execute(
+            text(
+                "SELECT gun_id, current_status FROM charging_gun "
+                "WHERE pile_id = 6 ORDER BY gun_id ASC"
+            )
+        ).all()
+        self.assertEqual([(int(gid), st) for gid, st in gun_statuses_b], [(11, "IDLE"), (12, "IDLE")])
+
+        logs_b = db.execute(
+            text(
+                "SELECT device_type, pile_id, gun_id, change_source, todo_status "
+                "FROM device_status_log WHERE log_id > :lid ORDER BY log_id ASC"
+            ),
+            {"lid": max_log_b},
+        ).mappings().all()
+        self.assertEqual(len(logs_b), 3)
+        self.assertTrue(all(row["change_source"] == "ALARM" for row in logs_b))
+        self.assertTrue(all(row["todo_status"] == "DONE" for row in logs_b))
+
+        vars_b = db.execute(
+            text("SELECT @status_change_source, @status_todo_status, @status_change_remark")
+        ).one()
+        self.assertEqual(tuple(vars_b), (None, None, None))
 
 
 if __name__ == "__main__":

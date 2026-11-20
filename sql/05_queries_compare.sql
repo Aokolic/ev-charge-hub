@@ -547,16 +547,25 @@ ORDER BY v.start_time DESC;
 EXPLAIN ANALYZE
 SELECT DATE(start_time) AS stat_date, station_id, gun_id,
        COUNT(*) AS order_cnt,
+       SUM(CASE WHEN status = 'PAID' THEN 1 ELSE 0 END) AS paid_cnt,
        SUM(kwh) AS total_kwh,
+       SUM(energy_fee) AS energy_fee,
+       SUM(service_fee) AS service_fee,
        SUM(total_amount) AS total_amount
 FROM charge_order
 WHERE start_time >= '2025-03-01' AND start_time < '2025-03-03'
-GROUP BY DATE(start_time), station_id, gun_id;
+  AND status IN ('CHARGING', 'FINISHED', 'PAID')
+GROUP BY DATE(start_time), station_id, gun_id
+ORDER BY stat_date, station_id, gun_id;
 
 -- B：查视图（视图里已经按天+站+枪聚合好了）
 EXPLAIN ANALYZE
-SELECT * FROM v_order_station_daily
-WHERE stat_date >= '2025-03-01' AND stat_date < '2025-03-03';
+SELECT stat_date, station_id, gun_id,
+       order_cnt, paid_cnt, total_kwh,
+       energy_fee, service_fee, total_amount
+FROM v_order_station_daily
+WHERE stat_date >= '2025-03-01' AND stat_date < '2025-03-03'
+ORDER BY stat_date, station_id, gun_id;
 
 -- 结论：A 能在 WHERE 上用 idx_order_time 先过滤再聚合；
 --       B 把整个表的聚合都算了一遍再筛，数据量大时反而慢。
@@ -619,16 +628,19 @@ SELECT DATE_FORMAT(o.start_time, '%Y-%m') AS bill_month,
 FROM charge_order o
 JOIN station s  ON s.station_id = o.station_id
 JOIN operator op ON op.operator_id = s.operator_id
-WHERE o.status = 'PAID'
-GROUP BY DATE_FORMAT(o.start_time, '%Y-%m'), o.station_id, s.station_name, op.operator_name;
+WHERE o.status IN ('PAID', 'FINISHED')
+GROUP BY DATE_FORMAT(o.start_time, '%Y-%m'), o.station_id, s.station_name, op.operator_name
+ORDER BY bill_month, o.station_id;
 
 -- B：查视图
 EXPLAIN ANALYZE
-SELECT v.bill_month, v.station_id, s.station_name,
-       COUNT(*) AS order_cnt, SUM(v.total_amount) AS total_amount
+SELECT v.bill_month, v.station_id, s.station_name, op.operator_name,
+       SUM(v.order_cnt) AS order_cnt, SUM(v.total_amount) AS total_amount
 FROM v_settle_order_month v
-JOIN station s ON s.station_id = v.station_id
-GROUP BY v.bill_month, v.station_id, s.station_name;
+JOIN station s  ON s.station_id = v.station_id
+JOIN operator op ON op.operator_id = s.operator_id
+GROUP BY v.bill_month, v.station_id, s.station_name, op.operator_name
+ORDER BY v.bill_month, v.station_id;
 
 -- 结论：A 有 WHERE status='PAID'，能走 idx_order_station 先按站过滤；B 视图里已经过滤过，
 --       外层再筛月份用不上索引，数据量大了要把月份条件下推到视图。
@@ -861,9 +873,13 @@ SELECT
         AND v.bind_status = 'BOUND')                                   AS vehicle_cnt,
     (SELECT COUNT(*)
        FROM coupon_record AS c
+       INNER JOIN coupon_campaign AS cp
+           ON cp.campaign_id = c.campaign_id
       WHERE c.user_id = u.user_id
         AND c.status = 'ISSUED'
-        AND c.expire_at >= CURDATE())                                   AS usable_coupon_cnt
+        AND c.expire_at >= CURDATE()
+        AND cp.status = 'ACTIVE'
+        AND CURDATE() BETWEEN cp.valid_from AND cp.valid_to)          AS usable_coupon_cnt
 FROM fleet_account AS f
 INNER JOIN user_account AS u
     ON u.fleet_id = f.fleet_id

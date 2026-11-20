@@ -639,26 +639,36 @@ END$$
 DELIMITER ;
 
 DROP TRIGGER IF EXISTS trg_payment_guard;
+DROP TRIGGER IF EXISTS trg_payment_after_insert;
 DELIMITER $$
 CREATE TRIGGER trg_payment_guard
 BEFORE INSERT ON payment_record
 FOR EACH ROW
 BEGIN
-    DECLARE v_total  DECIMAL(10,2);
-    DECLARE v_paid   DECIMAL(10,2);
-    DECLARE v_status VARCHAR(20);
-    DECLARE v_new_paid DECIMAL(10,2);
+    DECLARE v_user_id      BIGINT UNSIGNED;
+    DECLARE v_total        DECIMAL(10,2);
+    DECLARE v_paid         DECIMAL(10,2);
+    DECLARE v_status       VARCHAR(20);
+    DECLARE v_role         VARCHAR(20);
+    DECLARE v_fleet_id     BIGINT UNSIGNED;
+    DECLARE v_balance      DECIMAL(12,2);
+    DECLARE v_fleet_st     VARCHAR(20);
+    DECLARE v_credit_limit DECIMAL(12,2);
+    DECLARE v_credit_used  DECIMAL(12,2);
 
     IF NEW.amount = 0 THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '支付金额不能为 0';
     END IF;
 
-    SELECT total_amount, paid_amount, status
-      INTO v_total, v_paid, v_status
+    SELECT user_id, total_amount, paid_amount, status
+      INTO v_user_id, v_total, v_paid, v_status
       FROM charge_order
      WHERE order_id = NEW.order_id
        FOR UPDATE;
 
+    IF v_status IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单不存在';
+    END IF;
     IF v_status = 'CHARGING' THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单还在充电，不能支付';
     END IF;
@@ -673,21 +683,83 @@ BEGIN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '退款金额超过已支付金额';
     END IF;
 
+    -- BEFORE INSERT 仅做校验，不做任何 UPDATE，避免 INSERT IGNORE 命中重复 txn_no 时误改订单或余额
+    IF NEW.status <> 'FAILED'
+       AND NEW.method = 'BALANCE'
+       AND NEW.amount > 0
+       AND COALESCE(@skip_balance_sync, 0) = 0 THEN
+        SELECT role, fleet_id, balance
+          INTO v_role, v_fleet_id, v_balance
+          FROM user_account
+         WHERE user_id = v_user_id
+           FOR UPDATE;
+
+        IF v_role = 'fleet' AND v_fleet_id IS NOT NULL THEN
+            SELECT status, credit_limit, credit_used
+              INTO v_fleet_st, v_credit_limit, v_credit_used
+              FROM fleet_account
+             WHERE fleet_id = v_fleet_id
+               FOR UPDATE;
+
+            IF v_fleet_st IS NULL OR v_fleet_st <> 'ACTIVE' OR v_credit_used + NEW.amount > v_credit_limit THEN
+                SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '车队可用授信额度不足或车队状态异常';
+            END IF;
+        ELSE
+            IF v_balance IS NULL OR v_balance < NEW.amount THEN
+                SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '账户余额不足，请充值或更换支付方式';
+            END IF;
+        END IF;
+    END IF;
+END$$
+
+CREATE TRIGGER trg_payment_after_insert
+AFTER INSERT ON payment_record
+FOR EACH ROW
+BEGIN
+    DECLARE v_user_id  BIGINT UNSIGNED;
+    DECLARE v_total    DECIMAL(10,2);
+    DECLARE v_paid     DECIMAL(10,2);
+    DECLARE v_status   VARCHAR(20);
+    DECLARE v_new_paid DECIMAL(10,2);
+    DECLARE v_role     VARCHAR(20);
+    DECLARE v_fleet_id BIGINT UNSIGNED;
+
     IF NEW.status <> 'FAILED' THEN
-        -- 先算好新余额再写回。MySQL 单表 UPDATE 的 SET 从左到右求值，
-        -- 写成 paid_amount = paid_amount + NEW.amount, status = CASE ... paid_amount ...
-        -- 第二个表达式读到的是加过之后的值，等于加了两次。
+        SELECT user_id, total_amount, paid_amount, status
+          INTO v_user_id, v_total, v_paid, v_status
+          FROM charge_order
+         WHERE order_id = NEW.order_id
+           FOR UPDATE;
+
         SET v_new_paid = v_paid + NEW.amount;
 
         UPDATE charge_order
            SET paid_amount = v_new_paid,
                status = CASE
-                            WHEN v_new_paid >= total_amount AND NEW.amount > 0 THEN 'PAID'
+                            WHEN v_new_paid >= total_amount THEN 'PAID'
                             WHEN v_new_paid <= 0 AND NEW.amount < 0 THEN 'REFUNDED'
-                            WHEN NEW.amount < 0 THEN 'PAID'
+                            WHEN NEW.amount < 0 AND v_status = 'PAID' THEN 'PAID'
                             ELSE 'FINISHED'
                         END
          WHERE order_id = NEW.order_id;
+
+        IF NEW.method = 'BALANCE' AND COALESCE(@skip_balance_sync, 0) = 0 THEN
+            SELECT role, fleet_id
+              INTO v_role, v_fleet_id
+              FROM user_account
+             WHERE user_id = v_user_id
+               FOR UPDATE;
+
+            IF v_role = 'fleet' AND v_fleet_id IS NOT NULL THEN
+                UPDATE fleet_account
+                   SET credit_used = GREATEST(0.00, credit_used + NEW.amount)
+                 WHERE fleet_id = v_fleet_id;
+            ELSE
+                UPDATE user_account
+                   SET balance = balance - NEW.amount
+                 WHERE user_id = v_user_id;
+            END IF;
+        END IF;
     END IF;
 END$$
 DELIMITER ;
@@ -709,7 +781,7 @@ BEGIN
     SET v_rate = COALESCE(p_platform_rate, 0.0500);
 
     -- 只汇总本运营商的场站，一个站一张单。本月没有已付订单的站也建一张 0 元单，
-    -- 否则这些站的欠费差异没有账单可挂。
+    -- 否则这些站的欠费差异没有账单可挂。按实收净额（paid_amount）结算。
     INSERT INTO settlement_bill
         (operator_id, station_id, bill_month, order_count, total_kwh,
          total_amount, platform_fee, payable_amount, status)
@@ -725,9 +797,9 @@ BEGIN
       FROM station s
       LEFT JOIN (
             SELECT o.station_id,
-                   COUNT(*)            AS cnt,
-                   SUM(o.kwh)          AS kwh,
-                   SUM(o.total_amount) AS amt
+                   COUNT(*)           AS cnt,
+                   SUM(o.kwh)         AS kwh,
+                   SUM(o.paid_amount) AS amt
               FROM charge_order o
              WHERE DATE_FORMAT(o.start_time, '%Y-%m') = p_month
                AND o.status = 'PAID'
@@ -745,7 +817,7 @@ BEGIN
         platform_fee   = IF(status = 'DRAFT', VALUES(platform_fee), platform_fee),
         payable_amount = IF(status = 'DRAFT', VALUES(payable_amount), payable_amount);
 
-    -- 当月没结清的钱记成待处理差异：actual - expect 为负，表示还差多少
+    -- 当月没结清的钱记成待处理差异：actual - expect 为负，表示还差多少（排除因退款导致的差额）
     INSERT INTO reconcile_diff
         (bill_id, order_id, diff_type, expect_amount, actual_amount, diff_amount, remark)
     SELECT b.bill_id,
@@ -764,8 +836,12 @@ BEGIN
        AND b.station_key = o.station_id
        AND b.bill_month = p_month
      WHERE DATE_FORMAT(o.start_time, '%Y-%m') = p_month
-       AND o.status IN ('FINISHED', 'PAID')
+       AND o.status = 'FINISHED'
        AND o.total_amount > o.paid_amount
+       AND NOT EXISTS (SELECT 1 FROM payment_record pr
+                        WHERE pr.order_id = o.order_id
+                          AND pr.amount < 0
+                          AND pr.status = 'REFUNDED')
        AND NOT EXISTS (SELECT 1 FROM reconcile_diff d
                         WHERE d.bill_id = b.bill_id
                           AND d.order_id = o.order_id
@@ -774,6 +850,7 @@ END$$
 DELIMITER ;
 
 DROP TRIGGER IF EXISTS trg_invoice_guard;
+DROP TRIGGER IF EXISTS trg_invoice_after_insert;
 DELIMITER $$
 CREATE TRIGGER trg_invoice_guard
 BEFORE INSERT ON invoice_record
@@ -798,6 +875,12 @@ BEGIN
 
     IF v_payable IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '账单不存在';
+    END IF;
+    IF v_bill_st = 'CLOSED' THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '账单已关单，禁止开票或红冲';
+    END IF;
+    IF v_bill_st NOT IN ('CONFIRMED', 'INVOICED') THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '只有已确认或已开票账单才能开票或红冲，请先确认账单';
     END IF;
 
     -- 红冲票是负数，和原票相加正好抵消，所以这里不按状态过滤
@@ -838,6 +921,29 @@ BEGIN
         END IF;
         -- 注意：MySQL 不允许在 invoice_record 的触发器里再改 invoice_record，
         -- 所以原票状态由调用方（DAO）插入红冲票后补一条 UPDATE 置为 RED_FLUSHED。
+    END IF;
+END$$
+
+CREATE TRIGGER trg_invoice_after_insert
+AFTER INSERT ON invoice_record
+FOR EACH ROW
+BEGIN
+    DECLARE v_net_invoiced DECIMAL(12,2);
+
+    SELECT COALESCE(SUM(amount), 0) INTO v_net_invoiced
+      FROM invoice_record
+     WHERE bill_id = NEW.bill_id;
+
+    IF v_net_invoiced > 0 THEN
+        UPDATE settlement_bill
+           SET status = 'INVOICED'
+         WHERE bill_id = NEW.bill_id
+           AND status = 'CONFIRMED';
+    ELSE
+        UPDATE settlement_bill
+           SET status = 'CONFIRMED'
+         WHERE bill_id = NEW.bill_id
+           AND status = 'INVOICED';
     END IF;
 END$$
 DELIMITER ;

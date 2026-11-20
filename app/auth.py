@@ -18,8 +18,11 @@ from enum import Enum
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.db import get_db
 
 
 class RoleEnum(str, Enum):
@@ -194,11 +197,24 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    db: Session | None = Depends(get_db),
 ) -> CurrentUser:
-    """FastAPI 基础认证依赖：提取 Authorization: Bearer <token> 并解析为 CurrentUser。"""
+    """FastAPI 基础认证依赖：提取 Authorization: Bearer <token> 解析为 CurrentUser 并校验账号状态。"""
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise _unauthorized("请先提供有效的 Bearer Token")
-    return decode_access_token(credentials.credentials)
+    user = decode_access_token(credentials.credentials)
+    # 兼容单测直接传入凭证而不经 FastAPI DI 注入 db 的调用方式
+    if isinstance(db, Session):
+        account_status = db.execute(
+            text("SELECT status FROM user_account WHERE user_id = :uid LIMIT 1"),
+            {"uid": user.user_id},
+        ).scalar_one_or_none()
+        if account_status is not None and account_status != "ACTIVE":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="账号已被冻结或禁用，请联系平台管理员",
+            )
+    return user
 
 
 def require_roles(*allowed_roles: RoleEnum):

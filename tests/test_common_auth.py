@@ -233,6 +233,59 @@ class CommonAndAuthUnitTest(unittest.TestCase):
                 LOGIN_LOCK_MINUTES=15,
             )
 
+    def test_03_production_config_requires_strong_secret_and_disables_dev_token(self) -> None:
+        """校验 APP_ENV=production 默认关闭 ENABLE_DEV_TOKEN 并拦截缺失/默认/过短 SECRET_KEY。"""
+        strong_key = "prod-strong-random-secret-key-9876543210"
+        with patch.dict(
+            os.environ,
+            {"APP_ENV": "production", "SECRET_KEY": strong_key},
+            clear=False,
+        ):
+            os.environ.pop("ENABLE_DEV_TOKEN", None)
+            prod_settings = Settings()
+            self.assertEqual(prod_settings.APP_ENV, "production")
+            self.assertFalse(prod_settings.ENABLE_DEV_TOKEN)
+            self.assertEqual(prod_settings.SECRET_KEY, strong_key)
+
+        # 缺失、空白、默认占位及过短密钥在非本地环境均必须被拒绝
+        with patch.dict(os.environ, {"APP_ENV": "production"}, clear=False):
+            os.environ.pop("SECRET_KEY", None)
+            os.environ.pop("ENABLE_DEV_TOKEN", None)
+            with self.assertRaises(ValueError):
+                app_config._get_secret_key("production")
+            with self.assertRaises(ValueError):
+                Settings()
+
+        for bad_secret in (
+            "   ",
+            "dev-secret-change-in-production",
+            "replace-with-a-random-secret-key",
+            "too-short-key",
+        ):
+            with patch.dict(
+                os.environ,
+                {"APP_ENV": "production", "SECRET_KEY": bad_secret},
+                clear=False,
+            ):
+                with self.assertRaises(ValueError, msg=f"未拦截非法生产密钥: {bad_secret!r}"):
+                    app_config._get_secret_key("production")
+                with self.assertRaises(ValueError, msg=f"Settings 未拦截非法生产密钥: {bad_secret!r}"):
+                    Settings()
+
+        # 直接构造 Settings(APP_ENV="production", ...) 同样受 __post_init__ 兜底校验保护
+        with self.assertRaises(ValueError):
+            Settings(
+                APP_TITLE="prod-test",
+                APP_ENV="production",
+                DATABASE_URL=settings.DATABASE_URL,
+                SQL_ECHO=False,
+                SECRET_KEY="dev-secret-change-in-production",
+                ENABLE_DEV_TOKEN=False,
+                ACCESS_TOKEN_EXPIRE_MINUTES=120,
+                LOGIN_MAX_FAILS=5,
+                LOGIN_LOCK_MINUTES=15,
+            )
+
     def test_02_fernet_cache_and_fetch_view_page_guards(self) -> None:
         """校验 Fernet 实例按密钥缓存复用，以及 fetch_view_page 防注入校验。"""
         f1 = common_dao._build_fernet("key-alpha")
@@ -619,22 +672,25 @@ class CommonAuthAndStationFixesTest(unittest.TestCase):
         self.assertEqual(body_1406["code"], 1406)
         self.assertEqual(body_1406["detail"], "提交数据超出字段长度或数值范围")
 
-        # 5.2 完整 ASGI 链路触发真实 MySQL DataError (1264) -> HTTP 400（/telemetry/batch 限 admin）
+        # 5.2 完整 ASGI 链路触发真实 MySQL DataError (1264) -> HTTP 400（INT UNSIGNED 溢出）
         admin_token = create_access_token(
             CurrentUser(user_id=1, username="admin", role=RoleEnum.ADMIN)
         )
         st_asgi, body_asgi = asyncio.run(
             _call_asgi(
                 "POST",
-                "/api/monitor/telemetry/batch",
+                "/api/stations",
                 token=admin_token,
-                payload=[
-                    {
-                        "pile_id": 1,
-                        "collected_at": "2026-11-20T10:00:00",
-                        "power": "999999.999",  # 超出 DECIMAL(8,3) 上限触发 1264
-                    }
-                ],
+                payload={
+                    "operator_id": 1,
+                    "station_code": "ST-DATAERR-1264",
+                    "station_name": "数值溢出测试站",
+                    "address": "北京市海淀区测试路1264号",
+                    "longitude": "116.350000",
+                    "latitude": "40.000000",
+                    "total_spaces": 5_000_000_000,  # 超出 INT UNSIGNED 上限触发 1264
+                    "available_spaces": 5,
+                },
             )
         )
         self.assertEqual(st_asgi, 400)
@@ -785,6 +841,68 @@ class CommonAuthAndStationFixesTest(unittest.TestCase):
             text("SELECT @status_change_source, @status_todo_status, @status_change_remark")
         ).one()
         self.assertEqual(tuple(vars_row), (None, None, None))
+
+    def test_07_frozen_user_jwt_blocked_on_business_routes(self) -> None:
+        """验证账号被冻结或禁用后，此前已签发的有效 JWT 访问业务路由（/api/stations/overview、/api/orders）立即返回 403。"""
+        st_reg, body_reg = asyncio.run(
+            _call_asgi(
+                "POST",
+                "/api/auth/register",
+                payload={
+                    "username": "biz_freeze_driver",
+                    "password": "PassWord123",
+                    "phone": "13900005555",
+                    "role": "driver",
+                },
+            )
+        )
+        self.assertEqual(st_reg, 201)
+        uid = int(body_reg["user_id"])
+        jwt_token = create_access_token(
+            CurrentUser(user_id=uid, username="biz_freeze_driver", role=RoleEnum.DRIVER)
+        )
+
+        # 冻结前携带该 JWT 可正常访问业务路由
+        st_ok_station, _ = asyncio.run(
+            _call_asgi("GET", "/api/stations/overview", token=jwt_token)
+        )
+        st_ok_orders, _ = asyncio.run(
+            _call_asgi("GET", "/api/orders", token=jwt_token)
+        )
+        self.assertEqual(st_ok_station, 200)
+        self.assertEqual(st_ok_orders, 200)
+
+        # 库内冻结/禁用后，同一张未过期 JWT 在业务路由均必须被实时拦截返回 403
+        for blocked_status in ("FROZEN", "DISABLED"):
+            self.db.execute(
+                text("UPDATE user_account SET status = :st WHERE user_id = :uid"),
+                {"st": blocked_status, "uid": uid},
+            )
+            self.db.commit()
+
+            st_blk_station, body_blk_station = asyncio.run(
+                _call_asgi("GET", "/api/stations/overview", token=jwt_token)
+            )
+            st_blk_orders, body_blk_orders = asyncio.run(
+                _call_asgi("GET", "/api/orders", token=jwt_token)
+            )
+            self.assertEqual(st_blk_station, 403, f"{blocked_status} 应拦截 /api/stations/overview")
+            self.assertEqual(st_blk_orders, 403, f"{blocked_status} 应拦截 /api/orders")
+            self.assertIn("禁用", body_blk_station["detail"])
+            self.assertIn("禁用", body_blk_orders["detail"])
+
+        # 合成 dev-token（库中无对应 user_account 行）仍正常放行
+        synth_token = create_access_token(
+            CurrentUser(user_id=888889, username="demo_synth_driver", role=RoleEnum.DRIVER)
+        )
+        st_synth_station, _ = asyncio.run(
+            _call_asgi("GET", "/api/stations/overview", token=synth_token)
+        )
+        st_synth_orders, _ = asyncio.run(
+            _call_asgi("GET", "/api/orders", token=synth_token)
+        )
+        self.assertEqual(st_synth_station, 200)
+        self.assertEqual(st_synth_orders, 200)
 
 
 if __name__ == "__main__":

@@ -165,12 +165,18 @@ CREATE TABLE IF NOT EXISTS device_status_log (
 --   5. 删除顺序按外键依赖倒序排列，保证本脚本可反复重跑。
 -- ============================================================================
 
--- 业务线3的 repair_order 引用 user_account，必须先于 user_account 删除，避免外键阻塞重跑
+-- 业务线 2/3/4/5 子表按外键依赖逆序统一清理，避免跨线外键（如 charge_order -> vehicle/user_account）阻塞重跑
+DROP TABLE IF EXISTS invoice_record;
+DROP TABLE IF EXISTS reconcile_diff;
+DROP TABLE IF EXISTS settlement_bill;
+DROP TABLE IF EXISTS order_fee_detail;
+DROP TABLE IF EXISTS payment_record;
+DROP TABLE IF EXISTS coupon_redeem_record;
+DROP TABLE IF EXISTS charge_order;
+DROP TABLE IF EXISTS pricing_rule;
 DROP TABLE IF EXISTS repair_order;
 DROP TABLE IF EXISTS alarm_record;
 DROP TABLE IF EXISTS pile_telemetry;
-
-DROP TABLE IF EXISTS coupon_redeem_record;
 DROP TABLE IF EXISTS coupon_record;
 DROP TABLE IF EXISTS coupon_campaign;
 DROP TABLE IF EXISTS vehicle;
@@ -376,11 +382,6 @@ CREATE TABLE coupon_redeem_record (
 -- ============================================================================
 
 -- 电价规则：一个站、一个时段（峰/平/谷）、一段有效期，对应一条单价
-DROP TABLE IF EXISTS order_fee_detail;
-DROP TABLE IF EXISTS payment_record;
-DROP TABLE IF EXISTS charge_order;
-DROP TABLE IF EXISTS pricing_rule;
-
 CREATE TABLE pricing_rule (
     rule_id        BIGINT       NOT NULL AUTO_INCREMENT COMMENT '规则ID',
     station_id     BIGINT UNSIGNED       NOT NULL COMMENT '所属场站（线1）',
@@ -588,10 +589,6 @@ CREATE TABLE IF NOT EXISTS repair_order (
 -- 说明：依赖 operator(operator_id)、station(station_id)、charge_order(order_id)
 --       data flow：settle 只读线2 的订单，写自己的三张表
 -- ============================================================================
-
-DROP TABLE IF EXISTS invoice_record;
-DROP TABLE IF EXISTS reconcile_diff;
-DROP TABLE IF EXISTS settlement_bill;
 
 -- 月度结算单：一个运营商（或一个站）一个月只能有一张
 CREATE TABLE settlement_bill (
