@@ -655,7 +655,8 @@ ORDER BY created_at DESC;
 -- ----------------------------------------------------------------------------
 
 -- [实现 A - 低效]：SELECT 标量相关子查询每桩回表取最大时间，且在时间列上使用
---                  DATE() 函数，导致 idx_pile_telemetry_pile_time 与分区裁剪失效
+--                  DATE() 函数，导致 uk_pile_telemetry_time 与分区裁剪失效
+EXPLAIN ANALYZE
 SELECT
     s.station_code,
     s.station_name,
@@ -685,6 +686,7 @@ ORDER BY p.pile_id ASC;
 
 -- [实现 B - 优化]：使用 ROW_NUMBER 窗口函数每桩取最新一行，避免相关子查询回表；
 --                 时间过滤使用常量区间，使索引与 RANGE 分区裁剪同时生效
+EXPLAIN ANALYZE
 SELECT
     s.station_code,
     s.station_name,
@@ -724,13 +726,14 @@ ORDER BY p.pile_id ASC;
 
 -- [实现 A - 低效]：NOT EXISTS 子查询反复扫描 repair_order；WHERE 用
 --                  TIMESTAMPDIFF 包裹 occurred_at，无法命中 idx_alarm_status_time
+EXPLAIN ANALYZE
 SELECT
     s.station_id,
     s.station_code,
     s.station_name,
     o.operator_name,
     COUNT(*)                                  AS overdue_alarm_count,
-    MAX(a.alarm_level)                        AS max_alarm_level
+    MIN(a.alarm_level)                        AS most_urgent_alarm_level
 FROM alarm_record AS a
 INNER JOIN charging_pile AS p
     ON p.pile_id = a.pile_id
@@ -744,20 +747,21 @@ WHERE a.status IN ('ACTIVE', 'PROCESSING')
       SELECT 1
         FROM repair_order AS r
        WHERE r.alarm_id = a.alarm_id
-         AND r.status IN ('ACCEPTED', 'ARRIVED', 'REPAIRED', 'VERIFIED', 'CLOSED')
+         AND r.status IN ('ACCEPTED', 'ARRIVED', 'REPAIRED', 'VERIFIED')
   )
 GROUP BY s.station_id, s.station_code, s.station_name, o.operator_name
 ORDER BY overdue_alarm_count DESC;
 
 -- [实现 B - 优化]：由于 DDL 约束 response_limit_min >= 15，先用常量时间下界锁定候选
 --                 行命中 idx_alarm_status_time(status, occurred_at)，再逐行精确复核
+EXPLAIN ANALYZE
 SELECT
     s.station_id,
     s.station_code,
     s.station_name,
     o.operator_name,
     COUNT(*)                                  AS overdue_alarm_count,
-    MAX(a.alarm_level)                        AS max_alarm_level
+    MIN(a.alarm_level)                        AS most_urgent_alarm_level
 FROM alarm_record AS a
 INNER JOIN charging_pile AS p
     ON p.pile_id = a.pile_id
@@ -772,7 +776,7 @@ WHERE a.status IN ('ACTIVE', 'PROCESSING')
       SELECT 1
         FROM repair_order AS r
        WHERE r.alarm_id = a.alarm_id
-         AND r.status IN ('ACCEPTED', 'ARRIVED', 'REPAIRED', 'VERIFIED', 'CLOSED')
+         AND r.status IN ('ACCEPTED', 'ARRIVED', 'REPAIRED', 'VERIFIED')
   )
 GROUP BY s.station_id, s.station_code, s.station_name, o.operator_name
 ORDER BY overdue_alarm_count DESC;
@@ -784,6 +788,7 @@ ORDER BY overdue_alarm_count DESC;
 -- ----------------------------------------------------------------------------
 
 -- [实现 A - 低效]：DATE() 包裹 dispatched_at 使时间索引失效，且每行做 CASE 函数计算
+EXPLAIN ANALYZE
 SELECT
     s.station_id,
     s.station_name,
@@ -801,8 +806,9 @@ WHERE DATE(r.dispatched_at) >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
 GROUP BY s.station_id, s.station_name
 ORDER BY work_order_count DESC;
 
--- [实现 B - 优化]：时间筛选改为常量下界直接命中 idx_workorder_maintainer_status 或
---                 idx_workorder_alarm_status 的时间范围，聚合前先裁剪工单明细
+-- [实现 B - 优化]：时间筛选改为常量下界直接命中 idx_workorder_dispatch_time，
+--                 聚合前先裁剪工单明细
+EXPLAIN ANALYZE
 SELECT
     s.station_id,
     s.station_name,

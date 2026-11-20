@@ -763,6 +763,7 @@ DELIMITER ;
 -- ============================================================================
 
 DROP TRIGGER IF EXISTS trg_repair_order_before_insert_active;
+DROP TRIGGER IF EXISTS trg_repair_order_before_update_active;
 DROP PROCEDURE IF EXISTS proc_escalate_overdue_alarms;
 
 DELIMITER //
@@ -774,7 +775,9 @@ CREATE TRIGGER trg_repair_order_before_insert_active
 BEFORE INSERT ON repair_order
 FOR EACH ROW
 BEGIN
-    IF NEW.status <> 'CLOSED' AND EXISTS (
+    IF COALESCE(@skip_repair_order_guard, 0) = 0
+       AND NEW.status <> 'CLOSED'
+       AND EXISTS (
         SELECT 1
           FROM repair_order
          WHERE alarm_id = NEW.alarm_id
@@ -786,9 +789,31 @@ BEGIN
 END //
 
 -- ----------------------------------------------------------------------------
+-- 触发器 3.2：更新时防止把已关闭工单重新打开或换到已有活动工单的告警
+-- ----------------------------------------------------------------------------
+CREATE TRIGGER trg_repair_order_before_update_active
+BEFORE UPDATE ON repair_order
+FOR EACH ROW
+BEGIN
+    IF COALESCE(@skip_repair_order_guard, 0) = 0
+       AND (NEW.alarm_id <> OLD.alarm_id OR OLD.status = 'CLOSED')
+       AND NEW.status <> 'CLOSED'
+       AND EXISTS (
+           SELECT 1
+             FROM repair_order
+            WHERE alarm_id = NEW.alarm_id
+              AND work_order_id <> OLD.work_order_id
+              AND status <> 'CLOSED'
+       ) THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = '目标告警已存在处理中的维修工单，禁止重新打开';
+    END IF;
+END //
+
+-- ----------------------------------------------------------------------------
 -- 存储过程 3.1：告警 SLA 超时未响应自动升级
 -- 说明：MySQL 触发器无法由时间流逝自动触发，故使用存储过程 + 定时任务（EVENT 或
---       外部调度）执行；升级规则 L1(15min) -> L2(30min) -> L3(120min) -> L4(480min)。
+--       外部调度）执行；L1 最紧急(15min)，超时升级方向为 L4 -> L3 -> L2 -> L1。
 -- 调用方式：CALL proc_escalate_overdue_alarms(NOW(), @upgraded);
 -- ----------------------------------------------------------------------------
 CREATE PROCEDURE proc_escalate_overdue_alarms (
@@ -800,31 +825,32 @@ BEGIN
 
     SET v_now = COALESCE(p_check_time, NOW());
 
-    -- MySQL 单表 UPDATE 的 SET 赋值从左到右求值：先升级等级，再按“升级后等级”刷新响应时限
+    -- 先把旧等级的时限映射为新等级的时限，再改 alarm_level；避免 MySQL SET 左到右
+    -- 求值导致 response_limit_min 读取到已经变更后的等级而错配一档。
     UPDATE alarm_record
-       SET alarm_level = CASE alarm_level
-                WHEN 'L1' THEN 'L2'
-                WHEN 'L2' THEN 'L3'
-                WHEN 'L3' THEN 'L4'
-                ELSE alarm_level
-           END,
-           response_limit_min = CASE alarm_level
-                WHEN 'L1' THEN 30
-                WHEN 'L2' THEN 120
-                WHEN 'L3' THEN 480
+       SET response_limit_min = CASE alarm_level
+                WHEN 'L4' THEN 120
+                WHEN 'L3' THEN 30
+                WHEN 'L2' THEN 15
                 ELSE response_limit_min
+           END,
+           alarm_level = CASE alarm_level
+                WHEN 'L4' THEN 'L3'
+                WHEN 'L3' THEN 'L2'
+                WHEN 'L2' THEN 'L1'
+                ELSE alarm_level
            END,
            escalated_count = escalated_count + 1,
            escalated_at    = v_now,
            updated_at      = v_now
      WHERE status IN ('ACTIVE', 'PROCESSING')
-       AND alarm_level <> 'L4'
+       AND alarm_level <> 'L1'
        AND TIMESTAMPDIFF(MINUTE, occurred_at, v_now) > response_limit_min
        AND NOT EXISTS (
            SELECT 1
              FROM repair_order AS r
             WHERE r.alarm_id = alarm_record.alarm_id
-              AND r.status IN ('ACCEPTED', 'ARRIVED', 'REPAIRED', 'VERIFIED', 'CLOSED')
+              AND r.status IN ('ACCEPTED', 'ARRIVED', 'REPAIRED', 'VERIFIED')
        );
 
     SET p_escalated_count = ROW_COUNT();
