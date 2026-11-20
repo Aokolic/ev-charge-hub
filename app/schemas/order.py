@@ -1,9 +1,11 @@
 """业务线2：订单计费的入参/出参契约。"""
 
-from datetime import datetime
+from datetime import date, datetime, time
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+MONEY = dict(max_digits=12, decimal_places=2, description="金额（元，两位小数）")
 
 
 class OrderStartIn(BaseModel):
@@ -23,17 +25,19 @@ class OrderFinishIn(BaseModel):
 
 
 class PaymentIn(BaseModel):
-    """支付入参。amount 为负表示退款；txn_no 是渠道流水号，用来防重复入账。"""
+    """支付入参。txn_no 是渠道流水号，唯一索引用来防重复入账。"""
 
-    amount: Decimal = Field(description="支付金额，负数表示退款")
+    amount: Decimal = Field(gt=0, **MONEY)
     method: str = Field(pattern="^(WECHAT|ALIPAY|BALANCE|CASH)$")
     txn_no: str = Field(min_length=6, max_length=64)
 
-    @model_validator(mode="after")
-    def _check_amount(self) -> "PaymentIn":
-        if self.amount == 0:
-            raise ValueError("支付金额不能为 0")
-        return self
+
+class RefundIn(BaseModel):
+    """退款入参：金额必须为负，只允许结算专员/管理员发起。"""
+
+    amount: Decimal = Field(lt=0, **MONEY)
+    method: str = Field(pattern="^(WECHAT|ALIPAY|BALANCE|CASH)$")
+    txn_no: str = Field(min_length=6, max_length=64)
 
 
 class FeeDetailOut(BaseModel):
@@ -88,12 +92,48 @@ class PaymentOut(BaseModel):
 
 
 class PeriodStatOut(BaseModel):
+    """峰平谷统计：stat_date 是 date 不是 str，视图原样返回 date 类型。"""
+
     model_config = ConfigDict(from_attributes=True)
 
     period: str
-    stat_date: str
+    stat_date: date
     order_cnt: int
-    total_kwh: Decimal
-    energy_fee: Decimal
-    service_fee: Decimal
-    avg_price: Decimal
+    total_kwh: Decimal | None = None
+    energy_fee: Decimal | None = None
+    service_fee: Decimal | None = None
+    avg_price: Decimal | None = None
+
+
+class PriceRuleIn(BaseModel):
+    """新增一条分时电价规则（同一站同一时段不要重叠）。"""
+
+    station_id: int = Field(gt=0)
+    period: str = Field(pattern="^(PEAK|FLAT|VALLEY)$", description="峰/平/谷")
+    start_time: str = Field(pattern="^\\d{2}:\\d{2}$", description="HH:MM，可跨零点")
+    end_time: str = Field(pattern="^\\d{2}:\\d{2}$")
+    energy_price: Decimal = Field(gt=0, max_digits=8, decimal_places=4)
+    service_price: Decimal = Field(ge=0, max_digits=8, decimal_places=4)
+    free_minutes: int = Field(default=0, ge=0, le=120)
+    min_charge: Decimal = Field(default=Decimal("0"), ge=0, **{k: v for k, v in MONEY.items() if k != "description"})
+    effective_from: date
+    effective_to: date | None = None
+
+
+class PriceRuleOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    rule_id: int
+    station_id: int
+    period: str
+    start_time: time
+    end_time: time
+    energy_price: Decimal
+    service_price: Decimal
+    free_minutes: int
+    min_charge: Decimal
+    is_active: bool
+
+
+class PriceRuleActiveIn(BaseModel):
+    is_active: bool

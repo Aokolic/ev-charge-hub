@@ -159,10 +159,59 @@ class OrderSettleTestCase(unittest.TestCase):
         order_dao.start_order(self.db, 9101, payload)
         self.db.commit()
 
-        with self.assertRaises(IntegrityError) as ctx:
+        # 服务层先看枪状态，第二个人会拿到友好的 ValueError
+        with self.assertRaises(ValueError):
             order_dao.start_order(self.db, 9102, payload)
+        self.db.rollback()
+
+        # 绕过服务层的状态检查直接插一行，才是唯一索引兜底的场景（真并发）
+        with self.assertRaises(IntegrityError) as ctx:
+            self.db.execute(
+                text(
+                    "INSERT INTO charge_order "
+                    "(order_no, user_id, vehicle_id, gun_id, station_id, start_time, "
+                    " start_soc, status, energy_fee, service_fee, discount_amount, "
+                    " total_amount, paid_amount) "
+                    "VALUES ('RACE0001', 9102, 5002, :g, :s, NOW(), 30, 'CHARGING', 0, 0, 0, 0, 0)"
+                ),
+                {"g": payload.gun_id, "s": payload.station_id},
+            )
         self.assertIn("1062", str(ctx.exception.orig))
         self.db.rollback()
+
+    # ---------- 3.5 RBAC / IDOR 负向 ----------
+    def test_driver_cannot_touch_others_order(self) -> None:
+        from fastapi import HTTPException
+
+        from app.auth import CurrentUser, RoleEnum
+        from app.routers.order import _check_owner
+
+        order = self.db.execute(
+            text("SELECT * FROM charge_order ORDER BY order_id LIMIT 1")
+        ).mappings().one()
+        other_driver = CurrentUser(user_id=9999, username="intruder", role=RoleEnum.DRIVER)
+        with self.assertRaises(HTTPException) as ctx:
+            _check_owner(self.db, order, other_driver, "支付")
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_fleet_cannot_touch_other_fleet_order(self) -> None:
+        from fastapi import HTTPException
+
+        from app.auth import CurrentUser, RoleEnum
+        from app.routers.order import _check_owner
+
+        # 种子里的司机多半不挂车队，取第一单即可：fleet 侧拿不到 fleet_id 也必须 403
+        order = self.db.execute(
+            text("SELECT * FROM charge_order ORDER BY order_id LIMIT 1")
+        ).mappings().one()
+        fleet_id = self.db.execute(
+            text("SELECT fleet_id FROM user_account WHERE user_id = :u"), {"u": order["user_id"]}
+        ).scalar_one()
+        outsider = CurrentUser(user_id=8888, username="fleet_x", role=RoleEnum.FLEET,
+                               fleet_id=(fleet_id or 0) + 99)
+        with self.assertRaises(HTTPException) as ctx:
+            _check_owner(self.db, order, outsider, "查看")
+        self.assertEqual(ctx.exception.status_code, 403)
 
     # ---------- 4. 结束充电计费 ----------
     def test_finish_order_generates_fee_detail(self) -> None:

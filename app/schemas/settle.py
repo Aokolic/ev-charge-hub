@@ -5,13 +5,28 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+# 金额统一两位小数、最多 12 位，避免前端传 1e9 之类的脏数据
+MONEY = dict(max_digits=12, decimal_places=2)
+
 
 class BillGenerateIn(BaseModel):
     """生成月度结算单：按运营商 + 月份汇总，抽成比例默认 5%。"""
 
     operator_id: int = Field(gt=0)
-    bill_month: str = Field(pattern=r"^\d{4}-\d{2}$", description="YYYY-MM")
-    platform_rate: Decimal = Field(default=Decimal("0.0500"), ge=0, le=1)
+    bill_month: str = Field(
+        pattern=r"^\d{4}-(0[1-9]|1[0-2])$", description="YYYY-MM，月份必须是 01-12"
+    )
+    platform_rate: Decimal = Field(
+        default=Decimal("0.0500"), ge=0, le=1, max_digits=5, decimal_places=4
+    )
+
+
+class BillGenerateOut(BaseModel):
+    """生成结果：本轮影响了几张账单。"""
+
+    success: bool
+    message: str
+    affected_bills: int
 
 
 class BillOut(BaseModel):
@@ -61,7 +76,7 @@ class DiffResolveIn(BaseModel):
 class InvoiceIn(BaseModel):
     """开票：金额必须大于 0，超不超过账单应付由触发器判断。"""
 
-    amount: Decimal = Field(gt=0, description="开票金额")
+    amount: Decimal = Field(gt=0, **MONEY, description="开票金额")
     invoice_no: str = Field(min_length=4, max_length=32)
     invoice_type: str = Field(default="NORMAL", pattern="^(NORMAL|SPECIAL)$")
 

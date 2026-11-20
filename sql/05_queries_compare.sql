@@ -518,29 +518,33 @@ ORDER BY cand.pile_id ASC, g.gun_seq ASC;
 
 -- 第 1 组：查某个车主的订单列表（带未付金额和状态中文）
 -- A：查原表，状态中文在应用层翻译
-EXPLAIN
+EXPLAIN ANALYZE
 SELECT o.order_id, o.order_no, o.start_time, o.kwh,
        o.total_amount, o.paid_amount,
        o.total_amount - o.paid_amount AS unpaid_amount,
-       o.status
+       o.status, s.station_name, u.username
 FROM charge_order o
+JOIN station s      ON s.station_id = o.station_id
+JOIN user_account u ON u.user_id = o.user_id
 WHERE o.user_id = 9006
 ORDER BY o.start_time DESC;
 
 -- B：直接查视图，状态中文已经在视图里算好
-EXPLAIN
-SELECT order_id, order_no, start_time, kwh,
-       total_amount, paid_amount, unpaid_amount, status, status_text
-FROM v_order_owner
-WHERE user_id = 9006
-ORDER BY start_time DESC;
+EXPLAIN ANALYZE
+SELECT v.order_id, v.order_no, v.start_time, v.kwh,
+       v.total_amount, v.paid_amount, v.unpaid_amount, v.status, v.status_text,
+       s.station_name
+FROM v_order_owner v
+JOIN station s ON s.station_id = v.station_id
+WHERE v.user_id = 9006
+ORDER BY v.start_time DESC;
 
 -- 结论：两边都走 idx_order_user（user_id, start_time），
 --       视图多一层 derived，开销几乎一样；好处是前端少写翻译逻辑。
 
 -- 第 2 组：站点当天运营日报（单量、电量、金额）
 -- A：自己 GROUP BY
-EXPLAIN
+EXPLAIN ANALYZE
 SELECT DATE(start_time) AS stat_date, station_id, gun_id,
        COUNT(*) AS order_cnt,
        SUM(kwh) AS total_kwh,
@@ -550,7 +554,7 @@ WHERE start_time >= '2025-03-01' AND start_time < '2025-03-03'
 GROUP BY DATE(start_time), station_id, gun_id;
 
 -- B：查视图（视图里已经按天+站+枪聚合好了）
-EXPLAIN
+EXPLAIN ANALYZE
 SELECT * FROM v_order_station_daily
 WHERE stat_date >= '2025-03-01' AND stat_date < '2025-03-03';
 
@@ -560,7 +564,7 @@ WHERE stat_date >= '2025-03-01' AND stat_date < '2025-03-03';
 
 -- 第 3 组：峰平谷各卖了多少电、平均单价
 -- A：明细表聚合，单价按“金额/电量”现算
-EXPLAIN
+EXPLAIN ANALYZE
 SELECT period,
        SUM(kwh) AS total_kwh,
        ROUND(SUM(energy_fee + service_fee) / NULLIF(SUM(kwh), 0), 4) AS avg_price
@@ -568,7 +572,7 @@ FROM order_fee_detail
 GROUP BY period;
 
 -- B：查视图
-EXPLAIN
+EXPLAIN ANALYZE
 SELECT period, SUM(total_kwh) AS total_kwh,
        ROUND(SUM(energy_fee + service_fee) / NULLIF(SUM(total_kwh), 0), 4) AS avg_price
 FROM v_order_period_stat
@@ -583,7 +587,7 @@ GROUP BY period;
 
 -- 第 4 组：账单总览（应付、已开票、还差多少、有几条未处理差异）
 -- A：三个表自己 LEFT JOIN 子查询
-EXPLAIN
+EXPLAIN ANALYZE
 SELECT b.bill_id, b.bill_month, b.payable_amount,
        COALESCE(i.amt, 0) AS invoiced_amount,
        b.payable_amount - COALESCE(i.amt, 0) AS uninvoiced_amount,
@@ -597,7 +601,7 @@ LEFT JOIN (SELECT bill_id, COUNT(*) AS cnt FROM reconcile_diff
 ORDER BY b.bill_month, b.station_id;
 
 -- B：查视图
-EXPLAIN
+EXPLAIN ANALYZE
 SELECT bill_id, bill_month, payable_amount,
        invoiced_amount, uninvoiced_amount, open_diff_cnt
 FROM v_settle_bill_detail
@@ -608,17 +612,23 @@ ORDER BY bill_month, bill_id;
 
 -- 第 5 组：按站按月汇总待结算订单（生成账单前的核对数）
 -- A：原表聚合
-EXPLAIN
-SELECT DATE_FORMAT(start_time, '%Y-%m') AS bill_month, station_id,
-       COUNT(*) AS order_cnt, SUM(total_amount) AS total_amount
-FROM charge_order
-WHERE status = 'PAID'
-GROUP BY DATE_FORMAT(start_time, '%Y-%m'), station_id;
+EXPLAIN ANALYZE
+SELECT DATE_FORMAT(o.start_time, '%Y-%m') AS bill_month,
+       o.station_id, s.station_name, op.operator_name,
+       COUNT(*) AS order_cnt, SUM(o.total_amount) AS total_amount
+FROM charge_order o
+JOIN station s  ON s.station_id = o.station_id
+JOIN operator op ON op.operator_id = s.operator_id
+WHERE o.status = 'PAID'
+GROUP BY DATE_FORMAT(o.start_time, '%Y-%m'), o.station_id, s.station_name, op.operator_name;
 
 -- B：查视图
-EXPLAIN
-SELECT bill_month, station_id, order_cnt, total_amount
-FROM v_settle_order_month;
+EXPLAIN ANALYZE
+SELECT v.bill_month, v.station_id, s.station_name,
+       COUNT(*) AS order_cnt, SUM(v.total_amount) AS total_amount
+FROM v_settle_order_month v
+JOIN station s ON s.station_id = v.station_id
+GROUP BY v.bill_month, v.station_id, s.station_name;
 
 -- 结论：A 有 WHERE status='PAID'，能走 idx_order_station 先按站过滤；B 视图里已经过滤过，
 --       外层再筛月份用不上索引，数据量大了要把月份条件下推到视图。
@@ -626,7 +636,7 @@ FROM v_settle_order_month;
 
 -- 第 6 组：对账员工作台（未处理差异 + 账单信息）
 -- A：两表 join
-EXPLAIN
+EXPLAIN ANALYZE
 SELECT d.diff_id, d.bill_id, b.bill_month, d.order_id,
        d.diff_type, d.diff_amount, d.remark
 FROM reconcile_diff d
@@ -635,7 +645,7 @@ WHERE d.resolved = 0
 ORDER BY d.created_at DESC;
 
 -- B：查视图
-EXPLAIN
+EXPLAIN ANALYZE
 SELECT diff_id, bill_id, bill_month, order_id, diff_type, diff_amount, remark
 FROM v_settle_diff_open
 ORDER BY created_at DESC;
